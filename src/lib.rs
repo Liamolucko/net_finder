@@ -51,62 +51,39 @@ pub struct Net {
     squares: Vec<bool>,
 }
 
+struct Rotations {
+    net: Net,
+    stage: u8,
+}
+
+impl Rotations {
+    fn new(net: Net) -> Self {
+        Self { net, stage: 0 }
+    }
+}
+
+impl Iterator for Rotations {
+    type Item = Net;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.stage {
+            1 | 3 | 5 | 7 => self.net.horizontal_flip(),
+            2 | 6 => self.net.vertical_flip(),
+            0 => {}
+            4 => self.net = self.net.rotate(1),
+            _ => return None,
+        }
+        self.stage += 1;
+        Some(self.net.clone())
+    }
+}
+
 impl PartialEq for Net {
     fn eq(&self, other: &Self) -> bool {
         let a = self.shrink();
-        let mut b = other.shrink();
-        let mut rotated = b.rotate(1);
+        let b = other.shrink();
 
-        fn sub_eq(a: &Net, b: &Net) -> bool {
-            a.width == b.width && a.squares == b.squares
-        }
-
-        if sub_eq(&a, &b) {
-            return true;
-        }
-
-        b.horizontal_flip();
-
-        if sub_eq(&a, &b) {
-            return true;
-        }
-
-        // this results in an overall rotation of 180 degrees.
-        b.vertical_flip();
-
-        if sub_eq(&a, &b) {
-            return true;
-        }
-
-        b.horizontal_flip();
-
-        if sub_eq(&a, &b) {
-            return true;
-        }
-
-        if sub_eq(&a, &rotated) {
-            return true;
-        }
-
-        rotated.horizontal_flip();
-
-        if sub_eq(&a, &rotated) {
-            return true;
-        }
-
-        rotated.vertical_flip();
-
-        if sub_eq(&a, &rotated) {
-            return true;
-        }
-
-        rotated.horizontal_flip();
-
-        if sub_eq(&a, &rotated) {
-            return true;
-        }
-
-        false
+        Rotations::new(b).any(|b| a.width == b.width && a.squares == b.squares)
     }
 }
 
@@ -114,24 +91,11 @@ impl Eq for Net {}
 
 impl Hash for Net {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let net = self.shrink();
-
         // Create the 'canonical' version of this net by finding the rotation which
-        // results in the lexicographically 'largest' value of squares.
-        let canon = [
-            // TODO: stop `rotate`ing so much.
-            net.rotate(1).horizontally_flipped(),
-            net.rotate(1),
-            net.rotate(2).horizontally_flipped(),
-            net.rotate(2),
-            net.rotate(3).horizontally_flipped(),
-            net.rotate(3),
-            net.horizontally_flipped(),
-            net,
-        ]
-        .into_iter()
-        .max_by(|a, b| a.squares.as_slice().cmp(b.squares.as_slice()))
-        .unwrap();
+        // results in the lexicographically 'largest' value of `squares`.
+        let canon = Rotations::new(self.shrink())
+            .max_by(|a, b| a.squares.as_slice().cmp(b.squares.as_slice()))
+            .unwrap();
 
         canon.width.hash(state);
         canon.squares.hash(state);
@@ -709,8 +673,9 @@ struct Instruction {
 
 impl PartialEq for Instruction {
     fn eq(&self, other: &Self) -> bool {
-        // We don't consider `followup_index`.
-        self.net_pos == other.net_pos && self.face_positions == other.face_positions
+        // We only care about whether `net_pos` is equal. The rest is just auxiliary
+        // information which helps to actually evaluate the instruction.
+        self.net_pos == other.net_pos
     }
 }
 
@@ -784,7 +749,6 @@ impl NetFinder {
         for (surface, &pos) in zip(&mut self.surfaces, face_positions) {
             surface.set(pos, value);
         }
-        // println!("{}\n", self.net);
     }
 
     /// Undoes the last instruction that was successfully carried out.
