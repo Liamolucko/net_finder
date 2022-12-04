@@ -48,6 +48,40 @@ pub struct Net {
     squares: Vec<bool>,
 }
 
+impl PartialEq for Net {
+    fn eq(&self, other: &Self) -> bool {
+        let a = self.shrink();
+        let b = other.shrink();
+        let b_rotations = [b.rotate(1), b.rotate(2), b.rotate(3), b];
+        b_rotations.into_iter().any(|mut b| {
+            if a.width != b.width {
+                return false;
+            }
+            if a.squares == b.squares {
+                true
+            } else {
+                b.horizontal_flip();
+                a.squares == b.squares
+            }
+        })
+    }
+}
+
+#[test]
+fn rotated_cross() {
+    let cross = Net {
+        width: 3,
+        #[rustfmt::skip]
+        squares: vec![
+            false, true, false,
+            true, true, true,
+            false, true, false,
+            false, true, false,
+        ],
+    };
+    assert_eq!(cross, cross.rotate(1));
+}
+
 impl<'a> Arbitrary<'a> for Net {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let (width, squares): (usize, Vec<bool>) = u.arbitrary()?;
@@ -159,6 +193,32 @@ impl Net {
     fn set(&mut self, pos: Pos, value: bool) {
         self.squares[pos.y * self.width + pos.x] = value;
     }
+
+    /// Returns a copy of this net rotated by the given number of clockwise turns.
+    pub fn rotate(&self, turns: i8) -> Self {
+        let turns = turns.rem_euclid(4);
+        if turns == 0 {
+            return self.clone();
+        }
+        let mut rotated_size = self.size();
+        rotated_size.rotate(turns);
+        let mut result = Net::new(rotated_size.width, rotated_size.height);
+        for x in 0..self.width() {
+            for y in 0..self.height() {
+                let pos = Pos::new(x, y);
+                let rotated = pos.rotated(turns, self.size());
+                result.set(rotated, self.filled(pos));
+            }
+        }
+        result
+    }
+
+    /// Flips this net around the horizontal axis.
+    pub fn horizontal_flip(&mut self) {
+        for row in self.rows_mut() {
+            row.reverse();
+        }
+    }
 }
 
 /// Displays a text version of the net.
@@ -229,6 +289,11 @@ impl Pos {
             (self.x, self.y) = (self.y, size.width - self.x - 1);
             size.rotate(1);
         }
+    }
+
+    fn rotated(mut self, turns: i8, size: Size) -> Self {
+        self.rotate(turns, size);
+        self
     }
 }
 
@@ -395,7 +460,7 @@ impl Surface {
     }
 }
 
-struct NetFinder {
+pub struct NetFinder {
     net: Net,
     surface: Surface,
     queue: Vec<Instruction>,
@@ -403,6 +468,10 @@ struct NetFinder {
     index: usize,
     /// The size of the net so far.
     area: usize,
+    target_area: usize,
+    /// All of the nets we've previously reached, to stop us from wasting effort
+    /// if we reach them again.
+    prev_nets: Vec<Net>,
 }
 
 /// An instruction to add a square.
@@ -422,7 +491,7 @@ struct Instruction {
 }
 
 impl NetFinder {
-    fn new(cuboid: Cuboid) -> Self {
+    pub fn new(cuboid: Cuboid) -> Self {
         // Allocate the biggest net we could possibly need. We return a shrunk version.
         // We put our starting point (the bottom-left of the bottom face) in the middle
         // of the net, and then the net could potentially extend purely left, right,
@@ -462,6 +531,8 @@ impl NetFinder {
             queue,
             index: 0,
             area: 0,
+            target_area: cuboid.surface_area(),
+            prev_nets: Vec::new(),
         }
     }
 
@@ -477,14 +548,18 @@ impl NetFinder {
     }
 
     /// Undoes the last instruction that was successfully carried out.
-    fn backtrack(&mut self) {
+    ///
+    /// Returns whether backtracking was successful. If `false` is returned,
+    /// there are no more available options.
+    fn backtrack(&mut self) -> bool {
         // Find the last instruction that was successfully carried out.
-        let (last_success_index, instruction) = self
+        let Some((last_success_index, instruction)) = self
             .queue
             .iter_mut()
             .enumerate()
-            .rfind(|(_, instruction)| instruction.followup_index.is_some())
-            .unwrap();
+            .rfind(|(_, instruction)| instruction.followup_index.is_some()) else {
+                return false
+            };
         let followup_index = instruction.followup_index.unwrap();
         // Mark it as unsuccessful.
         instruction.followup_index = None;
@@ -496,6 +571,7 @@ impl NetFinder {
         self.queue.resize_with(followup_index, || unreachable!());
         // We continue executing from just after the instruction we undid.
         self.index = last_success_index + 1;
+        true
     }
 
     /// Evaluate the instruction at the current index in the queue, incrementing
@@ -503,9 +579,7 @@ impl NetFinder {
     fn evaluate_instruction(&mut self) {
         let next_index = self.queue.len();
         let Instruction {
-            net_pos,
-            face_pos,
-            ref mut followup_index,
+            net_pos, face_pos, ..
         } = self.queue[self.index];
         if !self.net.filled(net_pos)
             && !self.surface.filled(face_pos)
@@ -524,46 +598,56 @@ impl NetFinder {
                 true
             })
         {
-            // The space is free, so we fill it and mark the instruction as successful.
-            *followup_index = Some(next_index);
+            // The space is free, so we fill it.
             self.set_square(net_pos, face_pos, true);
+            // If we've just reached a net we've already tried, revert.
+            if self.prev_nets.contains(&self.net) {
+                self.set_square(net_pos, face_pos, false);
+            } else {
+                self.prev_nets.push(self.net.shrink());
+                self.queue[self.index].followup_index = Some(next_index);
 
-            // Add the new things we can do from here to the queue.
-            self.queue.extend(
-                [Left, Up, Right, Down]
-                    .into_iter()
-                    .map(|direction| Instruction {
-                        net_pos: net_pos.moved_in(direction, self.net.size()).unwrap(),
-                        face_pos: face_pos.moved_in(direction),
-                        followup_index: None,
-                    }),
-            );
+                // Add the new things we can do from here to the queue.
+                self.queue
+                    .extend([Left, Up, Right, Down].into_iter().filter_map(|direction| {
+                        Some(Instruction {
+                            net_pos: net_pos.moved_in(direction, self.net.size())?,
+                            face_pos: face_pos.moved_in(direction),
+                            followup_index: None,
+                        })
+                    }));
+            }
         }
         self.index += 1;
     }
 }
 
-/// Finds a net which can fold into any of the passed set of cuboids.
-pub fn find_nets(cuboid: Cuboid) -> Net {
-    // We start from the bottom-left of the bottom face of the cuboid, and work our
-    // way out from there. The net is aligned with the bottom face, so left, right,
-    // up, down on the net correspond to the same directions on the bottom face.
-    // From there they continue up other faces, e.g. left on the net can become up
-    // on the left face.
-    // We think of directions on each face as they appear from the inside.
+impl Iterator for NetFinder {
+    type Item = Net;
 
-    let mut state = NetFinder::new(cuboid);
+    fn next(&mut self) -> Option<Self::Item> {
+        // We start from the bottom-left of the bottom face of the cuboid, and work our
+        // way out from there. The net is aligned with the bottom face, so left, right,
+        // up, down on the net correspond to the same directions on the bottom face.
+        // From there they continue up other faces, e.g. left on the net can become up
+        // on the left face.
+        // We think of directions on each face as they appear from the inside.
 
-    while state.area < cuboid.surface_area() {
-        while state.index >= state.queue.len() {
-            // We've exhausted the queue and haven't found a solution, so we
-            // must have done something wrong. Backtrack.
-            state.backtrack();
+        while self.area < self.target_area {
+            while self.index >= self.queue.len() {
+                // We've exhausted the queue and haven't found a solution, so we
+                // must have done something wrong. Backtrack.
+                if !self.backtrack() {
+                    return None;
+                }
+            }
+
+            // Evaluate the next instruction in the queue.
+            self.evaluate_instruction();
         }
 
-        // Evaluate the next instruction in the queue.
-        state.evaluate_instruction();
+        let net = self.net.shrink();
+        self.backtrack();
+        Some(net)
     }
-
-    state.net.shrink()
 }
