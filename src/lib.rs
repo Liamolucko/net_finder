@@ -211,6 +211,16 @@ impl Pos {
         true
     }
 
+    /// Returns this position moved 1 unit in the given direction, if it fits
+    /// within the given size.
+    fn moved_in(mut self, direction: Direction, size: Size) -> Option<Self> {
+        if self.move_in(direction, size) {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
     /// Returns what this position would be if the surface it was on was rotated
     /// by `turns` clockwise turns, and the surface was of size `size` before
     /// being turned.
@@ -354,14 +364,182 @@ impl FacePos {
             // Then set the coordinate we moved along to the appropriate edge of the face.
             match entry_direction {
                 Left => self.pos.x = self.cuboid.face_size(new_face).width - 1,
-                Up => self.pos.y = self.cuboid.face_size(new_face).height - 1,
+                Up => self.pos.y = 0,
                 Right => self.pos.x = 0,
-                Down => self.pos.y = 0,
+                Down => self.pos.y = self.cuboid.face_size(new_face).height - 1,
             }
 
             self.orientation = (self.orientation + turns).rem_euclid(4);
             self.face = new_face;
         }
+    }
+
+    /// Returns this position moved 1 unit in the given direction on the net.
+    fn moved_in(mut self, direction: Direction) -> Self {
+        self.move_in(direction);
+        self
+    }
+}
+
+struct Surface {
+    faces: [Net; 6],
+}
+
+impl Surface {
+    fn filled(&self, pos: FacePos) -> bool {
+        self.faces[pos.face as usize].filled(pos.pos)
+    }
+
+    fn set(&mut self, pos: FacePos, value: bool) {
+        self.faces[pos.face as usize].set(pos.pos, value)
+    }
+}
+
+struct NetFinder {
+    net: Net,
+    surface: Surface,
+    queue: Vec<Instruction>,
+    /// The index of the next instruction in `queue` that will be evaluated.
+    index: usize,
+    /// The size of the net so far.
+    area: usize,
+}
+
+/// An instruction to add a square.
+#[derive(Debug, Clone, Copy)]
+struct Instruction {
+    /// The position on the net where the square will be added.
+    net_pos: Pos,
+    /// The equivalent position on the surface of the cuboid.
+    face_pos: FacePos,
+    /// If this instruction has been successfully carried out, the index in
+    /// `queue` at which the instructions added as a result of this instruction
+    /// begin.
+    ///
+    /// In other words, the length of the queue prior to this instruction being
+    /// carried out.
+    followup_index: Option<usize>,
+}
+
+impl NetFinder {
+    fn new(cuboid: Cuboid) -> Self {
+        // Allocate the biggest net we could possibly need. We return a shrunk version.
+        // We put our starting point (the bottom-left of the bottom face) in the middle
+        // of the net, and then the net could potentially extend purely left, right,
+        // up, down etc. from there. So, the x/y of that point is the maximum
+        // width/height of the net once shrunk (minus one, because zero-indexing).
+        let middle_x = 2 * cuboid.width + 2 * cuboid.height - 1;
+        let middle_y = 2 * cuboid.depth + 2 * cuboid.height - 1;
+        // Then the max width/height is 1 for the middle, plus twice the maximum
+        // extension off to either side, which happens to be equal to the middle's
+        // index.
+        let width = 1 + 2 * middle_x;
+        let height = 1 + 2 * middle_y;
+        let net = Net::new(width, height);
+
+        // The state of how much each face of the cuboid has been filled in. I reused
+        // `Net` to represent the state of each face.
+        // I put them in the arbitrary order of bottom, west, north, east, south, top.
+        let faces = [
+            Net::new(cuboid.width, cuboid.depth),
+            Net::new(cuboid.depth, cuboid.height),
+            Net::new(cuboid.width, cuboid.height),
+            Net::new(cuboid.depth, cuboid.height),
+            Net::new(cuboid.width, cuboid.height),
+            Net::new(cuboid.width, cuboid.depth),
+        ];
+
+        // The first instruction is to add the first square.
+        let queue = vec![Instruction {
+            net_pos: Pos::new(middle_x, middle_y),
+            face_pos: FacePos::new(cuboid),
+            followup_index: None,
+        }];
+
+        Self {
+            net,
+            surface: Surface { faces },
+            queue,
+            index: 0,
+            area: 0,
+        }
+    }
+
+    /// Set a square on the net and surface of the cuboid simultaneously.
+    fn set_square(&mut self, net_pos: Pos, face_pos: FacePos, value: bool) {
+        match (self.net.filled(net_pos), value) {
+            (false, true) => self.area += 1,
+            (true, false) => self.area -= 1,
+            _ => {}
+        }
+        self.net.set(net_pos, value);
+        self.surface.set(face_pos, value);
+    }
+
+    /// Undoes the last instruction that was successfully carried out.
+    fn backtrack(&mut self) {
+        // Find the last instruction that was successfully carried out.
+        let (last_success_index, instruction) = self
+            .queue
+            .iter_mut()
+            .enumerate()
+            .rfind(|(_, instruction)| instruction.followup_index.is_some())
+            .unwrap();
+        let followup_index = instruction.followup_index.unwrap();
+        // Mark it as unsuccessful.
+        instruction.followup_index = None;
+        // Remove the square it added.
+        let net_pos = instruction.net_pos;
+        let face_pos = instruction.face_pos;
+        self.set_square(net_pos, face_pos, false);
+        // Then remove all the instructions added as a result of this square.
+        self.queue.resize_with(followup_index, || unreachable!());
+        // We continue executing from just after the instruction we undid.
+        self.index = last_success_index + 1;
+    }
+
+    /// Evaluate the instruction at the current index in the queue, incrementing
+    /// the index afterwards.
+    fn evaluate_instruction(&mut self) {
+        let next_index = self.queue.len();
+        let Instruction {
+            net_pos,
+            face_pos,
+            ref mut followup_index,
+        } = self.queue[self.index];
+        if !self.net.filled(net_pos)
+            && !self.surface.filled(face_pos)
+            && [Left, Up, Right, Down].into_iter().all(|direction| {
+                // Make sure that the new square doesn't make it so that two squares that are
+                // next to each other on the net aren't next to each other on the cuboid's
+                // surface, since that would require extra cuts to the net which are disallowed.
+                // Note that it's perfectly fine (and required, in fact) for to adjacent spots
+                // on the surface to not be adjacent on the net.
+                if let Some(net_pos) = net_pos.moved_in(direction, self.net.size()) {
+                    let face_pos = face_pos.moved_in(direction);
+                    if self.net.filled(net_pos) && !self.surface.filled(face_pos) {
+                        return false;
+                    }
+                }
+                true
+            })
+        {
+            // The space is free, so we fill it and mark the instruction as successful.
+            *followup_index = Some(next_index);
+            self.set_square(net_pos, face_pos, true);
+
+            // Add the new things we can do from here to the queue.
+            self.queue.extend(
+                [Left, Up, Right, Down]
+                    .into_iter()
+                    .map(|direction| Instruction {
+                        net_pos: net_pos.moved_in(direction, self.net.size()).unwrap(),
+                        face_pos: face_pos.moved_in(direction),
+                        followup_index: None,
+                    }),
+            );
+        }
+        self.index += 1;
     }
 }
 
@@ -374,115 +552,18 @@ pub fn find_nets(cuboid: Cuboid) -> Net {
     // on the left face.
     // We think of directions on each face as they appear from the inside.
 
-    // Allocate the biggest net we could possibly need. We return a shrunk version
-    // from the iterator.
-    // We put our starting point (the bottom-left of the bottom face) in the middle
-    // of the net, and then the net could potentially extend purely left, right,
-    // up, down etc. from there. So, the x/y of that point is the maximum
-    // width/height of the net once shrunk (minus one, because zero-indexing).
-    let middle_x = 2 * cuboid.width + 2 * cuboid.height - 1;
-    let middle_y = 2 * cuboid.depth + 2 * cuboid.height - 1;
-    // Then the max width/height is 1 for the middle, plus twice the maximum
-    // extension off to either side, which happens to be equal to the middle's
-    // index.
-    let width = 1 + 2 * middle_x;
-    let height = 1 + 2 * middle_y;
-    let mut net = Net::new(width, height);
+    let mut state = NetFinder::new(cuboid);
 
-    // The state of how much each face of the cuboid has been filled in. I reused
-    // `Net` to represent the state of each face.
-    // I put them in the arbitrary order of bottom, west, north, east, south, top.
-    let mut faces = [
-        Net::new(cuboid.width, cuboid.depth),
-        Net::new(cuboid.depth, cuboid.height),
-        Net::new(cuboid.width, cuboid.height),
-        Net::new(cuboid.depth, cuboid.height),
-        Net::new(cuboid.width, cuboid.height),
-        Net::new(cuboid.width, cuboid.depth),
-    ];
-
-    // Construct the initial positions.
-    let face_pos = FacePos::new(cuboid);
-    let net_pos = Pos::new(middle_x, middle_y);
-
-    // Set the first square.
-    net.set(net_pos, true);
-    faces[face_pos.face as usize].set(face_pos.pos, true);
-
-    // A list of all the squares we're going to attempt to fill.
-    // Formatted as `(pos, direction, success)`, where each element means 'extrude a
-    // square in `direction` from `pos`', and `success` is whether it was
-    // actually carried out.
-    // However, we don't remove anything from the queue, because we need to be able
-    // to backtrack.
-    let mut queue: Vec<_> = [Left, Up, Right, Down]
-        .into_iter()
-        .map(|direction| (net_pos, face_pos, direction, false))
-        .collect();
-    // The index of the next instruction in the queue that we're going to carry out.
-    let mut index = 0;
-
-    // Compute the target surface area.
-    // Once we reach it, we're done.
-    let target_area = cuboid.surface_area();
-    let mut area = 1;
-
-    while area < target_area {
-        if index >= queue.len() {
+    while state.area < cuboid.surface_area() {
+        while state.index >= state.queue.len() {
             // We've exhausted the queue and haven't found a solution, so we
-            // must have done something wrong.
-            // Backtrack and undo the last instruction we successfully carried
-            // out.
-            let (last_success_index, &mut (mut net_pos, mut face_pos, direction, ref mut success)) =
-                queue
-                    .iter_mut()
-                    .enumerate()
-                    .rfind(|(_, &mut (_, _, _, success))| success)
-                    .unwrap();
-            *success = false;
-            // Figure out which square was added, and remove it.
-            let moved = net_pos.move_in(direction, net.size());
-            debug_assert!(moved);
-            face_pos.move_in(direction);
-            net.set(net_pos, false);
-            faces[face_pos.face as usize].set(face_pos.pos, false);
-            area -= 1;
-            // Then remove all the instructions added as a result of this square.
-            let (delete_start_index, _) = queue
-                .iter()
-                .enumerate()
-                .find(|(_, &(other_net_pos, _, _, _))| other_net_pos == net_pos)
-                .unwrap();
-            queue.resize_with(delete_start_index, || unreachable!());
-            index = last_success_index + 1;
-            // it's possible that that last successful one was actually the last one in the
-            // queue, so restart to loop to run this if again and check for that.
-            continue;
+            // must have done something wrong. Backtrack.
+            state.backtrack();
         }
 
-        let (mut net_pos, mut face_pos, direction, ref mut success) = queue[index];
-        let moved = net_pos.move_in(direction, net.size());
-        // we should always have allocated a big enough net.
-        debug_assert!(moved);
-        if !net.filled(net_pos) {
-            face_pos.move_in(direction);
-            if !faces[face_pos.face as usize].filled(face_pos.pos) {
-                // Success!
-                *success = true;
-                net.set(net_pos, true);
-                faces[face_pos.face as usize].set(face_pos.pos, true);
-                area += 1;
-
-                // Add the new things we can do from here to the queue.
-                queue.extend(
-                    [Left, Up, Right, Down]
-                        .into_iter()
-                        .map(|direction| (net_pos, face_pos, direction, false)),
-                )
-            }
-        }
-        index += 1;
+        // Evaluate the next instruction in the queue.
+        state.evaluate_instruction();
     }
 
-    net.shrink()
+    state.net.shrink()
 }
