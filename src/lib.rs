@@ -3,6 +3,7 @@
 use std::fmt::{self, Display, Formatter, Write};
 use std::iter::zip;
 
+use anyhow::bail;
 use arbitrary::Arbitrary;
 
 #[derive(Debug, Clone, Copy)]
@@ -51,19 +52,59 @@ pub struct Net {
 impl PartialEq for Net {
     fn eq(&self, other: &Self) -> bool {
         let a = self.shrink();
-        let b = other.shrink();
-        let b_rotations = [b.rotate(1), b.rotate(2), b.rotate(3), b];
-        b_rotations.into_iter().any(|mut b| {
-            if a.width != b.width {
-                return false;
-            }
-            if a.squares == b.squares {
-                true
-            } else {
-                b.horizontal_flip();
-                a.squares == b.squares
-            }
-        })
+        let mut b = other.shrink();
+        let mut rotated = b.rotate(1);
+
+        fn sub_eq(a: &Net, b: &Net) -> bool {
+            a.width == b.width && a.squares == b.squares
+        }
+
+        if sub_eq(&a, &b) {
+            return true;
+        }
+
+        b.horizontal_flip();
+
+        if sub_eq(&a, &b) {
+            return true;
+        }
+
+        // this results in an overall rotation of 180 degrees.
+        b.vertical_flip();
+
+        if sub_eq(&a, &b) {
+            return true;
+        }
+
+        b.horizontal_flip();
+
+        if sub_eq(&a, &b) {
+            return true;
+        }
+
+        if sub_eq(&a, &rotated) {
+            return true;
+        }
+
+        rotated.horizontal_flip();
+
+        if sub_eq(&a, &rotated) {
+            return true;
+        }
+
+        rotated.vertical_flip();
+
+        if sub_eq(&a, &rotated) {
+            return true;
+        }
+
+        rotated.horizontal_flip();
+
+        if sub_eq(&a, &rotated) {
+            return true;
+        }
+
+        false
     }
 }
 
@@ -217,6 +258,17 @@ impl Net {
     pub fn horizontal_flip(&mut self) {
         for row in self.rows_mut() {
             row.reverse();
+        }
+    }
+
+    pub fn vertical_flip(&mut self) {
+        let midpoint = self.squares.len() / 2;
+        let (start, end) = self.squares.split_at_mut(midpoint);
+        for (a, b) in zip(start.chunks_mut(self.width), end.rchunks_mut(self.width)) {
+            // ignore the middle half-sized chunks if present
+            if a.len() == self.width {
+                a.swap_with_slice(b);
+            }
         }
     }
 }
@@ -462,7 +514,7 @@ impl Surface {
 
 pub struct NetFinder {
     net: Net,
-    surface: Surface,
+    surfaces: Vec<Surface>,
     queue: Vec<Instruction>,
     /// The index of the next instruction in `queue` that will be evaluated.
     index: usize,
@@ -475,12 +527,12 @@ pub struct NetFinder {
 }
 
 /// An instruction to add a square.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Instruction {
     /// The position on the net where the square will be added.
     net_pos: Pos,
-    /// The equivalent position on the surface of the cuboid.
-    face_pos: FacePos,
+    /// The equivalent positions on the surfaces of the cuboids.
+    face_positions: Vec<FacePos>,
     /// If this instruction has been successfully carried out, the index in
     /// `queue` at which the instructions added as a result of this instruction
     /// begin.
@@ -491,14 +543,33 @@ struct Instruction {
 }
 
 impl NetFinder {
-    pub fn new(cuboid: Cuboid) -> Self {
+    /// Create a `NetFinder` that searches for nets that fold into all of the passed cuboids.
+    pub fn new(cuboids: Vec<Cuboid>) -> anyhow::Result<Self> {
+        if cuboids.len() == 0 {
+            bail!("at least one cuboid must be provided")
+        }
+        if cuboids
+            .iter()
+            .any(|cuboid| cuboid.surface_area() != cuboids[0].surface_area())
+        {
+            bail!("all passed cuboids must have the same surface area")
+        }
+
         // Allocate the biggest net we could possibly need. We return a shrunk version.
         // We put our starting point (the bottom-left of the bottom face) in the middle
         // of the net, and then the net could potentially extend purely left, right,
         // up, down etc. from there. So, the x/y of that point is the maximum
         // width/height of the net once shrunk (minus one, because zero-indexing).
-        let middle_x = 2 * cuboid.width + 2 * cuboid.height - 1;
-        let middle_y = 2 * cuboid.depth + 2 * cuboid.height - 1;
+        let middle_x = cuboids
+            .iter()
+            .map(|cuboid| 2 * cuboid.width + 2 * cuboid.height - 1)
+            .max()
+            .unwrap();
+        let middle_y = cuboids
+            .iter()
+            .map(|cuboid| 2 * cuboid.depth + 2 * cuboid.height - 1)
+            .max()
+            .unwrap();
         // Then the max width/height is 1 for the middle, plus twice the maximum
         // extension off to either side, which happens to be equal to the middle's
         // index.
@@ -509,42 +580,50 @@ impl NetFinder {
         // The state of how much each face of the cuboid has been filled in. I reused
         // `Net` to represent the state of each face.
         // I put them in the arbitrary order of bottom, west, north, east, south, top.
-        let faces = [
-            Net::new(cuboid.width, cuboid.depth),
-            Net::new(cuboid.depth, cuboid.height),
-            Net::new(cuboid.width, cuboid.height),
-            Net::new(cuboid.depth, cuboid.height),
-            Net::new(cuboid.width, cuboid.height),
-            Net::new(cuboid.width, cuboid.depth),
-        ];
+        let surfaces = cuboids
+            .iter()
+            .map(|cuboid| Surface {
+                faces: [
+                    Net::new(cuboid.width, cuboid.depth),
+                    Net::new(cuboid.depth, cuboid.height),
+                    Net::new(cuboid.width, cuboid.height),
+                    Net::new(cuboid.depth, cuboid.height),
+                    Net::new(cuboid.width, cuboid.height),
+                    Net::new(cuboid.width, cuboid.depth),
+                ],
+            })
+            .collect();
 
         // The first instruction is to add the first square.
         let queue = vec![Instruction {
             net_pos: Pos::new(middle_x, middle_y),
-            face_pos: FacePos::new(cuboid),
+            face_positions: cuboids.iter().copied().map(FacePos::new).collect(),
             followup_index: None,
         }];
 
-        Self {
+        Ok(Self {
             net,
-            surface: Surface { faces },
+            surfaces,
             queue,
             index: 0,
             area: 0,
-            target_area: cuboid.surface_area(),
+            target_area: cuboids[0].surface_area(),
             prev_nets: Vec::new(),
-        }
+        })
     }
 
-    /// Set a square on the net and surface of the cuboid simultaneously.
-    fn set_square(&mut self, net_pos: Pos, face_pos: FacePos, value: bool) {
+    /// Set a square on the net and surfaces of the cuboids simultaneously.
+    fn set_square(&mut self, net_pos: Pos, face_positions: &[FacePos], value: bool) {
         match (self.net.filled(net_pos), value) {
             (false, true) => self.area += 1,
             (true, false) => self.area -= 1,
             _ => {}
         }
         self.net.set(net_pos, value);
-        self.surface.set(face_pos, value);
+        for (surface, &pos) in zip(&mut self.surfaces, face_positions) {
+            surface.set(pos, value);
+        }
+        // println!("{}\n", self.net);
     }
 
     /// Undoes the last instruction that was successfully carried out.
@@ -565,8 +644,9 @@ impl NetFinder {
         instruction.followup_index = None;
         // Remove the square it added.
         let net_pos = instruction.net_pos;
-        let face_pos = instruction.face_pos;
-        self.set_square(net_pos, face_pos, false);
+        // inefficient :(
+        let face_positions = instruction.face_positions.clone();
+        self.set_square(net_pos, &face_positions, false);
         // Then remove all the instructions added as a result of this square.
         self.queue.resize_with(followup_index, || unreachable!());
         // We continue executing from just after the instruction we undid.
@@ -579,10 +659,14 @@ impl NetFinder {
     fn evaluate_instruction(&mut self) {
         let next_index = self.queue.len();
         let Instruction {
-            net_pos, face_pos, ..
+            net_pos,
+            ref face_positions,
+            ..
         } = self.queue[self.index];
+        // this is inefficient but I'm too lazy to fight the borrow checker right now.
+        let face_positions = face_positions.clone();
         if !self.net.filled(net_pos)
-            && !self.surface.filled(face_pos)
+            && !zip(&self.surfaces, &face_positions).any(|(surface, &pos)| surface.filled(pos))
             && [Left, Up, Right, Down].into_iter().all(|direction| {
                 // Make sure that the new square doesn't make it so that two squares that are
                 // next to each other on the net aren't next to each other on the cuboid's
@@ -590,8 +674,10 @@ impl NetFinder {
                 // Note that it's perfectly fine (and required, in fact) for to adjacent spots
                 // on the surface to not be adjacent on the net.
                 if let Some(net_pos) = net_pos.moved_in(direction, self.net.size()) {
-                    let face_pos = face_pos.moved_in(direction);
-                    if self.net.filled(net_pos) && !self.surface.filled(face_pos) {
+                    if self.net.filled(net_pos)
+                        && zip(&self.surfaces, &face_positions)
+                            .any(|(surface, &pos)| !surface.filled(pos.moved_in(direction)))
+                    {
                         return false;
                     }
                 }
@@ -599,10 +685,10 @@ impl NetFinder {
             })
         {
             // The space is free, so we fill it.
-            self.set_square(net_pos, face_pos, true);
+            self.set_square(net_pos, &face_positions, true);
             // If we've just reached a net we've already tried, revert.
             if self.prev_nets.contains(&self.net) {
-                self.set_square(net_pos, face_pos, false);
+                self.set_square(net_pos, &face_positions, false);
             } else {
                 self.prev_nets.push(self.net.shrink());
                 self.queue[self.index].followup_index = Some(next_index);
@@ -612,7 +698,10 @@ impl NetFinder {
                     .extend([Left, Up, Right, Down].into_iter().filter_map(|direction| {
                         Some(Instruction {
                             net_pos: net_pos.moved_in(direction, self.net.size())?,
-                            face_pos: face_pos.moved_in(direction),
+                            face_positions: face_positions
+                                .iter()
+                                .map(|&pos| pos.moved_in(direction))
+                                .collect(),
                             followup_index: None,
                         })
                     }));
