@@ -1,13 +1,14 @@
 //! A crate which finds nets for cubiods.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::{self, Display, Formatter, Write};
+use std::hash::Hash;
 use std::iter::zip;
 
 use anyhow::bail;
 use arbitrary::Arbitrary;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cuboid {
     pub width: usize,
     pub depth: usize,
@@ -106,6 +107,33 @@ impl PartialEq for Net {
         }
 
         false
+    }
+}
+
+impl Eq for Net {}
+
+impl Hash for Net {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let net = self.shrink();
+        net.width.hash(state);
+
+        // Create the 'canonical' version of this net by finding the rotation which
+        // results in the lexicographically 'largest' value of squares.
+        let canon = [
+            net.rotate(1).horizontally_flipped(),
+            net.rotate(1),
+            net.rotate(2).horizontally_flipped(),
+            net.rotate(2),
+            net.rotate(3).horizontally_flipped(),
+            net.rotate(3),
+            net.horizontally_flipped(),
+            net,
+        ]
+        .into_iter()
+        .max_by(|a, b| a.squares.as_slice().cmp(b.squares.as_slice()))
+        .unwrap();
+
+        canon.squares.hash(state);
     }
 }
 
@@ -261,6 +289,13 @@ impl Net {
         for row in self.rows_mut() {
             row.reverse();
         }
+    }
+
+    /// Returns a copy of this net flipped around the horizontal axis.
+    pub fn horizontally_flipped(&self) -> Self {
+        let mut result = self.clone();
+        result.horizontal_flip();
+        result
     }
 
     pub fn vertical_flip(&mut self) {
@@ -523,7 +558,7 @@ enum Face {
 
 use Face::*;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FacePos {
     /// The cuboid which this position is on.
     cuboid: Cuboid,
@@ -652,7 +687,7 @@ pub struct NetFinder {
     target_area: usize,
     /// All of the nets we've previously reached, to stop us from wasting effort
     /// if we reach them again.
-    prev_nets: Vec<Net>,
+    prev_nets: HashSet<Net>,
 }
 
 /// An instruction to add a square.
@@ -669,6 +704,13 @@ struct Instruction {
     /// In other words, the length of the queue prior to this instruction being
     /// carried out.
     followup_index: Option<usize>,
+}
+
+impl PartialEq for Instruction {
+    fn eq(&self, other: &Self) -> bool {
+        // We don't consider `followup_index`.
+        self.net_pos == other.net_pos && self.face_positions == other.face_positions
+    }
 }
 
 impl NetFinder {
@@ -726,7 +768,7 @@ impl NetFinder {
             index: 0,
             area: 0,
             target_area: cuboids[0].surface_area(),
-            prev_nets: Vec::new(),
+            prev_nets: HashSet::new(),
         })
     }
 
@@ -808,12 +850,13 @@ impl NetFinder {
             if self.prev_nets.contains(&self.net) {
                 self.set_square(net_pos, &face_positions, false);
             } else {
-                self.prev_nets.push(self.net.shrink());
+                self.prev_nets.insert(self.net.shrink());
                 self.queue[self.index].followup_index = Some(next_index);
 
                 // Add the new things we can do from here to the queue.
-                self.queue
-                    .extend([Left, Up, Right, Down].into_iter().filter_map(|direction| {
+                let new_instructions: Vec<_> = [Left, Up, Right, Down]
+                    .into_iter()
+                    .filter_map(|direction| {
                         Some(Instruction {
                             net_pos: net_pos.moved_in(direction, self.net.size())?,
                             face_positions: face_positions
@@ -822,7 +865,10 @@ impl NetFinder {
                                 .collect(),
                             followup_index: None,
                         })
-                    }));
+                    })
+                    .filter(|instruction| !self.queue.contains(instruction))
+                    .collect();
+                self.queue.extend_from_slice(&new_instructions);
             }
         }
         self.index += 1;
