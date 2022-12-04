@@ -1,5 +1,6 @@
 //! A crate which finds nets for cubiods.
 
+use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter, Write};
 use std::iter::zip;
 
@@ -272,6 +273,120 @@ impl Net {
             }
         }
     }
+
+    /// Return a version of this net with its squares 'colored' with which faces
+    /// they're on.
+    pub fn color(&self, cuboid: Cuboid) -> Option<ColoredNet> {
+        if self.area() != cuboid.surface_area() {
+            return None;
+        }
+        for x in 0..self.width() {
+            for y in 0..self.height() {
+                let pos = Pos::new(x, y);
+                if self.filled(pos) {
+                    if let Some(net) = self.try_color(cuboid, pos) {
+                        return Some(net);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn try_color(&self, cuboid: Cuboid, start: Pos) -> Option<ColoredNet> {
+        let surface_start = FacePos::new(cuboid);
+        // We need to keep track of what we've filled in to reject cases where stuff
+        // overlaps.
+        let mut surface = Surface::new(cuboid);
+        let mut result = ColoredNet {
+            width: self.width,
+            squares: vec![None; self.squares.len()],
+        };
+        // This queue isn't a weird one like in `NetFinder`, it's a normal queue where
+        // we push things on and pop things off.
+        let mut queue = VecDeque::new();
+        queue.push_back((start, surface_start));
+
+        while let Some((pos, surface_pos)) = queue.pop_front() {
+            result.set(pos, surface_pos.face);
+            surface.set(surface_pos, true);
+            for direction in [Left, Up, Right, Down] {
+                let Some(pos) = pos.moved_in(direction, self.size()) else {
+                    continue
+                };
+                if !self.filled(pos) || result.get(pos).is_some() {
+                    // skip this if the square isn't present or we've already covered it.
+                    continue;
+                }
+                let surface_pos = surface_pos.moved_in(direction);
+                if surface.filled(surface_pos) {
+                    // This isn't a valid net for this cuboid (from this starting position) - this
+                    // spot is on the net but the corresponding spot on the surface is filled, so
+                    // the net doubles up which is invalid.
+                    return None;
+                }
+                queue.push_back((pos, surface_pos));
+            }
+        }
+
+        Some(result)
+    }
+
+    pub fn area(&self) -> usize {
+        self.squares.iter().filter(|&&square| square).count()
+    }
+}
+
+/// A version of `Net` which stores which face each of its squares are on.
+pub struct ColoredNet {
+    width: usize,
+    squares: Vec<Option<Face>>,
+}
+
+impl ColoredNet {
+    /// Set whether a spot on the net is filled.
+    fn set(&mut self, pos: Pos, value: Face) {
+        self.squares[pos.y * self.width + pos.x] = Some(value);
+    }
+
+    fn get(&mut self, pos: Pos) -> Option<Face> {
+        self.squares[pos.y * self.width + pos.x]
+    }
+
+    /// Returns an iterator over the rows of the net.
+    fn rows(&self) -> impl Iterator<Item = &[Option<Face>]> {
+        (self.width != 0)
+            .then(|| self.squares.chunks(self.width))
+            .into_iter()
+            .flatten()
+    }
+}
+
+impl Display for ColoredNet {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for (i, row) in self.rows().enumerate() {
+            if i != 0 {
+                f.write_char('\n')?;
+            }
+            for &square in row {
+                if let Some(face) = square {
+                    f.write_str(match face {
+                        Bottom => "\x1b[31m",
+                        West => "\x1b[32m",
+                        North => "\x1b[33m",
+                        East => "\x1b[34m",
+                        South => "\x1b[35m",
+                        Top => "\x1b[36m",
+                    })?;
+                    f.write_char('█')?;
+                } else {
+                    f.write_char(' ')?;
+                }
+            }
+            f.write_str("\x1b[39m")?;
+        }
+        Ok(())
+    }
 }
 
 /// Displays a text version of the net.
@@ -504,6 +619,19 @@ struct Surface {
 }
 
 impl Surface {
+    fn new(cuboid: Cuboid) -> Self {
+        Self {
+            faces: [
+                Net::new(cuboid.width, cuboid.depth),
+                Net::new(cuboid.depth, cuboid.height),
+                Net::new(cuboid.width, cuboid.height),
+                Net::new(cuboid.depth, cuboid.height),
+                Net::new(cuboid.width, cuboid.height),
+                Net::new(cuboid.width, cuboid.depth),
+            ],
+        }
+    }
+
     fn filled(&self, pos: FacePos) -> bool {
         self.faces[pos.face as usize].filled(pos.pos)
     }
@@ -582,19 +710,7 @@ impl NetFinder {
         // The state of how much each face of the cuboid has been filled in. I reused
         // `Net` to represent the state of each face.
         // I put them in the arbitrary order of bottom, west, north, east, south, top.
-        let surfaces = cuboids
-            .iter()
-            .map(|cuboid| Surface {
-                faces: [
-                    Net::new(cuboid.width, cuboid.depth),
-                    Net::new(cuboid.depth, cuboid.height),
-                    Net::new(cuboid.width, cuboid.height),
-                    Net::new(cuboid.depth, cuboid.height),
-                    Net::new(cuboid.width, cuboid.height),
-                    Net::new(cuboid.width, cuboid.depth),
-                ],
-            })
-            .collect();
+        let surfaces = cuboids.iter().copied().map(Surface::new).collect();
 
         // The first instruction is to add the first square.
         let queue = vec![Instruction {
