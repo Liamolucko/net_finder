@@ -115,11 +115,11 @@ impl Eq for Net {}
 impl Hash for Net {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let net = self.shrink();
-        net.width.hash(state);
 
         // Create the 'canonical' version of this net by finding the rotation which
         // results in the lexicographically 'largest' value of squares.
         let canon = [
+            // TODO: stop `rotate`ing so much.
             net.rotate(1).horizontally_flipped(),
             net.rotate(1),
             net.rotate(2).horizontally_flipped(),
@@ -133,6 +133,7 @@ impl Hash for Net {
         .max_by(|a, b| a.squares.as_slice().cmp(b.squares.as_slice()))
         .unwrap();
 
+        canon.width.hash(state);
         canon.squares.hash(state);
     }
 }
