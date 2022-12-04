@@ -235,7 +235,8 @@ impl Net {
         self.squares[pos.y * self.width + pos.x] = value;
     }
 
-    /// Returns a copy of this net rotated by the given number of clockwise turns.
+    /// Returns a copy of this net rotated by the given number of clockwise
+    /// turns.
     pub fn rotate(&self, turns: i8) -> Self {
         let turns = turns.rem_euclid(4);
         if turns == 0 {
@@ -543,7 +544,8 @@ struct Instruction {
 }
 
 impl NetFinder {
-    /// Create a `NetFinder` that searches for nets that fold into all of the passed cuboids.
+    /// Create a `NetFinder` that searches for nets that fold into all of the
+    /// passed cuboids.
     pub fn new(cuboids: Vec<Cuboid>) -> anyhow::Result<Self> {
         if cuboids.len() == 0 {
             bail!("at least one cuboid must be provided")
