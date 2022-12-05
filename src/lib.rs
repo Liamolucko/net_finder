@@ -650,8 +650,8 @@ pub struct NetFinder {
     /// The size of the net so far.
     area: usize,
     target_area: usize,
-    /// All of the nets we've previously reached, to stop us from wasting effort
-    /// if we reach them again.
+    /// All of the nets we've previously yielded, so that we don't yield the
+    /// same thing multiple times.
     prev_nets: HashSet<Net>,
 }
 
@@ -673,9 +673,7 @@ struct Instruction {
 
 impl PartialEq for Instruction {
     fn eq(&self, other: &Self) -> bool {
-        // We only care about whether `net_pos` is equal. The rest is just auxiliary
-        // information which helps to actually evaluate the instruction.
-        self.net_pos == other.net_pos
+        self.net_pos == other.net_pos && self.face_positions == other.face_positions
     }
 }
 
@@ -792,30 +790,20 @@ impl NetFinder {
         let face_positions = face_positions.clone();
         if !self.net.filled(net_pos)
             && !zip(&self.surfaces, &face_positions).any(|(surface, &pos)| surface.filled(pos))
-            && [Left, Up, Right, Down].into_iter().all(|direction| {
-                // Make sure that the new square doesn't make it so that two squares that are
-                // next to each other on the net aren't next to each other on the cuboid's
-                // surface, since that would require extra cuts to the net which are disallowed.
-                // Note that it's perfectly fine (and required, in fact) for to adjacent spots
-                // on the surface to not be adjacent on the net.
-                if let Some(net_pos) = net_pos.moved_in(direction, self.net.size()) {
-                    if self.net.filled(net_pos)
-                        && zip(&self.surfaces, &face_positions)
-                            .any(|(surface, &pos)| !surface.filled(pos.moved_in(direction)))
-                    {
-                        return false;
-                    }
-                }
-                true
+            && !self.queue.iter().any(|instruction| {
+                // If we find an instruction which is trying to put a square in the same
+                // position on the net, but will produce a square in a different position on one
+                // of the cuboids' surfaces, that means a cut would be needed, and this square
+                // is invalid.
+                instruction.net_pos == net_pos && instruction.face_positions != face_positions
             })
         {
             // The space is free, so we fill it.
             self.set_square(net_pos, &face_positions, true);
-            // If we've just reached a net we've already tried, revert.
+            // If we've just reached a net we've already yielded, revert.
             if self.prev_nets.contains(&self.net) {
                 self.set_square(net_pos, &face_positions, false);
             } else {
-                self.prev_nets.insert(self.net.shrink());
                 self.queue[self.index].followup_index = Some(next_index);
 
                 // Add the new things we can do from here to the queue.
@@ -865,6 +853,7 @@ impl Iterator for NetFinder {
         }
 
         let net = self.net.shrink();
+        self.prev_nets.insert(net.clone());
         self.backtrack();
         Some(net)
     }
