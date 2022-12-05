@@ -4,6 +4,8 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt::{self, Display, Formatter, Write};
 use std::hash::Hash;
 use std::iter::zip;
+use std::sync::mpsc;
+use std::thread;
 
 use anyhow::bail;
 use arbitrary::Arbitrary;
@@ -35,6 +37,29 @@ impl Cuboid {
 
     pub fn surface_area(&self) -> usize {
         2 * self.width * self.depth + 2 * self.depth * self.height + 2 * self.width * self.height
+    }
+
+    fn surface_squares(&self) -> Vec<FacePos> {
+        let mut result = Vec::new();
+        // Don't bother with east, south, and top because they're symmetrical with west,
+        // north and bottom, and so won't reveal any new nets.
+        for face in [Bottom, West, North] {
+            let size = self.face_size(face);
+            for x in 0..size.width {
+                for y in 0..size.height {
+                    // At first, I thought we would have to include all the different rotations
+                    // here. However, because of cuboids' rotational symmetry, any rotation is
+                    // equivalent to just putting the square somewhere else on the same face.
+                    result.push(FacePos {
+                        cuboid: *self,
+                        face,
+                        pos: Pos::new(x, y),
+                        orientation: 0,
+                    })
+                }
+            }
+        }
+        result
     }
 }
 
@@ -284,8 +309,10 @@ impl Net {
             for y in 0..self.height() {
                 let pos = Pos::new(x, y);
                 if self.filled(pos) {
-                    if let Some(net) = self.try_color(cuboid, pos) {
-                        return Some(net);
+                    for orientation in 0..4 {
+                        if let Some(net) = self.try_color(cuboid, pos, orientation) {
+                            return Some(net);
+                        }
                     }
                 }
             }
@@ -293,8 +320,9 @@ impl Net {
         None
     }
 
-    fn try_color(&self, cuboid: Cuboid, start: Pos) -> Option<ColoredNet> {
-        let surface_start = FacePos::new(cuboid);
+    fn try_color(&self, cuboid: Cuboid, start: Pos, orientation: i8) -> Option<ColoredNet> {
+        let mut surface_start = FacePos::new(cuboid);
+        surface_start.orientation = orientation;
         // We need to keep track of what we've filled in to reject cases where stuff
         // overlaps.
         let mut surface = Surface::new(cuboid);
@@ -614,6 +642,7 @@ impl FacePos {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Surface {
     faces: [Net; 6],
 }
@@ -678,9 +707,9 @@ impl PartialEq for Instruction {
 }
 
 impl NetFinder {
-    /// Create a `NetFinder` that searches for nets that fold into all of the
-    /// passed cuboids.
-    pub fn new(cuboids: Vec<Cuboid>) -> anyhow::Result<Self> {
+    /// Create a bunch of `NetFinder`s that search for all the nets that fold
+    /// into all of the passed cuboids.
+    pub fn new(cuboids: Vec<Cuboid>) -> anyhow::Result<Vec<Self>> {
         if cuboids.len() == 0 {
             bail!("at least one cuboid must be provided")
         }
@@ -716,24 +745,63 @@ impl NetFinder {
         // The state of how much each face of the cuboid has been filled in. I reused
         // `Net` to represent the state of each face.
         // I put them in the arbitrary order of bottom, west, north, east, south, top.
-        let surfaces = cuboids.iter().copied().map(Surface::new).collect();
+        let surfaces: Vec<_> = cuboids.iter().copied().map(Surface::new).collect();
 
-        // The first instruction is to add the first square.
-        let queue = vec![Instruction {
-            net_pos: Pos::new(middle_x, middle_y),
-            face_positions: cuboids.iter().copied().map(FacePos::new).collect(),
-            followup_index: None,
-        }];
+        // All the starting points on each cuboid we want to consider.
+        let mut starting_points: Vec<Vec<FacePos>> = cuboids
+            .iter()
+            .map(|cuboid| cuboid.surface_squares())
+            .collect();
+        // We only need to consider one spot on one of them. The only reason we're
+        // considering multiple starting spots is so that the same spot on the net can
+        // map to any different spot on the different cuboids; for a single cuboid, we
+        // can discover a net from any starting spot.
+        starting_points[0] = vec![FacePos::new(cuboids[0])];
 
-        Ok(Self {
-            net,
-            surfaces,
-            queue,
-            index: 0,
-            area: 0,
-            target_area: cuboids[0].surface_area(),
-            prev_nets: HashSet::new(),
-        })
+        // let mut starting_face_positions =
+        // vec![cuboids.iter().copied().map(FacePos::new).collect();
+        // starting_points.iter().map(|vec| vec.len()).product()];
+        let mut starting_face_positions: Vec<Vec<FacePos>> = Vec::new();
+        let mut indices: Vec<_> = cuboids.iter().map(|_| 0_usize).collect();
+        'outer: loop {
+            starting_face_positions.push(
+                zip(&indices, &starting_points)
+                    .map(|(&index, vec)| vec[index])
+                    .collect(),
+            );
+            for index_index in (0..indices.len()).rev() {
+                indices[index_index] += 1;
+                if indices[index_index] >= starting_points[index_index].len() {
+                    indices[index_index] = 0;
+                    if index_index == 0 {
+                        break 'outer;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(starting_face_positions
+            .into_iter()
+            .map(|face_positions| {
+                // The first instruction is to add the first square.
+                let queue = vec![Instruction {
+                    net_pos: Pos::new(middle_x, middle_y),
+                    face_positions,
+                    followup_index: None,
+                }];
+                Self {
+                    net: net.clone(),
+                    surfaces: surfaces.clone(),
+                    queue,
+                    index: 0,
+                    area: 0,
+                    target_area: cuboids[0].surface_area(),
+                    prev_nets: HashSet::new(),
+                }
+            })
+            .collect())
     }
 
     /// Set a square on the net and surfaces of the cuboids simultaneously.
@@ -857,4 +925,29 @@ impl Iterator for NetFinder {
         self.backtrack();
         Some(net)
     }
+}
+
+pub fn find_nets(cuboids: Vec<Cuboid>) -> anyhow::Result<impl Iterator<Item = Net>> {
+    let finders = NetFinder::new(cuboids)?;
+    let (tx, rx) = mpsc::channel();
+
+    for finder in finders {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for net in finder {
+                if let Err(_) = tx.send(net) {
+                    // The receiver is gone, i.e. the iterator was dropped.
+                    return;
+                }
+            }
+        });
+    }
+
+    println!("threads spawned!");
+
+    let mut yielded_nets = HashSet::new();
+    Ok(rx.into_iter().filter(move |net| {
+        let new = yielded_nets.insert(net.clone());
+        new
+    }))
 }

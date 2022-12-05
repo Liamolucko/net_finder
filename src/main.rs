@@ -2,7 +2,7 @@ use std::env;
 use std::time::Instant;
 
 use anyhow::bail;
-use net_finder::{Cuboid, NetFinder};
+use net_finder::{find_nets, Cuboid};
 
 fn main() -> anyhow::Result<()> {
     let args = env::args()
@@ -21,16 +21,16 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let mut count = 0;
     let start = Instant::now();
-    for net in NetFinder::new(cuboids.clone())? {
-        println!("{:?}:", start.elapsed());
+    for net in find_nets(cuboids.clone())? {
+        count += 1;
+        println!("#{count} after {:?}:", start.elapsed());
         let mut nets = vec![net.to_string()];
         for &cuboid in cuboids.iter() {
             nets.push(net.color(cuboid).unwrap().to_string());
         }
         println!("{}\n", join_horizontal(nets));
-        count += 1;
     }
-    println!("Number of nets: {count}");
+    println!("Number of nets: {count} (took {:?})", start.elapsed());
     Ok(())
 }
 
