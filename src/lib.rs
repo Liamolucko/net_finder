@@ -679,9 +679,6 @@ pub struct NetFinder {
     /// The size of the net so far.
     area: usize,
     target_area: usize,
-    /// All of the nets we've previously yielded, so that we don't yield the
-    /// same thing multiple times.
-    prev_nets: HashSet<Net>,
 }
 
 /// An instruction to add a square.
@@ -798,7 +795,6 @@ impl NetFinder {
                     index: 0,
                     area: 0,
                     target_area: cuboids[0].surface_area(),
-                    prev_nets: HashSet::new(),
                 }
             })
             .collect())
@@ -868,29 +864,24 @@ impl NetFinder {
         {
             // The space is free, so we fill it.
             self.set_square(net_pos, &face_positions, true);
-            // If we've just reached a net we've already yielded, revert.
-            if self.prev_nets.contains(&self.net) {
-                self.set_square(net_pos, &face_positions, false);
-            } else {
-                self.queue[self.index].followup_index = Some(next_index);
+            self.queue[self.index].followup_index = Some(next_index);
 
-                // Add the new things we can do from here to the queue.
-                let new_instructions: Vec<_> = [Left, Up, Right, Down]
-                    .into_iter()
-                    .filter_map(|direction| {
-                        Some(Instruction {
-                            net_pos: net_pos.moved_in(direction, self.net.size())?,
-                            face_positions: face_positions
-                                .iter()
-                                .map(|&pos| pos.moved_in(direction))
-                                .collect(),
-                            followup_index: None,
-                        })
+            // Add the new things we can do from here to the queue.
+            let new_instructions: Vec<_> = [Left, Up, Right, Down]
+                .into_iter()
+                .filter_map(|direction| {
+                    Some(Instruction {
+                        net_pos: net_pos.moved_in(direction, self.net.size())?,
+                        face_positions: face_positions
+                            .iter()
+                            .map(|&pos| pos.moved_in(direction))
+                            .collect(),
+                        followup_index: None,
                     })
-                    .filter(|instruction| !self.queue.contains(instruction))
-                    .collect();
-                self.queue.extend_from_slice(&new_instructions);
-            }
+                })
+                .filter(|instruction| !self.queue.contains(instruction))
+                .collect();
+            self.queue.extend_from_slice(&new_instructions);
         }
         self.index += 1;
     }
@@ -921,7 +912,6 @@ impl Iterator for NetFinder {
         }
 
         let net = self.net.shrink();
-        self.prev_nets.insert(net.clone());
         self.backtrack();
         Some(net)
     }
