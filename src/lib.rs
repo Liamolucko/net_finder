@@ -4,17 +4,46 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt::{self, Display, Formatter, Write};
 use std::hash::Hash;
 use std::iter::zip;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::mpsc;
-use std::thread;
+use std::{fs, thread};
 
-use anyhow::bail;
+use anyhow::{bail, Context};
 use arbitrary::Arbitrary;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Cuboid {
     pub width: usize,
     pub depth: usize,
     pub height: usize,
+}
+
+impl FromStr for Cuboid {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let dims: Vec<usize> = s
+            .split("x")
+            .map(|dim| dim.parse())
+            .collect::<Result<_, _>>()
+            .context("dimensions must be integers")?;
+        let &[width, depth, height] = dims.as_slice() else {
+            bail!("3 dimensions must be provided: width, depth and height")
+        };
+        Ok(Self {
+            width,
+            depth,
+            height,
+        })
+    }
+}
+
+impl Display for Cuboid {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}x{}x{}", self.width, self.depth, self.height)
+    }
 }
 
 impl Cuboid {
@@ -63,13 +92,7 @@ impl Cuboid {
     }
 }
 
-impl Display for Cuboid {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}x{}x{} cuboid", self.width, self.depth, self.height)
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Net {
     width: usize,
     /// A vec indicating whether a square is present in each spot.
@@ -145,13 +168,7 @@ fn rotated_cross() {
 impl<'a> Arbitrary<'a> for Net {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         let (width, squares): (usize, Vec<bool>) = u.arbitrary()?;
-        if width == 0 {
-            if squares.len() != 0 {
-                return Err(arbitrary::Error::IncorrectFormat);
-            }
-        } else if squares.len() % width != 0 {
-            return Err(arbitrary::Error::IncorrectFormat);
-        } else if squares.len() == 0 && width != 0 {
+        if width == 0 || squares.len() == 0 {
             return Err(arbitrary::Error::IncorrectFormat);
         }
         Ok(Self { width, squares })
@@ -357,7 +374,11 @@ impl Net {
             }
         }
 
-        Some(result)
+        if result.area() == cuboid.surface_area() {
+            Some(result)
+        } else {
+            None
+        }
     }
 
     pub fn area(&self) -> usize {
@@ -387,6 +408,13 @@ impl ColoredNet {
             .then(|| self.squares.chunks(self.width))
             .into_iter()
             .flatten()
+    }
+
+    pub fn area(&self) -> usize {
+        self.squares
+            .iter()
+            .filter(|&&square| square.is_some())
+            .count()
     }
 }
 
@@ -438,7 +466,7 @@ impl Display for Net {
 }
 
 // A position in 2D space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Pos {
     x: usize,
     y: usize,
@@ -538,7 +566,7 @@ impl Direction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 enum Face {
     Bottom,
@@ -551,7 +579,7 @@ enum Face {
 
 use Face::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct FacePos {
     /// The cuboid which this position is on.
     cuboid: Cuboid,
@@ -642,7 +670,7 @@ impl FacePos {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Surface {
     faces: [Net; 6],
 }
@@ -670,6 +698,7 @@ impl Surface {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone)]
 pub struct NetFinder {
     net: Net,
     surfaces: Vec<Surface>,
@@ -682,7 +711,7 @@ pub struct NetFinder {
 }
 
 /// An instruction to add a square.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Instruction {
     /// The position on the net where the square will be added.
     net_pos: Pos,
@@ -706,7 +735,7 @@ impl PartialEq for Instruction {
 impl NetFinder {
     /// Create a bunch of `NetFinder`s that search for all the nets that fold
     /// into all of the passed cuboids.
-    pub fn new(cuboids: Vec<Cuboid>) -> anyhow::Result<Vec<Self>> {
+    fn new(cuboids: &[Cuboid]) -> anyhow::Result<Vec<Self>> {
         if cuboids.len() == 0 {
             bail!("at least one cuboid must be provided")
         }
@@ -887,45 +916,76 @@ impl NetFinder {
     }
 }
 
-impl Iterator for NetFinder {
-    type Item = Net;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // We start from the bottom-left of the bottom face of the cuboid, and work our
-        // way out from there. The net is aligned with the bottom face, so left, right,
-        // up, down on the net correspond to the same directions on the bottom face.
-        // From there they continue up other faces, e.g. left on the net can become up
-        // on the left face.
-        // We think of directions on each face as they appear from the inside.
-
-        while self.area < self.target_area {
-            while self.index >= self.queue.len() {
-                // We've exhausted the queue and haven't found a solution, so we
-                // must have done something wrong. Backtrack.
-                if !self.backtrack() {
-                    return None;
-                }
-            }
-
-            // Evaluate the next instruction in the queue.
-            self.evaluate_instruction();
+fn state_path(cuboids: &[Cuboid]) -> PathBuf {
+    let mut name = "state/".to_string();
+    for (i, cuboid) in cuboids.iter().enumerate() {
+        if i != 0 {
+            name.push(',');
         }
-
-        let net = self.net.shrink();
-        self.backtrack();
-        Some(net)
+        write!(name, "{cuboid}").unwrap();
     }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
 }
 
-pub fn find_nets(cuboids: Vec<Cuboid>) -> anyhow::Result<impl Iterator<Item = Net>> {
+pub fn find_nets(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net>> {
     let finders = NetFinder::new(cuboids)?;
-    let (tx, rx) = mpsc::channel();
 
-    for finder in finders {
-        let tx = tx.clone();
+    Ok(run(cuboids, finders))
+}
+
+pub fn resume(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net>> {
+    let bytes = fs::read(state_path(cuboids)).context("no state to resume from")?;
+    let finders: Vec<NetFinder> = postcard::from_bytes(&bytes)?;
+    Ok(run(cuboids, finders))
+}
+
+fn run(cuboids: &[Cuboid], finders: Vec<NetFinder>) -> impl Iterator<Item = Net> {
+    let (net_tx, net_rx) = mpsc::channel();
+    let (finder_senders, mut finder_receivers): (Vec<_>, Vec<_>) = finders
+        .iter()
+        .map(|_| {
+            // We specifically limit the buffer to 1 so that threads only send us a new
+            // state after we consume the last one.
+            mpsc::sync_channel::<NetFinder>(1)
+        })
+        .unzip();
+    for (mut finder, finder_tx) in zip(finders, finder_senders) {
+        let net_tx = net_tx.clone();
         thread::spawn(move || {
-            for net in finder {
-                if let Err(_) = tx.send(net) {
+            // We start from the bottom-left of the bottom face of the cuboid, and work our
+            // way out from there. The net is aligned with the bottom face, so left, right,
+            // up, down on the net correspond to the same directions on the bottom face.
+            // From there they continue up other faces, e.g. left on the net can become up
+            // on the left face.
+            // We think of directions on each face as they appear from the inside.
+
+            let mut send_counter: u16 = 0;
+            loop {
+                while finder.area < finder.target_area {
+                    while finder.index >= finder.queue.len() {
+                        // We've exhausted the queue and haven't found a solution, so we must have
+                        // done something wrong. Backtrack.
+                        if !finder.backtrack() {
+                            // We're out of options, so we're done.
+                            return;
+                        }
+                    }
+
+                    // Evaluate the next instruction in the queue.
+                    finder.evaluate_instruction();
+
+                    send_counter = send_counter.wrapping_add(1);
+                    if send_counter == 0 {
+                        let _ = finder_tx.try_send(finder.clone());
+                    }
+                }
+
+                // We broke out of the loop, which means we reached the target area and have a
+                // valid net!
+                let net = finder.net.shrink();
+                finder.backtrack();
+
+                if let Err(_) = net_tx.send(net) {
                     // The receiver is gone, i.e. the iterator was dropped.
                     return;
                 }
@@ -935,9 +995,29 @@ pub fn find_nets(cuboids: Vec<Cuboid>) -> anyhow::Result<impl Iterator<Item = Ne
 
     println!("threads spawned!");
 
+    let cuboids = cuboids.to_vec();
+    // Spawn a thread whose sole purpose is to periodically record our state to a
+    // file.
+    thread::spawn(move || {
+        // Create the folder where we're going to store our state.
+        fs::create_dir_all(Path::new(env!("CARGO_MANIFEST_DIR")).join("state")).unwrap();
+        loop {
+            let finders: Vec<_> = finder_receivers
+                .iter_mut()
+                .filter_map(|rx| rx.recv().ok())
+                .collect();
+
+            fs::write(
+                state_path(&cuboids),
+                &postcard::to_stdvec(&finders).unwrap(),
+            )
+            .unwrap();
+        }
+    });
+
     let mut yielded_nets = HashSet::new();
-    Ok(rx.into_iter().filter(move |net| {
+    net_rx.into_iter().filter(move |net| {
         let new = yielded_nets.insert(net.clone());
         new
-    }))
+    })
 }

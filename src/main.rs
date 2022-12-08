@@ -1,34 +1,32 @@
-use std::env;
 use std::time::Instant;
 
-use anyhow::bail;
-use net_finder::{find_nets, Cuboid};
+use clap::Parser;
+use net_finder::{find_nets, resume, Cuboid, Net};
+
+#[derive(Parser)]
+struct Options {
+    #[arg(long)]
+    resume: bool,
+    cuboids: Vec<Cuboid>,
+}
 
 fn main() -> anyhow::Result<()> {
-    let args = env::args()
-        .into_iter()
-        .skip(1)
-        .map(|arg| arg.parse::<usize>())
-        .collect::<Result<Vec<_>, _>>()?;
-    if args.len() % 3 != 0 {
-        bail!(
-            "expected sets of 3 arguments representing the width, height and depth of the cuboids."
-        );
-    }
-    let cuboids: Vec<_> = args
-        .chunks(3)
-        .map(|chunk| Cuboid::new(chunk[0], chunk[1], chunk[2]))
-        .collect();
+    let options = Options::parse();
     let mut count = 0;
     let start = Instant::now();
-    for net in find_nets(cuboids.clone())? {
+    let callback = |net: Net| {
         count += 1;
         println!("#{count} after {:?}:", start.elapsed());
         let mut nets = vec![net.to_string()];
-        for &cuboid in cuboids.iter() {
+        for &cuboid in options.cuboids.iter() {
             nets.push(net.color(cuboid).unwrap().to_string());
         }
         println!("{}\n", join_horizontal(nets));
+    };
+    if options.resume {
+        resume(&options.cuboids)?.for_each(callback);
+    } else {
+        find_nets(&options.cuboids)?.for_each(callback);
     }
     println!("Number of nets: {count} (took {:?})", start.elapsed());
     Ok(())
