@@ -716,7 +716,7 @@ struct Instruction {
     /// The position on the net where the square will be added.
     net_pos: Pos,
     /// The equivalent positions on the surfaces of the cuboids.
-    face_positions: Vec<FacePos>,
+    face_positions: heapless::Vec<FacePos, 3>,
     /// If this instruction has been successfully carried out, the index in
     /// `queue` at which the instructions added as a result of this instruction
     /// begin.
@@ -784,10 +784,7 @@ impl NetFinder {
         // can discover a net from any starting spot.
         starting_points[0] = vec![FacePos::new(cuboids[0])];
 
-        // let mut starting_face_positions =
-        // vec![cuboids.iter().copied().map(FacePos::new).collect();
-        // starting_points.iter().map(|vec| vec.len()).product()];
-        let mut starting_face_positions: Vec<Vec<FacePos>> = Vec::new();
+        let mut starting_face_positions: Vec<heapless::Vec<FacePos, 3>> = Vec::new();
         let mut indices: Vec<_> = cuboids.iter().map(|_| 0_usize).collect();
         'outer: loop {
             starting_face_positions.push(
@@ -880,13 +877,14 @@ impl NetFinder {
             // Add the new things we can do from here to the queue.
             for direction in [Left, Up, Right, Down] {
                 if let Some(net_pos) = net_pos.moved_in(direction, self.net.size()) {
+                    // `heapless::Vec`'s `FromIterator` impl isn't very efficient, which is why we clone and modify instead.
+                    let mut face_positions = self.queue[self.index].face_positions.clone();
+                    face_positions
+                        .iter_mut()
+                        .for_each(|pos| pos.move_in(direction));
                     let instruction = Instruction {
                         net_pos,
-                        face_positions: self.queue[self.index]
-                            .face_positions
-                            .iter()
-                            .map(|&pos| pos.moved_in(direction))
-                            .collect(),
+                        face_positions,
                         followup_index: None,
                     };
                     if !self.queue.contains(&instruction) {
