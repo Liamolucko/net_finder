@@ -930,16 +930,26 @@ fn state_path(cuboids: &[Cuboid]) -> PathBuf {
 pub fn find_nets(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net>> {
     let finders = NetFinder::new(cuboids)?;
 
-    Ok(run(cuboids, finders))
+    Ok(run(cuboids, finders, HashSet::new()))
+}
+
+#[derive(Serialize, Deserialize)]
+struct State {
+    finders: Vec<NetFinder>,
+    yielded_nets: HashSet<Net>,
 }
 
 pub fn resume(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net>> {
     let bytes = fs::read(state_path(cuboids)).context("no state to resume from")?;
-    let finders: Vec<NetFinder> = postcard::from_bytes(&bytes)?;
-    Ok(run(cuboids, finders))
+    let state: State = postcard::from_bytes(&bytes)?;
+    Ok(run(cuboids, state.finders, state.yielded_nets))
 }
 
-fn run(cuboids: &[Cuboid], finders: Vec<NetFinder>) -> impl Iterator<Item = Net> {
+fn run(
+    cuboids: &[Cuboid],
+    finders: Vec<NetFinder>,
+    mut yielded_nets: HashSet<Net>,
+) -> impl Iterator<Item = Net> {
     let (net_tx, net_rx) = mpsc::channel();
     let (finder_senders, mut finder_receivers): (Vec<_>, Vec<_>) = finders
         .iter()
@@ -995,29 +1005,47 @@ fn run(cuboids: &[Cuboid], finders: Vec<NetFinder>) -> impl Iterator<Item = Net>
 
     println!("threads spawned!");
 
+    let (yielded_nets_tx, yielded_nets_rx) = mpsc::channel();
+
     let cuboids = cuboids.to_vec();
+    let yielded_nets_clone = yielded_nets.clone();
     // Spawn a thread whose sole purpose is to periodically record our state to a
     // file.
     thread::spawn(move || {
         // Create the folder where we're going to store our state.
         fs::create_dir_all(Path::new(env!("CARGO_MANIFEST_DIR")).join("state")).unwrap();
+        let mut yielded_nets = yielded_nets_clone;
         loop {
             let finders: Vec<_> = finder_receivers
                 .iter_mut()
                 .filter_map(|rx| rx.recv().ok())
                 .collect();
 
+            while let Ok(net) = yielded_nets_rx.try_recv() {
+                yielded_nets.insert(net);
+            }
+
             fs::write(
                 state_path(&cuboids),
-                &postcard::to_stdvec(&finders).unwrap(),
+                &postcard::to_stdvec(&State {
+                    finders,
+                    yielded_nets: yielded_nets.clone(),
+                })
+                .unwrap(),
             )
             .unwrap();
         }
     });
 
-    let mut yielded_nets = HashSet::new();
-    net_rx.into_iter().filter(move |net| {
-        let new = yielded_nets.insert(net.clone());
-        new
-    })
+    // Yield all our previous yielded nets before starting the new ones
+    yielded_nets
+        .clone()
+        .into_iter()
+        .chain(net_rx.into_iter().filter(move |net| {
+            let new = yielded_nets.insert(net.clone());
+            if new {
+                yielded_nets_tx.send(net.clone()).unwrap();
+            }
+            new
+        }))
 }
