@@ -829,19 +829,6 @@ impl NetFinder {
             .collect())
     }
 
-    /// Set a square on the net and surfaces of the cuboids simultaneously.
-    fn set_square(&mut self, net_pos: Pos, face_positions: &[FacePos], value: bool) {
-        match (self.net.filled(net_pos), value) {
-            (false, true) => self.area += 1,
-            (true, false) => self.area -= 1,
-            _ => {}
-        }
-        self.net.set(net_pos, value);
-        for (surface, &pos) in zip(&mut self.surfaces, face_positions) {
-            surface.set(pos, value);
-        }
-    }
-
     /// Undoes the last instruction that was successfully carried out.
     ///
     /// Returns whether backtracking was successful. If `false` is returned,
@@ -859,10 +846,7 @@ impl NetFinder {
         // Mark it as unsuccessful.
         instruction.followup_index = None;
         // Remove the square it added.
-        let net_pos = instruction.net_pos;
-        // inefficient :(
-        let face_positions = instruction.face_positions.clone();
-        self.set_square(net_pos, &face_positions, false);
+        self.set_square(last_success_index, false);
         // Then remove all the instructions added as a result of this square.
         self.queue.resize_with(followup_index, || unreachable!());
         // We continue executing from just after the instruction we undid.
@@ -870,49 +854,67 @@ impl NetFinder {
         true
     }
 
-    /// Evaluate the instruction at the current index in the queue, incrementing
+    /// Handle the instruction at the current index in the queue, incrementing
     /// the index afterwards.
-    fn evaluate_instruction(&mut self) {
+    fn handle_instruction(&mut self) {
         let next_index = self.queue.len();
         let Instruction {
             net_pos,
             ref face_positions,
             ..
         } = self.queue[self.index];
-        // this is inefficient but I'm too lazy to fight the borrow checker right now.
-        let face_positions = face_positions.clone();
         if !self.net.filled(net_pos)
-            && !zip(&self.surfaces, &face_positions).any(|(surface, &pos)| surface.filled(pos))
+            && !zip(&self.surfaces, face_positions).any(|(surface, &pos)| surface.filled(pos))
             && !self.queue.iter().any(|instruction| {
                 // If we find an instruction which is trying to put a square in the same
                 // position on the net, but will produce a square in a different position on one
                 // of the cuboids' surfaces, that means a cut would be needed, and this square
                 // is invalid.
-                instruction.net_pos == net_pos && instruction.face_positions != face_positions
+                instruction.net_pos == net_pos && instruction.face_positions != *face_positions
             })
         {
             // The space is free, so we fill it.
-            self.set_square(net_pos, &face_positions, true);
+            self.set_square(self.index, true);
             self.queue[self.index].followup_index = Some(next_index);
 
             // Add the new things we can do from here to the queue.
-            let new_instructions: Vec<_> = [Left, Up, Right, Down]
-                .into_iter()
-                .filter_map(|direction| {
-                    Some(Instruction {
-                        net_pos: net_pos.moved_in(direction, self.net.size())?,
-                        face_positions: face_positions
+            for direction in [Left, Up, Right, Down] {
+                if let Some(net_pos) = net_pos.moved_in(direction, self.net.size()) {
+                    let instruction = Instruction {
+                        net_pos,
+                        face_positions: self.queue[self.index]
+                            .face_positions
                             .iter()
                             .map(|&pos| pos.moved_in(direction))
                             .collect(),
                         followup_index: None,
-                    })
-                })
-                .filter(|instruction| !self.queue.contains(instruction))
-                .collect();
-            self.queue.extend_from_slice(&new_instructions);
+                    };
+                    if !self.queue.contains(&instruction) {
+                        self.queue.push(instruction);
+                    }
+                }
+            }
         }
         self.index += 1;
+    }
+
+    /// Set a square on the net and surfaces of the cuboids simultaneously,
+    /// specifying the square by the index of an instruction which sets it.
+    fn set_square(&mut self, instruction_index: usize, value: bool) {
+        let Instruction {
+            net_pos,
+            ref face_positions,
+            ..
+        } = self.queue[instruction_index];
+        match (self.net.filled(net_pos), value) {
+            (false, true) => self.area += 1,
+            (true, false) => self.area -= 1,
+            _ => {}
+        }
+        self.net.set(net_pos, value);
+        for (surface, &pos) in zip(&mut self.surfaces, face_positions) {
+            surface.set(pos, value);
+        }
     }
 }
 
@@ -972,7 +974,7 @@ fn run(cuboids: &[Cuboid], finders: Vec<NetFinder>) -> impl Iterator<Item = Net>
                     }
 
                     // Evaluate the next instruction in the queue.
-                    finder.evaluate_instruction();
+                    finder.handle_instruction();
 
                     send_counter = send_counter.wrapping_add(1);
                     if send_counter == 0 {
