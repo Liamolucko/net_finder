@@ -2,7 +2,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt::{self, Display, Formatter, Write};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::iter::zip;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -11,6 +11,7 @@ use std::{fs, thread};
 
 use anyhow::{bail, Context};
 use arbitrary::Arbitrary;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -138,7 +139,7 @@ impl PartialEq for Net {
 impl Eq for Net {}
 
 impl Hash for Net {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         // Create the 'canonical' version of this net by finding the rotation which
         // results in the lexicographically 'largest' value of `squares`.
         let canon = Rotations::new(self.shrink())
@@ -521,6 +522,12 @@ impl Pos {
     }
 }
 
+impl Display for Pos {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
 // A size in 2D space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Size {
@@ -703,6 +710,11 @@ pub struct NetFinder {
     net: Net,
     surfaces: Vec<Surface>,
     queue: Vec<Instruction>,
+    /// A map from net positions to the possible positions they could map to on
+    /// the cuboids' surfaces, annotated with how many times they pop up in the queue.
+    ///
+    /// There are only at most 4 - one from each adjacent position.
+    pos_possibilities: FxHashMap<Pos, heapless::Vec<heapless::Vec<FacePos, 3>, 4>>,
     /// The index of the next instruction in `queue` that will be evaluated.
     index: usize,
     /// The size of the net so far.
@@ -717,18 +729,32 @@ struct Instruction {
     net_pos: Pos,
     /// The equivalent positions on the surfaces of the cuboids.
     face_positions: heapless::Vec<FacePos, 3>,
-    /// If this instruction has been successfully carried out, the index in
-    /// `queue` at which the instructions added as a result of this instruction
-    /// begin.
-    ///
-    /// In other words, the length of the queue prior to this instruction being
-    /// carried out.
-    followup_index: Option<usize>,
+    state: InstructionState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum InstructionState {
+    /// The instruction has not been run or has been reverted.
+    NotRun,
+    Completed {
+        /// The index in `queue` at which the instructions added as a result of
+        /// this instruction begin.
+        followup_index: usize,
+    },
 }
 
 impl PartialEq for Instruction {
     fn eq(&self, other: &Self) -> bool {
         self.net_pos == other.net_pos && self.face_positions == other.face_positions
+    }
+}
+
+impl Eq for Instruction {}
+
+impl Hash for Instruction {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.net_pos.hash(state);
+        self.face_positions.hash(state);
     }
 }
 
@@ -812,12 +838,21 @@ impl NetFinder {
                 let queue = vec![Instruction {
                     net_pos: Pos::new(middle_x, middle_y),
                     face_positions,
-                    followup_index: None,
+                    state: InstructionState::NotRun,
                 }];
+                let mut pos_possibilities = FxHashMap::default();
+                pos_possibilities.insert(
+                    queue[0].net_pos,
+                    [queue[0].face_positions.clone()]
+                        .as_slice()
+                        .try_into()
+                        .unwrap(),
+                );
                 Self {
                     net: net.clone(),
                     surfaces: surfaces.clone(),
                     queue,
+                    pos_possibilities,
                     index: 0,
                     area: 0,
                     target_area: cuboids[0].surface_area(),
@@ -836,16 +871,21 @@ impl NetFinder {
             .queue
             .iter_mut()
             .enumerate()
-            .rfind(|(_, instruction)| instruction.followup_index.is_some()) else {
+            .rfind(|(_, instruction)| matches!(instruction.state, InstructionState::Completed { .. })) else {
                 return false
             };
-        let followup_index = instruction.followup_index.unwrap();
-        // Mark it as unsuccessful.
-        instruction.followup_index = None;
+        let InstructionState::Completed { followup_index } = instruction.state else { unreachable!() };
+        // Mark it as reverted.
+        instruction.state = InstructionState::NotRun;
         // Remove the square it added.
         self.set_square(last_success_index, false);
         // Then remove all the instructions added as a result of this square.
-        self.queue.resize_with(followup_index, || unreachable!());
+        for instruction in self.queue.drain(followup_index..) {
+            self.pos_possibilities
+                .get_mut(&instruction.net_pos)
+                .unwrap()
+                .retain(|face_positions| *face_positions != instruction.face_positions);
+        }
         // We continue executing from just after the instruction we undid.
         self.index = last_success_index + 1;
         true
@@ -854,30 +894,34 @@ impl NetFinder {
     /// Handle the instruction at the current index in the queue, incrementing
     /// the index afterwards.
     fn handle_instruction(&mut self) {
+        // for (index, instruction) in self.queue.iter().enumerate() {
+        //     println!(
+        //         "{marker}{index}: {}: {:?}",
+        //         instruction.net_pos,
+        //         instruction.state,
+        //         marker = if index == self.index { '>' } else { ' ' }
+        //     );
+        // }
+        // println!("----");
         let next_index = self.queue.len();
-        let Instruction {
-            net_pos,
-            ref face_positions,
-            ..
-        } = self.queue[self.index];
-        if !self.net.filled(net_pos)
-            && !zip(&self.surfaces, face_positions).any(|(surface, &pos)| surface.filled(pos))
-            && !self.queue.iter().any(|instruction| {
-                // If we find an instruction which is trying to put a square in the same
-                // position on the net, but will produce a square in a different position on one
-                // of the cuboids' surfaces, that means a cut would be needed, and this square
-                // is invalid.
-                instruction.net_pos == net_pos && instruction.face_positions != *face_positions
-            })
+        let instruction = &mut self.queue[self.index];
+        if !self.net.filled(instruction.net_pos)
+            && !zip(&self.surfaces, &instruction.face_positions)
+                .any(|(surface, &pos)| surface.filled(pos))
+            && self.pos_possibilities[&instruction.net_pos].len() == 1
         {
             // The space is free, so we fill it.
+            instruction.state = InstructionState::Completed {
+                followup_index: next_index,
+            };
+            let net_pos = instruction.net_pos;
             self.set_square(self.index, true);
-            self.queue[self.index].followup_index = Some(next_index);
 
             // Add the new things we can do from here to the queue.
             for direction in [Left, Up, Right, Down] {
                 if let Some(net_pos) = net_pos.moved_in(direction, self.net.size()) {
-                    // `heapless::Vec`'s `FromIterator` impl isn't very efficient, which is why we clone and modify instead.
+                    // `heapless::Vec`'s `FromIterator` impl isn't very efficient, which is why we
+                    // clone and modify instead.
                     let mut face_positions = self.queue[self.index].face_positions.clone();
                     face_positions
                         .iter_mut()
@@ -885,9 +929,16 @@ impl NetFinder {
                     let instruction = Instruction {
                         net_pos,
                         face_positions,
-                        followup_index: None,
+                        state: InstructionState::NotRun,
                     };
-                    if !self.queue.contains(&instruction) {
+                    let pos_possibilities = self
+                        .pos_possibilities
+                        .entry(instruction.net_pos)
+                        .or_insert(heapless::Vec::new());
+                    if !pos_possibilities.contains(&instruction.face_positions) {
+                        pos_possibilities
+                            .push(instruction.face_positions.clone())
+                            .unwrap();
                         self.queue.push(instruction);
                     }
                 }
