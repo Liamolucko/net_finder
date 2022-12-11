@@ -979,9 +979,8 @@ impl NetFinder {
         // println!("----");
         let next_index = self.queue.len();
         let instruction = &mut self.queue[self.index];
-        if !self.net.filled(instruction.net_pos)
-            && !zip(&self.surfaces, &instruction.face_positions)
-                .any(|(surface, &pos)| surface.filled(pos))
+        if !zip(&self.surfaces, &instruction.face_positions)
+            .any(|(surface, &pos)| surface.filled(pos))
             && self.pos_possibilities[&instruction.net_pos].len() == 1
         {
             // The space is free, so we fill it.
