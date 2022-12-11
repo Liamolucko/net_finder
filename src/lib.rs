@@ -263,7 +263,7 @@ impl Net {
     }
 
     /// Returns whether a given position on the net is filled.
-    fn filled(&self, pos: Pos) -> bool {
+    pub fn filled(&self, pos: Pos) -> bool {
         self.squares[pos.y * self.width + pos.x]
     }
 
@@ -388,18 +388,26 @@ impl Net {
 }
 
 /// A version of `Net` which stores which face each of its squares are on.
+#[derive(Debug, Clone)]
 pub struct ColoredNet {
     width: usize,
     squares: Vec<Option<Face>>,
 }
 
 impl ColoredNet {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            squares: vec![None; width * height],
+        }
+    }
+
     /// Set whether a spot on the net is filled.
-    fn set(&mut self, pos: Pos, value: Face) {
+    pub fn set(&mut self, pos: Pos, value: Face) {
         self.squares[pos.y * self.width + pos.x] = Some(value);
     }
 
-    fn get(&mut self, pos: Pos) -> Option<Face> {
+    pub fn get(&mut self, pos: Pos) -> Option<Face> {
         self.squares[pos.y * self.width + pos.x]
     }
 
@@ -411,11 +419,76 @@ impl ColoredNet {
             .flatten()
     }
 
+    /// Returns a mutable iterator over the rows of the net.
+    fn rows_mut(&mut self) -> impl Iterator<Item = &mut [Option<Face>]> {
+        (self.width != 0)
+            .then(|| self.squares.chunks_mut(self.width))
+            .into_iter()
+            .flatten()
+    }
+
     pub fn area(&self) -> usize {
         self.squares
             .iter()
             .filter(|&&square| square.is_some())
             .count()
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        if self.width == 0 {
+            0
+        } else {
+            self.squares.len() / self.width
+        }
+    }
+
+    /// Return a copy of this net with the empty space removed from around it.
+    pub fn shrink(&self) -> Self {
+        // The x and y at which the new net will start (inclusive).
+        // If these get left as their initial values after the end of the net, the net
+        // contains no squares.
+        let mut start_x = self.width();
+        let mut start_y = self.height();
+        // The x and y at which the new net will end (exclusive).
+        let mut end_x = 0;
+        let mut end_y = 0;
+
+        for (y, row) in self.rows().enumerate() {
+            for (x, &cell) in row.iter().enumerate() {
+                if cell.is_some() {
+                    // There's a cell in this row, so push the end row to the next row.
+                    end_y = y + 1;
+                    if x >= end_x {
+                        // There's a cell in this column, so push the end column to the next column.
+                        end_x = x + 1;
+                    }
+
+                    if x < start_x {
+                        start_x = x;
+                    }
+                    if y < start_y {
+                        start_y = y;
+                    }
+                }
+            }
+        }
+
+        if start_x == self.width() || start_y == self.height() {
+            // The net contains no squares. Just return an empty net.
+            return ColoredNet::new(0, 0);
+        }
+
+        let mut result = ColoredNet::new(end_x - start_x, end_y - start_y);
+
+        for (src, dst) in zip(self.rows().take(end_y).skip(start_y), result.rows_mut()) {
+            dst.copy_from_slice(&src[start_x..end_x])
+        }
+
+        result
     }
 }
 
@@ -468,13 +541,13 @@ impl Display for Net {
 
 // A position in 2D space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct Pos {
+pub struct Pos {
     x: usize,
     y: usize,
 }
 
 impl Pos {
-    fn new(x: usize, y: usize) -> Self {
+    pub fn new(x: usize, y: usize) -> Self {
         Self { x, y }
     }
 
@@ -575,7 +648,7 @@ impl Direction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
-enum Face {
+pub enum Face {
     Bottom,
     West,
     North,
@@ -587,11 +660,11 @@ enum Face {
 use Face::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct FacePos {
+pub struct FacePos {
     /// The cuboid which this position is on.
     cuboid: Cuboid,
     /// Which face this position is on.
-    face: Face,
+    pub face: Face,
     /// The position within the face.
     pos: Pos,
     /// The orientation of the current face.
@@ -707,19 +780,20 @@ impl Surface {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NetFinder {
-    net: Net,
+    pub net: Net,
     surfaces: Vec<Surface>,
     queue: Vec<Instruction>,
     /// A map from net positions to the possible positions they could map to on
-    /// the cuboids' surfaces, annotated with how many times they pop up in the queue.
+    /// the cuboids' surfaces, annotated with how many times they pop up in the
+    /// queue.
     ///
     /// There are only at most 4 - one from each adjacent position.
-    pos_possibilities: FxHashMap<Pos, heapless::Vec<heapless::Vec<FacePos, 3>, 4>>,
+    pub pos_possibilities: FxHashMap<Pos, heapless::Vec<heapless::Vec<FacePos, 3>, 4>>,
     /// The index of the next instruction in `queue` that will be evaluated.
     index: usize,
     /// The size of the net so far.
-    area: usize,
-    target_area: usize,
+    pub area: usize,
+    pub target_area: usize,
 }
 
 /// An instruction to add a square.
@@ -965,6 +1039,15 @@ impl NetFinder {
             surface.set(pos, value);
         }
     }
+
+    /// The cuboids this is finding nets for.
+    pub fn cuboids(&self) -> Vec<Cuboid> {
+        self.queue[0]
+            .face_positions
+            .iter()
+            .map(|face_pos| face_pos.cuboid)
+            .collect()
+    }
 }
 
 fn state_path(cuboids: &[Cuboid]) -> PathBuf {
@@ -985,9 +1068,9 @@ pub fn find_nets(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net>
 }
 
 #[derive(Serialize, Deserialize)]
-struct State {
-    finders: Vec<NetFinder>,
-    yielded_nets: HashSet<Net>,
+pub struct State {
+    pub finders: Vec<NetFinder>,
+    pub yielded_nets: HashSet<Net>,
 }
 
 pub fn resume(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net>> {

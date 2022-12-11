@@ -7,7 +7,9 @@ edition = "2021"
 anyhow = "1.0.66"
 arbitrary = "1.2.0"
 clap = { version = "4.0.29", features = ["derive"] }
+crossterm = "0.25.0"
 heapless = { version = "0.7.16", default-features = false, features = ["serde"] }
+notify = { version = "5.0.0", features = ["fsevent-sys", "macos_fsevent"], default-features = false }
 postcard = { version = "1.0.2", features = ["use-std"] }
 rustc-hash = "1.1.0"
 serde = { version = "1.0.149", features = ["derive"] }
