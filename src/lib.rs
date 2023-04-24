@@ -142,9 +142,7 @@ impl Hash for Net {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Create the 'canonical' version of this net by finding the rotation which
         // results in the lexicographically 'largest' value of `squares`.
-        let canon = Rotations::new(self.shrink())
-            .max_by(|a, b| a.squares.as_slice().cmp(b.squares.as_slice()))
-            .unwrap();
+        let canon = self.canon();
 
         canon.width.hash(state);
         canon.squares.hash(state);
@@ -260,6 +258,12 @@ impl Net {
         }
 
         result
+    }
+
+    pub fn canon(&self) -> Self {
+        Rotations::new(self.shrink())
+            .max_by(|a, b| a.squares.as_slice().cmp(b.squares.as_slice()))
+            .unwrap()
     }
 
     /// Returns whether a given position on the net is filled.
