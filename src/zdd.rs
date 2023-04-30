@@ -2,12 +2,17 @@
 
 use std::{
     collections::{HashSet, VecDeque},
-    hash::{Hash, Hasher},
+    hash::{BuildHasherDefault, Hash, Hasher},
+    iter::zip,
 };
 
 use crate::{Cuboid, Direction, Face, FacePos, Net, Pos};
 
-use rustc_hash::FxHashMap;
+use indexmap::{IndexMap, IndexSet};
+use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressIterator};
+use rayon::prelude::*;
+use rustc_hash::FxHasher;
+use serde::{Deserialize, Serialize};
 use Direction::*;
 use Face::*;
 
@@ -21,7 +26,7 @@ use Face::*;
 ///
 /// So, the results have to be filtered a bit after the fact to account for
 /// that.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zdd {
     /// The cuboid this is a ZDD for.
     cuboid: Cuboid,
@@ -38,12 +43,17 @@ pub struct Zdd {
 }
 
 /// A node in a ZDD.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Node {
     /// The node pointed to by the 0-edge of the node.
     zero_edge: NodeRef,
     /// The node pointed to by the 1-edge of the node.
     one_edge: NodeRef,
+}
+
+/// The state of the graph represented by a node in a ZDD.
+#[derive(Debug, Clone)]
+struct NodeState {
     /// The indices of the connected components that each vertex in the graph is
     /// in.
     components: Vec<usize>,
@@ -61,7 +71,7 @@ struct Node {
     sizes: Vec<usize>,
 }
 
-impl PartialEq for Node {
+impl PartialEq for NodeState {
     fn eq(&self, other: &Self) -> bool {
         self.components == other.components
         // TODO: do we consider the equality of `pendant`?
@@ -72,20 +82,18 @@ impl PartialEq for Node {
     }
 }
 
-impl Eq for Node {}
+impl Eq for NodeState {}
 
-impl Hash for Node {
+impl Hash for NodeState {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.components.hash(state)
     }
 }
 
-impl Node {
+impl NodeState {
     /// Create a new node without any info filled in.
     fn new(num_vertices: usize) -> Self {
         Self {
-            zero_edge: NodeRef::Zero,
-            one_edge: NodeRef::Zero,
             components: (0..num_vertices).collect(),
             pendant: vec![false; num_vertices],
             sizes: vec![1; num_vertices],
@@ -191,7 +199,7 @@ impl Node {
         edge: Edge,
         remaining_edges: &[Edge],
         frontier: &[usize],
-    ) -> Result<Node, ConstantNode> {
+    ) -> Result<NodeState, ConstantNode> {
         let new_node = self.clone();
 
         // First handle the exits of the individual vertices.
@@ -246,7 +254,7 @@ impl Node {
         edge: Edge,
         remaining_edges: &[Edge],
         frontier: &[usize],
-    ) -> Result<Node, ConstantNode> {
+    ) -> Result<NodeState, ConstantNode> {
         if self.components[edge.vertices[0]] == self.components[edge.vertices[1]] {
             // Adding this edge would create a cycle, which isn't allowed, so
             // discard this possibility by pointing to the zero-edge.
@@ -314,7 +322,7 @@ impl Node {
 }
 
 /// A node pointed to by an edge coming out of a node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum NodeRef {
     /// The 0-node.
     Zero,
@@ -340,7 +348,7 @@ enum ConstantNode {
 /// surface of a cuboid; it's the corner.
 /// To be clear, it's not just the corners of the entire cuboid, it still
 /// includes the corners of all the grid squares on the cuboid's surface.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Vertex {
     /// The cuboid this is a vertex of.
     cuboid: Cuboid,
@@ -354,7 +362,7 @@ struct Vertex {
 }
 
 /// A edge between two vertices of a cuboid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Edge {
     /// The indices of the two endpoints of this edge.
     ///
@@ -556,9 +564,6 @@ impl Zdd {
 
         let mut rows = vec![vec![]; edges.len()];
 
-        // Create the root node, which represents no edges having been added yet.
-        rows[0].push(Node::new(vertices.len()));
-
         // Create the list of 'frontiers', which is basically the list of vertices which
         // are still 'relevant' at a given row of the ZDD.
         // Each row of the ZDD represents an edge which is or isn't added to the graph.
@@ -580,69 +585,80 @@ impl Zdd {
             }
         }
 
+        // The state of the nodes in the current row.
+        let mut states: IndexSet<NodeState, BuildHasherDefault<FxHasher>> = IndexSet::default();
+        // Initialise it with the root node, which represents an empty graph.
+        states.insert(NodeState::new(vertices.len()));
+
+        let progress = MultiProgress::new();
+        let row_progress = ProgressBar::new(rows.len().try_into().unwrap());
+        progress.add(row_progress.clone());
+
         // Now go through one row at a time and fill in the ZDD.
-        for (i, &edge) in edges.iter().enumerate() {
-            // We need to do this so that we can exclusively borrow the next row at the same
-            // time as the current row.
-            let (row, rest) = rows[i..].split_first_mut().unwrap();
+        for (i, (row, &edge)) in zip(&mut rows, &edges)
+            .enumerate()
+            .progress_with(row_progress)
+        {
+            // Storage for the states of the nodes in the next row.
+            let mut next_states: IndexSet<NodeState, BuildHasherDefault<FxHasher>> =
+                IndexSet::default();
 
-            // Keep track of the indices where we've put nodes so far, so that we don't have
-            // to do a linear search.
-            let mut indices: FxHashMap<Node, usize> = FxHashMap::default();
-
-            for node in row {
-                // First fill in the 0-edge, which represents not adding this
-                // edge to the graph.
-                // We first create a new node representing this, and then check
-                // to see if there's already another one representing the same
-                // thing.
-                // If there is, use that one instead.
-                match node.zero_edge(edge, &edges[i + 1..], &frontiers[i]) {
-                    Ok(new_node) => {
-                        let next_row = rest
-                            .get_mut(0)
-                            .expect("node in last row didn't lead to a constant node");
-                        if let Some(&index) = indices.get(&new_node) {
-                            node.zero_edge = NodeRef::NextRow { index };
-                        } else {
-                            let index = next_row.len();
-                            next_row.push(new_node.clone());
-                            indices.insert(new_node, index);
-                            node.zero_edge = NodeRef::NextRow { index };
+            let node_progress = ProgressBar::new(states.len().try_into().unwrap());
+            progress.add(node_progress.clone());
+            // Go through states of the nodes in the current row and create the nodes that they
+            // should point to, then actually add the nodes to the graph.
+            states
+                .into_iter()
+                .progress_with(node_progress)
+                .for_each(|state| {
+                    // First create the 0-edge, which represents not adding this
+                    // edge to the graph.
+                    // We first create a new node representing this, and then check
+                    // to see if there's already another one representing the same
+                    // thing.
+                    // If there is, use that one instead.
+                    let zero_edge = match state.zero_edge(edge, &edges[i + 1..], &frontiers[i]) {
+                        Ok(new_node) => {
+                            if let Some(index) = next_states.get_index_of(&new_node) {
+                                NodeRef::NextRow { index }
+                            } else {
+                                let index = next_states.len();
+                                next_states.insert(new_node);
+                                NodeRef::NextRow { index }
+                            }
                         }
-                    }
-                    Err(constant_node) => {
-                        node.zero_edge = match constant_node {
+                        Err(constant_node) => match constant_node {
                             ConstantNode::Zero => NodeRef::Zero,
                             ConstantNode::One => NodeRef::One,
-                        }
-                    }
-                }
+                        },
+                    };
 
-                // Then we do the same thing for the 1-edge, which represents adding this edge
-                // to the graph.
-                match node.one_edge(edge, &edges[i + 1..], &frontiers[i]) {
-                    Ok(new_node) => {
-                        let next_row = rest
-                            .get_mut(0)
-                            .expect("node in last row didn't lead to a constant node");
-                        if let Some(&index) = indices.get(&new_node) {
-                            node.one_edge = NodeRef::NextRow { index };
-                        } else {
-                            let index = next_row.len();
-                            next_row.push(new_node.clone());
-                            indices.insert(new_node, index);
-                            node.one_edge = NodeRef::NextRow { index };
+                    // Then we do the same thing for the 1-edge, which represents adding this edge
+                    // to the graph.
+                    let one_edge = match state.one_edge(edge, &edges[i + 1..], &frontiers[i]) {
+                        Ok(new_node) => {
+                            if let Some(index) = next_states.get_index_of(&new_node) {
+                                NodeRef::NextRow { index }
+                            } else {
+                                let index = next_states.len();
+                                next_states.insert(new_node);
+                                NodeRef::NextRow { index }
+                            }
                         }
-                    }
-                    Err(constant_node) => {
-                        node.one_edge = match constant_node {
+                        Err(constant_node) => match constant_node {
                             ConstantNode::Zero => NodeRef::Zero,
                             ConstantNode::One => NodeRef::One,
-                        }
-                    }
-                }
-            }
+                        },
+                    };
+
+                    // Finally, add the filled-in node to the row.
+                    row.push(Node {
+                        zero_edge,
+                        one_edge,
+                    })
+                });
+
+            states = next_states;
         }
 
         Self {
@@ -679,12 +695,12 @@ impl Zdd {
         let node = &self.rows[0][0];
         let result =
             size(self, &mut cache, 0, node.zero_edge) + size(self, &mut cache, 0, node.one_edge);
-        for row in &cache[1..] {
-            for size in row {
-                print!("{} ", size.unwrap());
-            }
-            println!();
-        }
+        // for row in &cache[1..] {
+        //     for size in row {
+        //         print!("{} ", size.unwrap());
+        //     }
+        //     println!();
+        // }
         result
     }
 
