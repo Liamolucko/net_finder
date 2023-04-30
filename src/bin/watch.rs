@@ -25,10 +25,12 @@ fn main() -> anyhow::Result<()> {
     let changed = Arc::new(AtomicBool::new(false));
     let mut watcher = notify::recommended_watcher({
         let changed = Arc::clone(&changed);
-        move |res| match res {
-            Ok(_) => changed.store(true, Ordering::Relaxed),
-            // ignore it? idk
-            Err(_) => {}
+        move |res: Result<_, _>| {
+            if res.is_ok() {
+                changed.store(true, Ordering::Relaxed);
+            } else {
+                // ignore it? idk
+            }
         }
     })?;
     watcher.watch(&path, RecursiveMode::NonRecursive)?;
