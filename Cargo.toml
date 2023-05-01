@@ -9,6 +9,8 @@ arbitrary = "1.2.0"
 clap = { version = "4.0.29", features = ["derive"] }
 crossterm = "0.25.0"
 heapless = { version = "0.7.16", default-features = false, features = ["serde"] }
+indexmap = { version = "1.9.3" }
+indicatif = { version = "0.17.3" }
 notify = { version = "5.0.0", features = ["fsevent-sys", "macos_fsevent"], default-features = false }
 postcard = { version = "1.0.2", features = ["use-std"] }
 rustc-hash = "1.1.0"

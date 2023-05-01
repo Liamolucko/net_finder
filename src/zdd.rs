@@ -1,17 +1,19 @@
 // This implements the ZDD-based algorithm for finding common developments of cuboids described in http://dx.doi.org/10.1016/j.comgeo.2017.03.001.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{hash_map::DefaultHasher, HashSet, VecDeque},
     hash::{BuildHasherDefault, Hash, Hasher},
     iter::zip,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::{Cuboid, Direction, Face, FacePos, Net, Pos};
 
-use indexmap::{IndexMap, IndexSet};
-use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressIterator};
-use rayon::prelude::*;
-use rustc_hash::FxHasher;
+use indexmap::IndexSet;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
 use serde::{Deserialize, Serialize};
 use Direction::*;
 use Face::*;
@@ -517,6 +519,95 @@ impl PartialEq for Vertex {
 
 impl Eq for Vertex {}
 
+/// Entrypoint for a thread that computes one of the rows of a ZDD.
+fn row_thread(
+    edges: &[Edge],
+    frontier: &[usize],
+    progress_bar: ProgressBar,
+    index: usize,
+    receiver: mpsc::Receiver<NodeState>,
+    sender: Option<mpsc::SyncSender<NodeState>>,
+) -> Vec<Node> {
+    let edge = edges[index];
+
+    // The row of nodes that this thread is building up.
+    let mut row: Vec<Node> = Vec::new();
+
+    // Store the hashes of the `NodeState`s we're passing off to the next row for
+    // de-duplication. We don't store the actual `NodeState` to avoid using a
+    // comical amount of RAM; unfortunately, though, this leads to a risk of hash
+    // collisions. For the moment I'm just hoping they don't happen.
+    //
+    // TODO: this might be able to be solved by storing one of the paths through the
+    // ZDD that you can take to get to a `NodeState`, probably as a `u128` bitfield
+    // of taken edges, and then recreating it on the fly. You don't actually
+    // need access to the ZDD to do that, just to the list of edges. If computing
+    // that's too slow, you could maybe use an LRU cache or something.
+    // Since we're storing hashes anyway, `NoopHasher` is a hasher which just
+    // returns an input `u64` verbatim.
+    let mut state_hashes: IndexSet<u64, BuildHasherDefault<NoopHasher>> = IndexSet::default();
+
+    // Create a helper function that takes the result of `NodeState::zero_edge` or
+    // `NodeState::one_edge` and turns it into a `NodeRef`, handling all the
+    // de-duping and such.
+    let mut handle_state = |result: Result<NodeState, ConstantNode>| -> NodeRef {
+        match result {
+            Ok(new_node) => {
+                let hash = hash(&new_node);
+                if let Some(index) = state_hashes.get_index_of(&hash) {
+                    NodeRef::NextRow { index }
+                } else {
+                    // We've found a new `NodeState`, send it to the next row.
+                    sender
+                        .as_ref()
+                        .expect("node in last row doesn't lead to a constant node")
+                        .send(new_node)
+                        .unwrap();
+                    let index = state_hashes.len();
+                    state_hashes.insert(hash);
+                    NodeRef::NextRow { index }
+                }
+            }
+            Err(constant_node) => match constant_node {
+                ConstantNode::Zero => NodeRef::Zero,
+                ConstantNode::One => NodeRef::One,
+            },
+        }
+    };
+
+    let mut progress_last_updated = Instant::now();
+
+    // Receive `NodeState`s from the previous row and turn them into actual `Node`s.
+    for state in receiver.iter() {
+        // First create the 0-edge, which represents not adding this edge to the graph.
+        // We first create a new `NodeState` representing this, and then check
+        // `state_hashes` to see if it already exists. If it does, use that one instead.
+        let zero_edge = handle_state(state.zero_edge(edge, &edges[index + 1..], frontier));
+
+        // Then we do the same thing for the 1-edge, which represents adding this edge
+        // to the graph.
+        let one_edge = handle_state(state.one_edge(edge, &edges[index + 1..], frontier));
+
+        // Now add the new node to the row.
+        row.push(Node {
+            zero_edge,
+            one_edge,
+        });
+
+        // Updating the progress bar is surprisingly slow thanks to some mutex stuff, so
+        // only do it every 50ms.
+        if progress_last_updated.elapsed() > Duration::from_millis(50) {
+            progress_bar.set_position(row.len().try_into().unwrap());
+            progress_last_updated = Instant::now();
+        }
+    }
+
+    progress_bar.set_length(row.len().try_into().unwrap());
+    progress_bar.finish_and_clear();
+
+    row
+}
+
 impl Zdd {
     pub fn construct(cuboid: Cuboid) -> Self {
         // Enumerate all the vertices of the cuboid, starting with the corners.
@@ -562,8 +653,6 @@ impl Zdd {
             }
         }
 
-        let mut rows = vec![vec![]; edges.len()];
-
         // Create the list of 'frontiers', which is basically the list of vertices which
         // are still 'relevant' at a given row of the ZDD.
         // Each row of the ZDD represents an edge which is or isn't added to the graph.
@@ -572,7 +661,7 @@ impl Zdd {
         // The frontier for a row is the list of vertices which have been considered in
         // previous rows or are being considered for the first time this row, and which
         // will be considered again in future rows.
-        let mut frontiers = vec![vec![]; rows.len()];
+        let mut frontiers = vec![vec![]; edges.len()];
         for v in 0..vertices.len() {
             // Find the first and last time this vertex is considered, and then add the
             // vertex to the frontiers between them.
@@ -585,81 +674,65 @@ impl Zdd {
             }
         }
 
-        // The state of the nodes in the current row.
-        let mut states: IndexSet<NodeState, BuildHasherDefault<FxHasher>> = IndexSet::default();
-        // Initialise it with the root node, which represents an empty graph.
-        states.insert(NodeState::new(vertices.len()));
-
+        // Create a progress bar for each thread, which is initially hidden until the
+        // thread gets its first `NodeState` to process.
         let progress = MultiProgress::new();
-        let row_progress = ProgressBar::new(rows.len().try_into().unwrap());
-        progress.add(row_progress.clone());
+        let style = ProgressStyle::with_template("{prefix} {wide_bar} {pos}/{len}").unwrap();
+        let progress_bars: Vec<_> = (0..edges.len())
+            .map(|i| {
+                let bar = ProgressBar::hidden()
+                    .with_prefix(format!("row {}", i + 1))
+                    .with_style(style.clone());
+                bar.set_length(1);
+                progress.add(bar.clone());
+                bar
+            })
+            .collect();
 
-        // Now go through one row at a time and fill in the ZDD.
-        for (i, (row, &edge)) in zip(&mut rows, &edges)
-            .enumerate()
-            .progress_with(row_progress)
-        {
-            // Storage for the states of the nodes in the next row.
-            let mut next_states: IndexSet<NodeState, BuildHasherDefault<FxHasher>> =
-                IndexSet::default();
+        let rows = thread::scope(|s| {
+            let (senders, receivers): (Vec<_>, Vec<_>) = (0..edges.len())
+                .map(|_| mpsc::sync_channel::<NodeState>(100000))
+                .unzip();
+            // Extract the first sender, which is used to send the initial `NodeState` to
+            // the thread handling the first row.
+            let mut senders = senders.into_iter();
+            let first_sender = senders.next().unwrap();
+            let handles: Vec<_> = zip(senders.map(Some).chain([None]), receivers)
+                .enumerate()
+                .map(|(index, (sender, receiver))| {
+                    let edges = &edges;
+                    let frontiers = &frontiers[index];
+                    let progress_bar = progress_bars[index].clone();
+                    thread::Builder::new()
+                        .name(format!("row {}", index + 1))
+                        .spawn_scoped(s, move || {
+                            row_thread(edges, frontiers, progress_bar, index, receiver, sender)
+                        })
+                        .unwrap()
+                })
+                .collect();
 
-            let node_progress = ProgressBar::new(states.len().try_into().unwrap());
-            progress.add(node_progress.clone());
-            // Go through states of the nodes in the current row and create the nodes that they
-            // should point to, then actually add the nodes to the graph.
-            states
+            first_sender.send(NodeState::new(vertices.len())).unwrap();
+            drop(first_sender);
+
+            while !handles.iter().all(|handle| handle.is_finished()) {
+                thread::sleep(Duration::from_millis(100));
+                // Every half-second, update the estimated lengths of the progress bars.
+                // We just make each one's estimated length twice the current length of the
+                // previous one. This doesn't work very well, but it doesn't really matter.
+                for i in 1..progress_bars.len() {
+                    let bar = &progress_bars[i];
+                    if !bar.is_finished() {
+                        bar.set_length(progress_bars[i - 1].position() * 2);
+                    }
+                }
+            }
+
+            handles
                 .into_iter()
-                .progress_with(node_progress)
-                .for_each(|state| {
-                    // First create the 0-edge, which represents not adding this
-                    // edge to the graph.
-                    // We first create a new node representing this, and then check
-                    // to see if there's already another one representing the same
-                    // thing.
-                    // If there is, use that one instead.
-                    let zero_edge = match state.zero_edge(edge, &edges[i + 1..], &frontiers[i]) {
-                        Ok(new_node) => {
-                            if let Some(index) = next_states.get_index_of(&new_node) {
-                                NodeRef::NextRow { index }
-                            } else {
-                                let index = next_states.len();
-                                next_states.insert(new_node);
-                                NodeRef::NextRow { index }
-                            }
-                        }
-                        Err(constant_node) => match constant_node {
-                            ConstantNode::Zero => NodeRef::Zero,
-                            ConstantNode::One => NodeRef::One,
-                        },
-                    };
-
-                    // Then we do the same thing for the 1-edge, which represents adding this edge
-                    // to the graph.
-                    let one_edge = match state.one_edge(edge, &edges[i + 1..], &frontiers[i]) {
-                        Ok(new_node) => {
-                            if let Some(index) = next_states.get_index_of(&new_node) {
-                                NodeRef::NextRow { index }
-                            } else {
-                                let index = next_states.len();
-                                next_states.insert(new_node);
-                                NodeRef::NextRow { index }
-                            }
-                        }
-                        Err(constant_node) => match constant_node {
-                            ConstantNode::Zero => NodeRef::Zero,
-                            ConstantNode::One => NodeRef::One,
-                        },
-                    };
-
-                    // Finally, add the filled-in node to the row.
-                    row.push(Node {
-                        zero_edge,
-                        one_edge,
-                    })
-                });
-
-            states = next_states;
-        }
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
 
         Self {
             cuboid,
@@ -913,5 +986,30 @@ impl Zdd {
 
             net.shrink()
         })
+    }
+}
+
+fn hash(node: &NodeState) -> u64 {
+    // We could use `FxHasher` here for speed, but I'm hoping that `DefaultHasher`
+    // has less risk of a hash collision.
+    let mut hasher = DefaultHasher::new();
+    node.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[derive(Debug, Default)]
+struct NoopHasher(Option<u64>);
+
+impl Hasher for NoopHasher {
+    fn finish(&self) -> u64 {
+        self.0.unwrap()
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!()
+    }
+
+    fn write_u64(&mut self, val: u64) {
+        self.0 = Some(val);
     }
 }
