@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::{fs, io::BufWriter};
 
 use clap::Parser;
+use indicatif::HumanBytes;
 use net_finder::{Cuboid, Net, Zdd};
 use postcard::ser_flavors::Flavor;
 use rayon::prelude::*;
@@ -52,7 +53,7 @@ fn main() -> anyhow::Result<()> {
     let zdd: Zdd = postcard::from_bytes(&bytes)?;
     // No need to keep this 3GB binary blob around.
     drop(bytes);
-    println!("ZDD takes up {} bytes.", zdd.heap_size());
+    println!("ZDD takes up {} bytes.", HumanBytes(zdd.heap_size() as u64));
 
     let mut nets: FxHashSet<Net> = zdd.par_nets().collect();
     nets.retain(|net| net.color(cuboid).is_some());
