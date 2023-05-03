@@ -4,6 +4,7 @@ use std::{
     collections::{hash_map::DefaultHasher, HashSet, VecDeque},
     hash::{BuildHasherDefault, Hash, Hasher},
     iter::zip,
+    mem,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -14,6 +15,11 @@ use crate::{Cuboid, Direction, Face, FacePos, Net, Pos};
 use indexmap::IndexSet;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
+use rayon::{
+    iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer},
+    prelude::ParallelIterator,
+};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use Direction::*;
 use Face::*;
@@ -364,7 +370,7 @@ struct Vertex {
 }
 
 /// A edge between two vertices of a cuboid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 struct Edge {
     /// The indices of the two endpoints of this edge.
     ///
@@ -610,48 +616,8 @@ fn row_thread(
 
 impl Zdd {
     pub fn construct(cuboid: Cuboid) -> Self {
-        // Enumerate all the vertices of the cuboid, starting with the corners.
-        let mut vertices: Vec<_> = [
-            (Bottom, Pos::new(0, 0)),
-            (Bottom, Pos::new(0, cuboid.depth)),
-            (Bottom, Pos::new(cuboid.width, 0)),
-            (Bottom, Pos::new(cuboid.width, cuboid.depth)),
-            (Top, Pos::new(0, 0)),
-            (Top, Pos::new(0, cuboid.depth)),
-            (Top, Pos::new(cuboid.width, 0)),
-            (Top, Pos::new(cuboid.width, cuboid.depth)),
-        ]
-        .into_iter()
-        .map(|(face, pos)| Vertex { cuboid, face, pos })
-        .collect();
-
-        for face in [Bottom, West, North, East, South, Top] {
-            let size = cuboid.face_size(face);
-            for x in 0..=size.width {
-                for y in 0..=size.height {
-                    let vertex = Vertex {
-                        cuboid,
-                        face,
-                        pos: Pos { x, y },
-                    };
-                    if !vertices.contains(&vertex) {
-                        vertices.push(vertex);
-                    }
-                }
-            }
-        }
-
-        // Enumerate all the edges of the cuboid.
-        let mut edges = Vec::new();
-        for (i, v1) in vertices.iter().enumerate() {
-            for v2 in v1.neighbours() {
-                let j = vertices.iter().position(|&vertex| vertex == v2).unwrap();
-                let edge = Edge::new(i, j);
-                if !edges.contains(&edge) {
-                    edges.push(edge);
-                }
-            }
-        }
+        // Enumerate all the vertices and edges of the cuboid.
+        let (vertices, edges) = Self::compute_geometry(cuboid);
 
         // Create the list of 'frontiers', which is basically the list of vertices which
         // are still 'relevant' at a given row of the ZDD.
@@ -742,6 +708,72 @@ impl Zdd {
         }
     }
 
+    /// Computes the vertices and edges of a cuboid.
+    fn compute_geometry(cuboid: Cuboid) -> (Vec<Vertex>, Vec<Edge>) {
+        // Enumerate all the vertices of the cuboid, starting with the corners..
+        let mut vertices: Vec<_> = [
+            (Bottom, Pos::new(0, 0)),
+            (Bottom, Pos::new(0, cuboid.depth)),
+            (Bottom, Pos::new(cuboid.width, 0)),
+            (Bottom, Pos::new(cuboid.width, cuboid.depth)),
+            (Top, Pos::new(0, 0)),
+            (Top, Pos::new(0, cuboid.depth)),
+            (Top, Pos::new(cuboid.width, 0)),
+            (Top, Pos::new(cuboid.width, cuboid.depth)),
+        ]
+        .into_iter()
+        .map(|(face, pos)| Vertex { cuboid, face, pos })
+        .collect();
+
+        for face in [Bottom, West, North, East, South, Top] {
+            let size = cuboid.face_size(face);
+            for x in 0..=size.width {
+                for y in 0..=size.height {
+                    let vertex = Vertex {
+                        cuboid,
+                        face,
+                        pos: Pos { x, y },
+                    };
+                    if !vertices.contains(&vertex) {
+                        vertices.push(vertex);
+                    }
+                }
+            }
+        }
+
+        // Enumerate all the edges of the cuboid.
+        let mut edges = Vec::new();
+        for (i, v1) in vertices.iter().enumerate() {
+            for v2 in v1.neighbours() {
+                let j = vertices.iter().position(|&vertex| vertex == v2).unwrap();
+                let edge = Edge::new(i, j);
+                if !edges.contains(&edge) {
+                    edges.push(edge);
+                }
+            }
+        }
+
+        (vertices, edges)
+    }
+
+    pub fn cuboid_info(cuboid: Cuboid) -> (usize, usize) {
+        let (vertices, edges) = Self::compute_geometry(cuboid);
+
+        (vertices.len(), edges.len())
+    }
+
+    pub fn vertex_indices(&self) -> FxHashMap<(Face, Pos), usize> {
+        let mut vertex_indices = FxHashMap::default();
+        for (i, vertex) in self.vertices.iter().copied().enumerate() {
+            for face in [Bottom, West, North, East, South, Top] {
+                if let Some(pos) = vertex.pos_on_face(face) {
+                    vertex_indices.insert((face, pos), i);
+                }
+            }
+        }
+        vertex_indices
+    }
+
     /// Returns the number of developments this ZDD represents.
     pub fn size(&self) -> usize {
         // Set up a cache for the number of developments represented by each node.
@@ -779,214 +811,340 @@ impl Zdd {
 
     /// Returns an iterator over the set of sets of cut edges this ZDD
     /// represents.
-    fn edges(&self) -> impl Iterator<Item = Vec<Edge>> + '_ {
-        struct EdgeIter<'a> {
-            zdd: &'a Zdd,
-            /// The combination of edges we're going to try next.
-            next_combination: Vec<bool>,
-        }
-
-        impl EdgeIter<'_> {
-            fn inc_combination(&mut self) -> Result<(), ()> {
-                let mut i = self.next_combination.len() - 1;
-                loop {
-                    match self.next_combination[i] {
-                        false => {
-                            self.next_combination[i] = true;
-                            return Ok(());
-                        }
-                        true => {
-                            if i == 0 {
-                                return Err(());
-                            } else {
-                                self.next_combination[i] = false;
-                                i -= 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        impl Iterator for EdgeIter<'_> {
-            type Item = Vec<Edge>;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                // Keep trying combinations till we find one that works.
-                while !self.zdd.path_exists(&self.next_combination) {
-                    if self.inc_combination().is_err() {
-                        return None;
-                    }
-                }
-
-                let result = self
-                    .next_combination
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, included)| included.then_some(self.zdd.edges[i]))
-                    .collect();
-
-                // Then increment the combination to try next time.
-                let _ = self.inc_combination();
-
-                Some(result)
-            }
-        }
-
-        EdgeIter {
-            zdd: self,
-            next_combination: vec![false; self.edges.len()],
-        }
-    }
-
-    /// Whether a path exists for the given combination of edges; i.e., whether
-    /// it results in a valid net.
-    fn path_exists(&self, combination: &[bool]) -> bool {
-        let mut node = &self.rows[0][0];
-        let mut next_row = 1;
-        for (i, edge) in combination.iter().enumerate() {
-            let next_node = match edge {
-                false => node.zero_edge,
-                true => node.one_edge,
-            };
-            match next_node {
-                NodeRef::Zero => return false,
-                // When we skip to the 1-node, no further edges are added, so make sure there aren't
-                // any extra edges being added that shouldn't.
-                NodeRef::One => return !combination[i + 1..].contains(&true),
-                NodeRef::NextRow { index } => node = &self.rows[next_row][index],
-            }
-            next_row += 1;
-        }
-        // We should always get to the 0-node or 1-node before running out of rows.
-        // Besides, if that did happen we'd run into an out-of-bounds error trying to
-        // access `self.rows[next_row]` before getting here.
-        unreachable!()
+    fn edges(&self) -> EdgeIter<'_> {
+        EdgeIter::new(self)
     }
 
     /// Returns an iterator over the list of nets that this ZDD represents.
     pub fn nets(&self) -> impl Iterator<Item = Net> + '_ {
-        self.edges().map(|edges| {
-            let mut net = Net::for_cuboids(&[self.cuboid]);
-            let middle_x = net.width() / 2;
-            let middle_y = net.height() / 2;
+        // Create a mapping from face and position to the index of the vertex with that
+        // position, to avoid having to use `pos_on_face` and iterating through the list
+        // of vertices every time.
+        let vertex_indices = self.vertex_indices();
 
-            // Start in the middle of the net, and traverse out as far as we can until we
-            // run into edges.
-            let pos = Pos {
-                x: middle_x,
-                y: middle_y,
-            };
-            let face_pos = FacePos::new(self.cuboid);
-
-            // Create a queue of places to try extruding squares.
-            let mut queue: VecDeque<_> = [Left, Up, Right, Down]
-                .into_iter()
-                .map(|direction| (pos, face_pos, direction))
-                .collect();
-
-            while let Some((mut pos, mut face_pos, direction)) = queue.pop_front() {
-                // Construct the edge that would stop this from happening.
-
-                // First, figure out the endpoints on this face of the edge.
-
-                // Also, a note on indexing here: the vertex with the same `Pos` value as a face
-                // position actually represents the bottom left corners of the square at that
-                // face position. So, you can add 1 to the x and y of the
-                // position to get to the other corners of the square.
-                let (pos1, pos2) = match direction.turned(face_pos.orientation) {
-                    Left => (
-                        Pos {
-                            x: face_pos.pos.x,
-                            y: face_pos.pos.y,
-                        },
-                        Pos {
-                            x: face_pos.pos.x,
-                            y: face_pos.pos.y + 1,
-                        },
-                    ),
-                    Up => (
-                        Pos {
-                            x: face_pos.pos.x,
-                            y: face_pos.pos.y + 1,
-                        },
-                        Pos {
-                            x: face_pos.pos.x + 1,
-                            y: face_pos.pos.y + 1,
-                        },
-                    ),
-                    Right => (
-                        Pos {
-                            x: face_pos.pos.x + 1,
-                            y: face_pos.pos.y,
-                        },
-                        Pos {
-                            x: face_pos.pos.x + 1,
-                            y: face_pos.pos.y + 1,
-                        },
-                    ),
-                    Down => (
-                        Pos {
-                            x: face_pos.pos.x,
-                            y: face_pos.pos.y,
-                        },
-                        Pos {
-                            x: face_pos.pos.x + 1,
-                            y: face_pos.pos.y,
-                        },
-                    ),
-                };
-
-                // Then build vertices out of them.
-                let v1 = Vertex {
-                    pos: pos1,
-                    face: face_pos.face,
-                    cuboid: face_pos.cuboid,
-                };
-                let v2 = Vertex {
-                    pos: pos2,
-                    face: face_pos.face,
-                    cuboid: face_pos.cuboid,
-                };
-
-                // Then find the indices of those vertices in the ZDD, and build an edge out of
-                // them.
-                let i1 = self
-                    .vertices
-                    .iter()
-                    .position(|vertex| *vertex == v1)
-                    .unwrap();
-                let i2 = self
-                    .vertices
-                    .iter()
-                    .position(|vertex| *vertex == v2)
-                    .unwrap();
-                let edge = Edge::new(i1, i2);
-
-                // Finally, check if that edge that would stop us exists. If not, we add the
-                // square.
-                if edges.contains(&edge) {
-                    continue;
-                }
-
-                pos.move_in(direction, net.size());
-                face_pos.move_in(direction);
-
-                net.set(pos, true);
-
-                // Then add the new spots we could extrude squares to the queue.
-                for direction in [Left, Up, Right, Down] {
-                    if let Some(new_pos) = pos.moved_in(direction, net.size()) {
-                        if !net.filled(new_pos) {
-                            queue.push_back((pos, face_pos, direction));
-                        }
-                    }
-                }
-            }
-
-            net.shrink()
+        Iterator::map(self.edges(), move |edges| {
+            net_from_edges(self.cuboid, edges, &vertex_indices)
         })
     }
+
+    /// Returns a parallel iterator over the list of nets that this ZDD
+    /// represents.
+    pub fn par_nets(&self) -> impl ParallelIterator<Item = Net> + '_ {
+        // Create a mapping from face and position to the index of the vertex with that
+        // position, to avoid having to use `pos_on_face` and iterating through the list
+        // of vertices every time.
+        let vertex_indices = self.vertex_indices();
+
+        ParallelIterator::map(self.edges(), move |edges| {
+            net_from_edges(self.cuboid, edges, &vertex_indices)
+        })
+    }
+
+    /// Returns the (approximate) amount of space this ZDD takes up on the heap.
+    ///
+    /// Approximate because I couldn't be bothered to count anything other than
+    /// the nodes, which take up basically all the space anyway.
+    pub fn heap_size(&self) -> usize {
+        let nodes: usize = self.rows.iter().map(|row| row.len()).sum();
+        nodes * mem::size_of::<Node>()
+    }
+}
+
+#[derive(Clone)]
+struct EdgeIter<'a> {
+    zdd: &'a Zdd,
+    /// The current path through the ZDD we're looking at.
+    /// Between calls to `next`, this is the path we're going to try
+    /// next.
+    stack: Vec<(Node, bool)>,
+    /// If this is being used in parallel, the index in `stack` at which this
+    /// iterator was split off. In other words, it's the point in `stack` we
+    /// shouldn't backtrack past, because that's other threads' jobs.
+    /// This is implemented semi-crudely; `advance` ignores this and keeps
+    /// backtracking anyway, but then `endpoint` returns `None` once the split
+    /// point has been popped off, so it works out.
+    split_point: usize,
+}
+
+impl<'a> EdgeIter<'a> {
+    fn new(zdd: &'a Zdd) -> Self {
+        Self {
+            stack: vec![(zdd.rows[0][0], false)],
+            zdd,
+            split_point: 0,
+        }
+    }
+
+    /// Returns the node that the path currently leads to.
+    fn endpoint(&self) -> Option<NodeRef> {
+        if self.stack.len() <= self.split_point {
+            return None;
+        }
+        let (node, edge) = self.stack.last()?;
+        Some(match edge {
+            false => node.zero_edge,
+            true => node.one_edge,
+        })
+    }
+
+    /// Move `stack` forward to the next valid path, without actually
+    /// looking at what it leads to.
+    fn advance(&mut self) {
+        if let Some(NodeRef::NextRow { index }) = self.endpoint() {
+            // Add the new node to the stack.
+            let node = self.zdd.rows[self.stack.len()][index];
+            self.stack.push((node, false));
+        } else {
+            // Backtrack until we find a node that we haven't already tried both edges of.
+            while matches!(self.stack.last(), Some((_, true))) {
+                self.stack.pop();
+            }
+            // Then try its other edge, assuming we haven't exhausted all the possibilities
+            // making it `None`.
+            if let Some((_, edge)) = self.stack.last_mut() {
+                *edge = true;
+            }
+        }
+    }
+}
+
+impl Iterator for EdgeIter<'_> {
+    type Item = Vec<Edge>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Keep traversing the ZDD until we get to a 1-node.
+        // Also, if `self.endpoint()` returns `None`, we've exhausted all possibilities,
+        // so propagate the `None`.
+        while self.endpoint()? != NodeRef::One {
+            self.advance();
+        }
+
+        // If we broke out of the loop, we've found a path to a 1-node.
+        let result = self
+            .stack
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, included))| included.then_some(self.zdd.edges[i]))
+            .collect();
+
+        // Advance the path for next time.
+        self.advance();
+
+        Some(result)
+    }
+}
+
+impl UnindexedProducer for EdgeIter<'_> {
+    type Item = Vec<Edge>;
+
+    fn split(mut self) -> (Self, Option<Self>) {
+        if self.endpoint().is_none() {
+            // This iterator's already exhausted, don't bother splitting it.
+            return (self, None);
+        }
+
+        let old_split_point = self.split_point;
+
+        // Move upwards through the stack until we find a node we haven't tried both
+        // branches of yet.
+        while matches!(self.stack.get(self.split_point), Some((_, true))) {
+            self.split_point += 1;
+        }
+        if self.stack.get(self.split_point).is_none() {
+            // We've gone past the end of how far we've extended the stack through the ZDD,
+            // so we have to extend it by one more node so that we can split on its two
+            // edges.
+            // First we have to subtract 1 from the split point so that `endpoint` works,
+            // though.
+            self.split_point -= 1;
+            match self.endpoint() {
+                Some(NodeRef::NextRow { index }) => {
+                    // Add the new node to the stack.
+                    let node = self.zdd.rows[self.stack.len()][index];
+                    self.stack.push((node, false));
+                    self.split_point += 1;
+                }
+                // If everything up to here was a 1-edge, and the next node is a constant node, that
+                // means that this iterator's already exhausted, and just hasn't backtracked yet.
+                // Don't bother splitting.
+                _ => {
+                    self.split_point = old_split_point;
+                    return (self, None);
+                }
+            }
+        }
+
+        // Finally, we can use the two edges of the previous split point as the split
+        // points for the two new iterators.
+        let (split_point, _) = self.stack[self.split_point];
+        let (NodeRef::NextRow { index: index1 }, NodeRef::NextRow { index: index2 })
+            = (split_point.zero_edge, split_point.one_edge) else {
+            // We could try to traverse further to find a working split point, but what do
+            // we do if we find a 1-node that we should be yielding?
+            // It's a lot of hassle for what's probably a very rare case.
+            self.split_point = old_split_point;
+            return (self, None);
+        };
+        let mut other = self.clone();
+
+        if self.split_point == self.stack.len() - 1 {
+            // Add the split point to the existing iterator if it's not already there.
+            // (note: we know that this is already the 0-edge in the case where it's already
+            // there, since we made sure of that in the big loop above.)
+            let node = self.zdd.rows[self.stack.len()][index1];
+            self.stack.push((node, false));
+        }
+        self.split_point += 1;
+
+        // Get rid of the other iterator's stack beyond the old split point and then add
+        // its new split point.
+        other
+            .stack
+            .resize_with(other.split_point + 1, || unreachable!());
+        // Update the previous split point to say that the 1-edge was taken.
+        other.stack.last_mut().unwrap().1 = true;
+
+        let node = other.zdd.rows[other.stack.len()][index2];
+        other.stack.push((node, false));
+        other.split_point += 1;
+
+        (self, Some(other))
+    }
+
+    fn fold_with<F>(self, folder: F) -> F
+    where
+        F: Folder<Self::Item>,
+    {
+        folder.consume_iter(self)
+    }
+}
+
+impl ParallelIterator for EdgeIter<'_> {
+    type Item = Vec<Edge>;
+
+    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+    where
+        C: UnindexedConsumer<Self::Item>,
+    {
+        bridge_unindexed(self, consumer)
+    }
+}
+
+fn net_from_edges(
+    cuboid: Cuboid,
+    mut edges: Vec<Edge>,
+    vertex_indices: &FxHashMap<(Face, Pos), usize>,
+) -> Net {
+    edges.sort_unstable();
+    let mut net = Net::for_cuboids(&[cuboid]);
+    let middle_x = net.width() / 2;
+    let middle_y = net.height() / 2;
+
+    // Start in the middle of the net, and traverse out as far as we can until we
+    // run into edges.
+    let pos = Pos {
+        x: middle_x,
+        y: middle_y,
+    };
+    let face_pos = FacePos::new(cuboid);
+
+    net.set(pos, true);
+    let mut area = 1;
+
+    // Create a queue of places to try extruding squares.
+    let mut queue: VecDeque<_> = [Left, Up, Right, Down]
+        .into_iter()
+        .map(|direction| (pos, face_pos, direction))
+        .collect();
+
+    while let Some((pos, face_pos, direction)) = queue.pop_front() {
+        let new_pos = pos
+            .moved_in(direction, net.size())
+            .expect("this should have already been filtered out before adding to queue");
+        if net.filled(new_pos) {
+            continue;
+        }
+        let new_face_pos = face_pos.moved_in(direction);
+
+        // Construct the edge that would stop this from happening.
+
+        // First, figure out the endpoints on this face of the edge.
+
+        // Also, a note on indexing here: the vertex with the same `Pos` value as a face
+        // position actually represents the bottom left corner of the square at that
+        // face position. So, you can add 1 to the x and y of the position to get to the
+        // other corners of the square.
+        let (pos1, pos2) = match direction.turned(face_pos.orientation) {
+            Left => (
+                Pos {
+                    x: face_pos.pos.x,
+                    y: face_pos.pos.y,
+                },
+                Pos {
+                    x: face_pos.pos.x,
+                    y: face_pos.pos.y + 1,
+                },
+            ),
+            Up => (
+                Pos {
+                    x: face_pos.pos.x,
+                    y: face_pos.pos.y + 1,
+                },
+                Pos {
+                    x: face_pos.pos.x + 1,
+                    y: face_pos.pos.y + 1,
+                },
+            ),
+            Right => (
+                Pos {
+                    x: face_pos.pos.x + 1,
+                    y: face_pos.pos.y,
+                },
+                Pos {
+                    x: face_pos.pos.x + 1,
+                    y: face_pos.pos.y + 1,
+                },
+            ),
+            Down => (
+                Pos {
+                    x: face_pos.pos.x,
+                    y: face_pos.pos.y,
+                },
+                Pos {
+                    x: face_pos.pos.x + 1,
+                    y: face_pos.pos.y,
+                },
+            ),
+        };
+
+        // Then find the vertices at those positions.
+        let v1 = vertex_indices[&(face_pos.face, pos1)];
+        let v2 = vertex_indices[&(face_pos.face, pos2)];
+        let edge = Edge::new(v1, v2);
+
+        // Finally, check if that edge that would stop us exists. If not, we add the
+        // square.
+        if edges.binary_search(&edge).is_ok() {
+            continue;
+        }
+
+        net.set(new_pos, true);
+        area += 1;
+        if area > cuboid.surface_area() {
+            panic!("Invalid edge set found: {edges:?}");
+        }
+
+        // Then add the new spots we could extrude squares to the queue.
+        for direction in [Left, Up, Right, Down] {
+            if let Some(newer_pos) = new_pos.moved_in(direction, net.size()) {
+                if !net.filled(newer_pos) {
+                    queue.push_back((new_pos, new_face_pos, direction));
+                }
+            }
+        }
+    }
+
+    net.shrink()
 }
 
 fn hash(node: &NodeState) -> u64 {

@@ -228,56 +228,50 @@ impl Net {
     }
 
     /// Returns an iterator over the rows of the net.
-    pub fn rows(&self) -> impl Iterator<Item = &[bool]> {
-        (self.width != 0)
-            .then(|| self.squares.chunks(self.width))
-            .into_iter()
-            .flatten()
+    pub fn rows(&self) -> impl Iterator<Item = &[bool]> + DoubleEndedIterator + ExactSizeIterator {
+        self.squares.chunks(self.width)
     }
 
     /// Returns a mutable iterator over the rows of the net.
-    pub fn rows_mut(&mut self) -> impl Iterator<Item = &mut [bool]> {
-        (self.width != 0)
-            .then(|| self.squares.chunks_mut(self.width))
-            .into_iter()
-            .flatten()
+    pub fn rows_mut(
+        &mut self,
+    ) -> impl Iterator<Item = &mut [bool]> + DoubleEndedIterator + ExactSizeIterator {
+        self.squares.chunks_mut(self.width)
     }
 
     /// Return a copy of this net with the empty space removed from around it.
     pub fn shrink(&self) -> Self {
-        // The x and y at which the new net will start (inclusive).
-        // If these get left as their initial values after the end of the net, the net
-        // contains no squares.
-        let mut start_x = self.width();
-        let mut start_y = self.height();
-        // The x and y at which the new net will end (exclusive).
-        let mut end_x = 0;
-        let mut end_y = 0;
-
-        for (y, row) in self.rows().enumerate() {
-            for (x, &cell) in row.iter().enumerate() {
-                if cell {
-                    // There's a cell in this row, so push the end row to the next row.
-                    end_y = y + 1;
-                    if x >= end_x {
-                        // There's a cell in this column, so push the end column to the next column.
-                        end_x = x + 1;
-                    }
-
-                    if x < start_x {
-                        start_x = x;
-                    }
-                    if y < start_y {
-                        start_y = y;
-                    }
-                }
-            }
-        }
-
-        if start_x == self.width() || start_y == self.height() {
+        let start_y = self
+            .rows()
+            .position(|row| row.iter().map(|&square| square as usize).sum::<usize>() != 0);
+        let Some(start_y) = start_y else {
             // The net contains no squares. Just return an empty net.
             return Net::new(0, 0);
-        }
+        };
+        let end_y = self
+            .rows()
+            .rposition(|row| row.iter().map(|&square| square as usize).sum::<usize>() != 0)
+            .unwrap()
+            + 1;
+
+        let start_x = self
+            .rows()
+            .take(end_y)
+            .skip(start_y)
+            .map(|row| {
+                row.iter()
+                    .position(|&square| square == true)
+                    .unwrap_or(self.width())
+            })
+            .min()
+            .unwrap();
+        let end_x = self
+            .rows()
+            .take(end_y)
+            .skip(start_y)
+            .map(|row| row.iter().rposition(|&square| square == true).unwrap_or(0) + 1)
+            .max()
+            .unwrap();
 
         let mut result = Net::new(end_x - start_x, end_y - start_y);
 
