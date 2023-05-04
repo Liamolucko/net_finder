@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.66"
 arbitrary = "1.2.0"
-bitvec = "1.0.1"
 clap = { version = "4.0.29", features = ["derive"] }
 crossterm = "0.25.0"
 heapless = { version = "0.7.16", default-features = false, features = ["serde"] }

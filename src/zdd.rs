@@ -7,13 +7,12 @@ use std::{
     iter::zip,
     mem,
     sync::mpsc,
-    thread,
+    thread::{self, ScopedJoinHandle},
     time::{Duration, Instant},
 };
 
 use crate::{Cuboid, Direction, Face, FacePos, Net, Pos};
 
-use bitvec::prelude::*;
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
 
 use rayon::{
@@ -24,6 +23,11 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use Direction::*;
 use Face::*;
+
+/// The max. number of vertices allowed.
+/// This is 36 because that's all you need to be able to find ZDDs for 1x1x7 and
+/// 1x2x5 cuboids.
+const MAX_VERTICES: u8 = 36;
 
 /// A zero-suppressed binary decision diagram (ZDD), specialised for the purpose
 /// of storing developments of a cuboid.
@@ -53,12 +57,16 @@ pub struct Zdd {
 
 /// A node in a ZDD.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[repr(packed)]
 struct Node {
-    /// The combination of constant nodes and references to the next row that this node contains.
+    /// The combination of constant nodes and references to the next row that
+    /// this node contains.
     state: u8,
-    /// If the 0-edge of this node points to a node in the next row, the index of that node.
+    /// If the 0-edge of this node points to a node in the next row, the index
+    /// of that node.
     zero_edge_index: u32,
-    /// If the 1-edge of this node points to a node in the next row, the index of that node.
+    /// If the 1-edge of this node points to a node in the next row, the index
+    /// of that node.
     one_edge_index: u32,
 }
 
@@ -118,32 +126,45 @@ impl Node {
 /// The state of the graph represented by a node in a ZDD.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct NodeState {
-    /// The indices of the connected components that each vertex in the graph is
-    /// in.
-    components: Vec<u8>,
-    /// Whether each vertex in the graph is a pendant vertex.
-    ///
-    /// The original algorithm stores the degree of each vertex, but the only
-    /// thing that actually matters is whether the degree is 0, 1, or > 1.
-    /// You can already tell whether it's zero by checking `sizes`, and so all
-    /// we need is this set of booleans for whether the degree is 1.
-    pendant: BitVec,
+    /// Data about each vertex in the graph.
+    /// The MSB represents whether the vertex is pendant, and the rest of the
+    /// byte is the index of the component the vertex is in.
+    data: heapless::Vec<u8, { MAX_VERTICES as usize }>,
 }
 
 impl NodeState {
     /// Create a new node without any info filled in.
     fn new(num_vertices: u8) -> Self {
+        assert!(num_vertices <= MAX_VERTICES);
         Self {
-            components: (0..num_vertices).collect(),
-            pendant: bitvec![0; num_vertices.into()],
+            data: (0..num_vertices).collect(),
         }
     }
 
+    fn component(&self, vertex: usize) -> u8 {
+        self.data[vertex] & 0b01111111
+    }
+
+    fn set_component(&mut self, vertex: usize, component: u8) {
+        debug_assert!(component < MAX_VERTICES);
+        // Clear the old value, then OR in the new value.
+        self.data[vertex] &= 0b10000000;
+        self.data[vertex] |= component;
+    }
+
+    fn pendant(&self, vertex: usize) -> bool {
+        self.data[vertex] & 0b10000000 != 0
+    }
+
+    fn set_pendant(&mut self, vertex: usize, pendant: bool) {
+        self.data[vertex] &= 0b01111111;
+        self.data[vertex] |= (pendant as u8) << 7;
+    }
+
     fn size(&self, vertex: usize) -> usize {
-        let component = self.components[vertex];
-        self.components
-            .iter()
-            .filter(|&&other_component| other_component == component)
+        let component = self.component(vertex);
+        (0..self.data.len())
+            .filter(|&other_vertex| self.component(other_vertex) == component)
             .count()
     }
 
@@ -164,7 +185,7 @@ impl NodeState {
         } else {
             // Vertices that aren't corners are required to not be pendant vertices, since
             // they should just be glued together if that's the case.
-            if self.pendant[vertex] {
+            if self.pendant(vertex) {
                 return Err(ConstantNode::Zero);
             }
         }
@@ -192,11 +213,12 @@ impl NodeState {
         &self,
         vertex: usize,
         remaining_edges: &[Edge],
-        frontier: &[usize],
+        frontier: impl IntoIterator<Item = usize> + Clone,
     ) -> Result<(), ConstantNode> {
         if !frontier
-            .iter()
-            .any(|&other_vertex| self.components[other_vertex] == self.components[vertex])
+            .clone()
+            .into_iter()
+            .any(|other_vertex| self.component(other_vertex) == self.component(vertex))
         {
             // If there aren't any vertices left in the frontier that are in the same
             // connected component as this vertex, this component is now also never going to
@@ -205,7 +227,7 @@ impl NodeState {
             // If the component is of size > 1, it's _the_ connected component of the graph,
             // since there's only allowed to be one with size > 1.
             if self.size(vertex) > 1 {
-                if frontier.iter().any(|&vertex| self.size(vertex) > 1) {
+                if frontier.into_iter().any(|vertex| self.size(vertex) > 1) {
                     // There isn't allowed to be more than one connected component with size > 1, so
                     // this case is invalid.
                     return Err(ConstantNode::Zero);
@@ -254,39 +276,39 @@ impl NodeState {
             }
         }
 
-        // Create a modified version of the frontier which still contains the vertices
-        // of this edge, so that the first vertex still sees the second vertex as not
-        // having exited yet as it's exiting.
-        //
-        // The point of this is to make sure that if both vertices are exiting, and
-        // causing their components to exit, at the same time, the first vertex to exit
-        // sees the other one, and can make sure we don't have two connected components
-        // of size > 1.
-        //
-        // We only need to do this for the 0-edge because in the 1-edge, both vertices
-        // are in the same component anyway.
-        let mut modified_frontier = frontier.to_vec();
-        for vertex in edge.vertices {
-            if !modified_frontier.contains(&vertex) {
-                modified_frontier.push(vertex);
-            }
-        }
-
         // Then check if the exits of these vertices result in the exit of their
         // connected components.
-        for vertex in edge.vertices {
-            if !frontier.contains(&vertex) {
-                modified_frontier.swap_remove(
-                    modified_frontier
-                        .iter()
-                        .rposition(|v| *v == vertex)
-                        .unwrap(),
-                );
-
-                // This is the last edge containing the node, so we now check that all the
-                // conditions we place on nodes are satisfied.
-                self.handle_component_exit(vertex, remaining_edges, &modified_frontier)?
+        match (
+            frontier.contains(&edge.vertices[0]),
+            frontier.contains(&edge.vertices[1]),
+        ) {
+            (false, false) => {
+                self.handle_component_exit(
+                    edge.vertices[0],
+                    remaining_edges,
+                    frontier.iter().copied().chain([edge.vertices[1]]),
+                )?;
+                self.handle_component_exit(
+                    edge.vertices[1],
+                    remaining_edges,
+                    frontier.iter().copied(),
+                )?;
             }
+            (false, true) => {
+                self.handle_component_exit(
+                    edge.vertices[0],
+                    remaining_edges,
+                    frontier.iter().copied(),
+                )?;
+            }
+            (true, false) => {
+                self.handle_component_exit(
+                    edge.vertices[1],
+                    remaining_edges,
+                    frontier.iter().copied(),
+                )?;
+            }
+            (true, true) => {}
         }
 
         Ok(self.clone())
@@ -300,7 +322,7 @@ impl NodeState {
         remaining_edges: &[Edge],
         frontier: &[usize],
     ) -> Result<NodeState, ConstantNode> {
-        if self.components[edge.vertices[0]] == self.components[edge.vertices[1]] {
+        if self.component(edge.vertices[0]) == self.component(edge.vertices[1]) {
             // Adding this edge would create a cycle, which isn't allowed, so
             // discard this possibility by pointing to the zero-edge.
             return Err(ConstantNode::Zero);
@@ -313,17 +335,17 @@ impl NodeState {
         for vertex in edge.vertices {
             if new_node.size(vertex) == 1 {
                 // This vertex is getting its first edge added to it, and becoming pendant.
-                new_node.pendant.set(vertex, true);
-            } else if new_node.pendant[vertex] {
+                new_node.set_pendant(vertex, true);
+            } else if new_node.pendant(vertex) {
                 // This pendant vertex is getting a second edge added to it, and is no longer
                 // pendant.
-                new_node.pendant.set(vertex, false);
+                new_node.set_pendant(vertex, false);
             }
         }
 
         // Then we merge the two components that the endpoints of the edge are in.
-        let comp1 = new_node.components[edge.vertices[0]];
-        let comp2 = new_node.components[edge.vertices[1]];
+        let comp1 = new_node.component(edge.vertices[0]);
+        let comp2 = new_node.component(edge.vertices[1]);
         let min_comp = u8::min(comp1, comp2);
         let max_comp = u8::max(comp1, comp2);
 
@@ -334,8 +356,8 @@ impl NodeState {
         for &vertex in frontier.iter().chain(&edge.vertices) {
             // Set the component index for any vertices with the old component index to the
             // new index.
-            if new_node.components[vertex] == max_comp {
-                new_node.components[vertex] = new_index;
+            if new_node.component(vertex) == max_comp {
+                new_node.set_component(vertex, new_index);
             }
         }
 
@@ -353,7 +375,11 @@ impl NodeState {
             .into_iter()
             .all(|vertex| !frontier.contains(&vertex))
         {
-            new_node.handle_component_exit(edge.vertices[0], remaining_edges, frontier)?;
+            new_node.handle_component_exit(
+                edge.vertices[0],
+                remaining_edges,
+                frontier.iter().copied(),
+            )?;
         }
 
         Ok(new_node)
@@ -560,12 +586,14 @@ impl Eq for Vertex {}
 fn row_thread(
     edges: &[Edge],
     frontier: &[usize],
-    progress_bar: ProgressBar,
+    progress_bars: &[ProgressBar],
     index: usize,
     receiver: mpsc::Receiver<NodeState>,
     sender: Option<mpsc::Sender<NodeState>>,
 ) -> Vec<Node> {
     let edge = edges[index];
+    let progress_bar = progress_bars[index].clone();
+    let next_progress_bar = progress_bars.get(index + 1).cloned();
 
     // The row of nodes that this thread is building up.
     let mut row: Vec<Node> = Vec::new();
@@ -633,23 +661,35 @@ fn row_thread(
         // only do it every 50ms.
         if progress_last_updated.elapsed() > Duration::from_millis(50) {
             progress_bar.set_position(row.len().try_into().unwrap());
-            // For each vertex, `NodeState` stores 1 byte + 1 bit: the component it's in and whether it's pendant.
-            // I'm representing
-            let node_state_size = mem::size_of::<NodeState>()
-                + state.components.len()
-                + (state.components.len() + usize::BITS as usize - 1) / usize::BITS as usize
-                    * mem::size_of::<usize>();
+            // For each vertex, `NodeState` stores 1 byte.
+            let node_state_size = mem::size_of::<NodeState>() + state.data.len();
             progress_bar.set_message(format!(
-                "mem. usage: nodes: {}, states: {}",
+                "mem. usage: nodes: {}, states: {}, queue: {}",
                 HumanBytes((row.len() * mem::size_of::<Node>()) as u64),
-                HumanBytes((num_yielded_states.get() * node_state_size) as u64)
+                HumanBytes((num_yielded_states.get() * node_state_size) as u64),
+                HumanBytes(
+                    progress_bar
+                        .length()
+                        .unwrap()
+                        .saturating_sub(row.len() as u64)
+                        * node_state_size as u64
+                )
             ));
+            // Set the length of the next bar to the number of `NodeState`s we've sent it to
+            // process.
+            if let Some(next_progress_bar) = &next_progress_bar {
+                next_progress_bar.set_length(num_yielded_states.get() as u64);
+            }
             progress_last_updated = Instant::now();
         }
     }
 
+    progress_bar.set_position(row.len().try_into().unwrap());
     progress_bar.set_length(row.len().try_into().unwrap());
     progress_bar.finish_with_message("done");
+    if let Some(next_progress_bar) = &next_progress_bar {
+        next_progress_bar.set_length(num_yielded_states.get() as u64);
+    }
 
     row
 }
@@ -684,14 +724,16 @@ impl Zdd {
         // Create a progress bar for each thread, which is initially hidden until the
         // thread gets its first `NodeState` to process.
         let progress = MultiProgress::new();
-        let style =
-            ProgressStyle::with_template("{prefix} - {wide_msg} {human_pos} nodes {spinner}")
-                .unwrap();
+        let style = ProgressStyle::with_template(
+            "{prefix} - {msg} {wide_bar} {human_pos} / {human_len} nodes",
+        )
+        .unwrap();
         let progress_bars: Vec<_> = (0..edges.len())
             .map(|i| {
                 let bar = ProgressBar::new_spinner()
                     .with_prefix(format!("row {}", i + 1))
                     .with_style(style.clone());
+                bar.set_length(0);
                 progress.add(bar.clone());
                 bar
             })
@@ -705,28 +747,32 @@ impl Zdd {
             // the thread handling the first row.
             let mut senders = senders.into_iter();
             let first_sender = senders.next().unwrap();
-            let handles: Vec<_> = zip(senders.map(Some).chain([None]), receivers)
-                .enumerate()
-                .map(|(index, (sender, receiver))| {
-                    let edges = &edges;
-                    let frontiers = &frontiers[index];
-                    let progress_bar = progress_bars[index].clone();
-                    thread::Builder::new()
-                        .name(format!("row {}", index + 1))
-                        .spawn_scoped(s, move || {
-                            row_thread(edges, frontiers, progress_bar, index, receiver, sender)
-                        })
-                        .unwrap()
-                })
-                .collect();
-
             first_sender.send(NodeState::new(num_vertices)).unwrap();
             drop(first_sender);
 
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .collect()
+            let mut handles: VecDeque<ScopedJoinHandle<_>> = VecDeque::new();
+            let mut rows = Vec::new();
+            for (index, (sender, receiver)) in
+                zip(senders.map(Some).chain([None]), receivers).enumerate()
+            {
+                if handles.len() >= thread::available_parallelism().unwrap().into() {
+                    let row = handles.pop_front().unwrap().join().unwrap();
+                    rows.push(row);
+                }
+                let edges = &edges;
+                let frontiers = &frontiers[index];
+                let progress_bars = &progress_bars;
+                let handle = thread::Builder::new()
+                    .name(format!("row {}", index + 1))
+                    .spawn_scoped(s, move || {
+                        row_thread(edges, frontiers, progress_bars, index, receiver, sender)
+                    })
+                    .unwrap();
+                handles.push_back(handle);
+            }
+
+            rows.extend(handles.into_iter().map(|handle| handle.join().unwrap()));
+            rows
         });
 
         Self {
