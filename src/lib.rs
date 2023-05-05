@@ -349,13 +349,28 @@ impl Net {
         if self.area() != cuboid.surface_area() {
             return None;
         }
+        // A lot of time is spent on repeatedly allocating/deallocating these, so share them between attempts.
+        let mut surface = Surface::new(cuboid);
+        let mut result = ColoredNet {
+            width: self.width,
+            squares: vec![None; self.squares.len()],
+        };
+        let mut queue = VecDeque::new();
+
         for x in 0..self.width() {
             for y in 0..self.height() {
                 let pos = Pos::new(x, y);
                 if self.filled(pos) {
                     for orientation in 0..4 {
-                        if let Some(net) = self.try_color(cuboid, pos, orientation) {
-                            return Some(net);
+                        if self.try_color(
+                            cuboid,
+                            pos,
+                            orientation,
+                            &mut queue,
+                            &mut surface,
+                            &mut result,
+                        ) {
+                            return Some(result);
                         }
                     }
                 }
@@ -364,19 +379,24 @@ impl Net {
         None
     }
 
-    fn try_color(&self, cuboid: Cuboid, start: Pos, orientation: i8) -> Option<ColoredNet> {
+    fn try_color(
+        &self,
+        cuboid: Cuboid,
+        start: Pos,
+        orientation: i8,
+        queue: &mut VecDeque<(Pos, FacePos)>,
+        surface: &mut Surface,
+        result: &mut ColoredNet,
+    ) -> bool {
+        queue.clear();
+        surface.clear();
+        result.clear();
+
         let mut surface_start = FacePos::new(cuboid);
         surface_start.orientation = orientation;
-        // We need to keep track of what we've filled in to reject cases where stuff
-        // overlaps.
-        let mut surface = Surface::new(cuboid);
-        let mut result = ColoredNet {
-            width: self.width,
-            squares: vec![None; self.squares.len()],
-        };
+
         // This queue isn't a weird one like in `NetFinder`, it's a normal queue where
         // we push things on and pop things off.
-        let mut queue = VecDeque::new();
         queue.push_back((start, surface_start));
 
         while let Some((pos, surface_pos)) = queue.pop_front() {
@@ -395,21 +415,21 @@ impl Net {
                     // This isn't a valid net for this cuboid (from this starting position) - this
                     // spot is on the net but the corresponding spot on the surface is filled, so
                     // the net doubles up which is invalid.
-                    return None;
+                    return false;
                 }
                 queue.push_back((pos, surface_pos));
             }
         }
 
-        if result.area() == cuboid.surface_area() {
-            Some(result)
-        } else {
-            None
-        }
+        result.area() == cuboid.surface_area()
     }
 
     pub fn area(&self) -> usize {
         self.squares.iter().filter(|&&square| square).count()
+    }
+
+    fn clear(&mut self) {
+        self.squares.fill(false);
     }
 }
 
@@ -515,6 +535,10 @@ impl ColoredNet {
         }
 
         result
+    }
+
+    fn clear(&mut self) {
+        self.squares.fill(None);
     }
 }
 
@@ -811,6 +835,12 @@ impl Surface {
 
     fn set(&mut self, pos: FacePos, value: bool) {
         self.faces[pos.face as usize].set(pos.pos, value)
+    }
+
+    fn clear(&mut self) {
+        for face in &mut self.faces {
+            face.clear();
+        }
     }
 }
 
