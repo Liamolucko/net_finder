@@ -53,10 +53,13 @@ fn main() -> anyhow::Result<()> {
     let zdd: Zdd = postcard::from_bytes(&bytes)?;
     // No need to keep this 3GB binary blob around.
     drop(bytes);
-    println!("ZDD takes up {} bytes.", HumanBytes(zdd.heap_size() as u64));
+    println!("ZDD takes up {}.", HumanBytes(zdd.heap_size() as u64));
 
-    let mut nets: FxHashSet<Net> = zdd.par_nets().collect();
-    nets.retain(|net| net.color(cuboid).is_some());
+    let nets: FxHashSet<Net> = zdd.par_nets().collect();
+    let nets: Vec<Net> = nets
+        .into_par_iter()
+        .filter(|net| net.color(cuboid).is_some())
+        .collect();
     println!("ZDD contains {} nets.", nets.len());
 
     // Write the nets to disk.

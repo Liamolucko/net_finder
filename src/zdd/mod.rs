@@ -18,6 +18,9 @@ mod construct;
 /// The max. number of vertices allowed.
 /// This is 36 because that's all you need to be able to find ZDDs for 1x1x7 and
 /// 1x2x5 cuboids.
+/// (Oops, turns out I accidentally included support for 1x2x5 cuboids; 1x3x3
+/// cuboids only have 32 vertices and 60 edges the same as 1x1x7 cuboids... oh
+/// well)
 const MAX_VERTICES: u8 = 36;
 const MAX_EDGES: usize = 72;
 
@@ -161,11 +164,11 @@ pub(self) struct Edge {
     /// The indices of the two endpoints of this edge.
     ///
     /// Sorted from smallest to largest.
-    vertices: [usize; 2],
+    vertices: [u8; 2],
 }
 
 impl Edge {
-    fn new(v1: usize, v2: usize) -> Self {
+    fn new(v1: u8, v2: u8) -> Self {
         let mut vertices = [v1, v2];
         vertices.sort_unstable();
         Self { vertices }
@@ -350,7 +353,7 @@ impl Zdd {
         for (i, v1) in vertices.iter().enumerate() {
             for v2 in v1.neighbours() {
                 let j = vertices.iter().position(|&vertex| vertex == v2).unwrap();
-                let edge = Edge::new(i, j);
+                let edge = Edge::new(i.try_into().unwrap(), j.try_into().unwrap());
                 if !edges.contains(&edge) {
                     edges.push(edge);
                 }
@@ -366,12 +369,12 @@ impl Zdd {
         (vertices.len(), edges.len())
     }
 
-    pub fn vertex_indices(&self) -> FxHashMap<(Face, Pos), usize> {
+    pub fn vertex_indices(&self) -> FxHashMap<(Face, Pos), u8> {
         let mut vertex_indices = FxHashMap::default();
         for (i, vertex) in self.vertices.iter().copied().enumerate() {
             for face in [Bottom, West, North, East, South, Top] {
                 if let Some(pos) = vertex.pos_on_face(face) {
-                    vertex_indices.insert((face, pos), i);
+                    vertex_indices.insert((face, pos), i.try_into().unwrap());
                 }
             }
         }
@@ -637,7 +640,7 @@ impl ParallelIterator for EdgeIter<'_> {
 fn net_from_edges(
     cuboid: Cuboid,
     mut edges: Vec<Edge>,
-    vertex_indices: &FxHashMap<(Face, Pos), usize>,
+    vertex_indices: &FxHashMap<(Face, Pos), u8>,
 ) -> Net {
     edges.sort_unstable();
     let mut net = Net::for_cuboids(&[cuboid]);

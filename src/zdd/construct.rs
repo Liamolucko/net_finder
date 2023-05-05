@@ -1,78 +1,105 @@
 use std::{
     cell::Cell,
     collections::{HashSet, VecDeque},
-    hash::{Hash, Hasher},
+    fmt::{self, Debug, Formatter},
+    hash::Hash,
     iter::zip,
     mem,
+    num::NonZeroU8,
     sync::mpsc,
     thread::{self, ScopedJoinHandle},
     time::{Duration, Instant},
 };
 
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
-use once_cell::unsync::OnceCell;
 use rustc_hash::FxHashMap;
 
 use crate::Cuboid;
 
 use super::{ConstantNode, Edge, Node, NodeRef, Zdd, MAX_EDGES, MAX_VERTICES};
 
-thread_local! {
-    // I hate to use global state, but this doesn't have any risk of colliding since it's local to each row thread, which we completely control.
-    // We need it to implement `EdgeSet`.
-    /// A tuple of the number of vertices and the edges in the cuboid we're constructing a ZDD for.
-    static GEOMETRY: OnceCell<(u8, Vec<Edge>)> = OnceCell::new();
-}
-
 /// The state of the graph represented by a node in a ZDD.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct NodeState {
     /// Data about each vertex in the graph.
+    ///
     /// The MSB represents whether the vertex is pendant, and the rest of the
-    /// byte is the index of the component the vertex is in.
-    data: heapless::Vec<u8, { MAX_VERTICES as usize }>,
+    /// byte is the index of the component the vertex is in, or 0 if it isn't in
+    /// one.
+    ///
+    /// Component indices are a bit special - they need to be able to be
+    /// determined deterministically for a given set of vertices that make up a
+    /// component. So, the index of a component is always the the index of the
+    /// vertex in the component with the lowest index, plus one since zero
+    /// means not being in a component.
+    data: [u8; MAX_VERTICES as usize],
+    /// The number of vertices in the graph, which effectively also functions as
+    /// `data.len()`.
+    num_vertices: u8,
+}
+
+impl Debug for NodeState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        for vertex in 0..self.num_vertices {
+            list.entry(&(self.pendant(vertex), self.component(vertex)));
+        }
+        list.finish()
+    }
 }
 
 impl NodeState {
     /// Create a new node without any info filled in.
     fn new(num_vertices: u8) -> Self {
+        assert!(num_vertices <= MAX_VERTICES);
         Self {
-            data: (0..num_vertices).collect(),
+            data: [0; MAX_VERTICES as usize],
+            num_vertices,
         }
     }
 
-    fn component(&self, vertex: usize) -> u8 {
-        self.data[vertex] & 0b01111111
+    /// Creates a component index derived from a vertex index, which is just the
+    /// index + 1.
+    fn component_index(vertex: u8) -> NonZeroU8 {
+        NonZeroU8::new(vertex + 1).unwrap()
     }
 
-    fn set_component(&mut self, vertex: usize, component: u8) {
-        debug_assert!(component < MAX_VERTICES);
+    /// Returns the connected component this vertex is in, or `None` if it's not
+    /// connected to any other vertices.
+    fn component(&self, vertex: u8) -> Option<NonZeroU8> {
+        NonZeroU8::new(self.data[usize::from(vertex)] & 0b01111111)
+    }
+
+    fn set_component(&mut self, vertex: u8, component: NonZeroU8) {
+        debug_assert!(component.get() < MAX_VERTICES);
         // Clear the old value, then OR in the new value.
-        self.data[vertex] &= 0b10000000;
-        self.data[vertex] |= component;
+        self.data[usize::from(vertex)] &= 0b10000000;
+        self.data[usize::from(vertex)] |= component.get();
     }
 
-    fn pendant(&self, vertex: usize) -> bool {
-        self.data[vertex] & 0b10000000 != 0
+    fn pendant(&self, vertex: u8) -> bool {
+        self.data[usize::from(vertex)] & 0b10000000 != 0
     }
 
-    fn set_pendant(&mut self, vertex: usize, pendant: bool) {
-        self.data[vertex] &= 0b01111111;
-        self.data[vertex] |= (pendant as u8) << 7;
+    fn set_pendant(&mut self, vertex: u8, pendant: bool) {
+        self.data[usize::from(vertex)] &= 0b01111111;
+        self.data[usize::from(vertex)] |= (pendant as u8) << 7;
     }
 
-    fn size(&self, vertex: usize) -> usize {
-        let component = self.component(vertex);
-        (0..self.data.len())
-            .filter(|&other_vertex| self.component(other_vertex) == component)
-            .count()
+    fn change_component_index(&mut self, old_index: NonZeroU8, new_index: NonZeroU8) {
+        for vertex in 0..self.num_vertices {
+            if self.component(vertex) == Some(old_index) {
+                self.set_component(vertex, new_index);
+            }
+        }
     }
 
-    /// Adds an edge to this `NodeState` without performing any kind of validation.
+    /// Adds an edge to this `NodeState` without performing any kind of
+    /// validation.
     fn add_edge(&mut self, edge: Edge) {
         // First we update whether or not the vertices are pendant.
         for vertex in edge.vertices {
-            if self.size(vertex) == 1 {
+            if self.component(vertex).is_none() {
                 // This vertex is getting its first edge added to it, and becoming pendant.
                 self.set_pendant(vertex, true);
             } else if self.pendant(vertex) {
@@ -83,20 +110,37 @@ impl NodeState {
         }
 
         // Then we merge the two components that the endpoints of the edge are in.
-        let comp1 = self.component(edge.vertices[0]);
-        let comp2 = self.component(edge.vertices[1]);
-        let min_comp = u8::min(comp1, comp2);
-        let max_comp = u8::max(comp1, comp2);
-
-        // The minimum of the two component indices is the new index for the merged
-        // component.
-        let new_index = min_comp;
-
-        for vertex in 0..self.data.len() {
-            // Set the component index for any vertices with the old component index to the
-            // new index.
-            if self.component(vertex) == max_comp {
-                self.set_component(vertex, new_index);
+        match (
+            self.component(edge.vertices[0]),
+            self.component(edge.vertices[1]),
+        ) {
+            (None, None) => {
+                // Use the smaller of the two indices of the edge's endpoints as the component
+                // index. This is always `edge.vertices[0]`, since the vertices
+                // of an edge are sorted by their index.
+                let index = Self::component_index(edge.vertices[0]);
+                for vertex in edge.vertices {
+                    self.set_component(vertex, index)
+                }
+            }
+            (Some(comp), None) => self.set_component(edge.vertices[1], comp),
+            (None, Some(index)) => {
+                // Check if `edge.vertices[0]` has the new smallest index in the component, and
+                // if so update the component's index.
+                let potential_index = Self::component_index(edge.vertices[0]);
+                if potential_index < index {
+                    self.set_component(edge.vertices[0], potential_index);
+                    self.change_component_index(index, potential_index);
+                } else {
+                    self.set_component(edge.vertices[0], index);
+                }
+            }
+            (Some(comp1), Some(comp2)) => {
+                // Merge the two components, picking the smaller of their two indices as the new
+                // index.
+                let new_index = NonZeroU8::min(comp1, comp2);
+                let old_index = NonZeroU8::max(comp1, comp2);
+                self.change_component_index(old_index, new_index);
             }
         }
     }
@@ -107,91 +151,105 @@ impl NodeState {
     //
     /// If those requirements aren't met, it returns `Err(ConstantNode::Zero)`,
     /// which effectively discards this possiblility.
-    fn handle_vertex_exit(&self, vertex: usize) -> Result<(), ConstantNode> {
+    ///
+    /// Then, it does some bookkeeping:
+    /// * If this vertex was the one in its component with the minimal index, it
+    ///   updates the component's index to be based on the new vertex with the
+    ///   minimal index, since we want it to be entirely determined by what's in
+    ///   the component now, not what was there previously.
+    /// * It resets the data for the vertex to 0, since we no longer care about
+    ///   it now that it's exited and want two `NodeState`s which have different
+    ///   info about it to be considered equal.
+    ///
+    /// Finally, it returns whether the component the vertex was in exited too,
+    /// since it happens to need to compute that anyway to update the component
+    /// index.
+    fn handle_vertex_exit(&mut self, vertex: u8) -> Result<bool, ConstantNode> {
         if (0..8).contains(&vertex) {
             // The first 8 vertices are the corners of the cuboid.
             // We require that corners have at least one edge coming out of them; in other
             // words, that they're part of a connected component with size > 1.
-            if self.size(vertex) < 2 {
+            if self.component(vertex).is_none() {
                 return Err(ConstantNode::Zero);
             }
         } else {
             // Vertices that aren't corners are required to not be pendant vertices, since
-            // they should just be glued together if that's the case.
+            // the cut edge that the lone edge coming out of the vertex represents should
+            // just be glued together if that's the case.
             if self.pendant(vertex) {
                 return Err(ConstantNode::Zero);
             }
         }
-        Ok(())
-    }
 
-    /// When a vertex is exiting, checks whether a vertex is the last vertex in
-    /// its connected component to exit, and if it is, handles the 'exit' of the
-    /// component.
-    ///
-    /// What this actually means is that it checks whether the component
-    /// contains more than just the one vertex, and if it does, that means that
-    /// the graph is now either invalid or complete.
-    ///
-    /// Since the graph is only allowed to have at most one connected component
-    /// with size > 1, if one such component is never going to be touched again
-    /// (i.e., will never get merged with the other ones), it'd better be the
-    /// only one.
-    ///
-    /// So, we first check whether there are any other connected components with
-    /// size > 1, and fail if so. Otherwise, the graph is done, and we check the
-    /// degree constraints for any remaining vertices before returning
-    /// `Err(ConstantNode::One)`.
-    fn handle_component_exit(
-        &self,
-        vertex: usize,
-        remaining_edges: &[Edge],
-        frontier: impl IntoIterator<Item = usize> + Clone,
-    ) -> Result<(), ConstantNode> {
-        if !frontier
-            .clone()
-            .into_iter()
-            .any(|other_vertex| self.component(other_vertex) == self.component(vertex))
-        {
-            // If there aren't any vertices left in the frontier that are in the same
-            // connected component as this vertex, this component is now also never going to
-            // be modified again.
+        let mut component_exited = false;
 
-            // If the component is of size > 1, it's _the_ connected component of the graph,
-            // since there's only allowed to be one with size > 1.
-            if self.size(vertex) > 1 {
-                if frontier.into_iter().any(|vertex| self.size(vertex) > 1) {
-                    // There isn't allowed to be more than one connected component with size > 1, so
-                    // this case is invalid.
-                    return Err(ConstantNode::Zero);
-                }
-
-                // The graph is now finished, since there aren't any more edges that would
-                // expand this connected component, and creating any new connected components
-                // with size > 1 is illegal.
-                //
-                // Before we return `ConstantNode::One` to signal that, we handle the exit of
-                // all the vertices that haven't already exited, since we're cutting things off
-                // early and those checks won't get performed when they normally would when the
-                // vertices exit the frontier.
-                //
-                // Note that we can't just use the frontier for this because it's possible that
-                // there are some vertices that still haven't yet entered the frontier, and we
-                // need to check those too.
-                let remaining_vertices: HashSet<usize> = remaining_edges
-                    .iter()
-                    .flat_map(|edge| edge.vertices)
-                    .collect();
-                for vertex in remaining_vertices {
-                    self.handle_vertex_exit(vertex)?;
-                }
-
-                // Now we finish the graph.
-                return Err(ConstantNode::One);
+        // If this vertex was the one that determined the component's index, update it
+        // to the new minimal index in the component.
+        if self.component(vertex) == Some(Self::component_index(vertex)) {
+            let old_index = Self::component_index(vertex);
+            let new_index = (vertex + 1..self.num_vertices)
+                .find(|&other_vertex| self.component(other_vertex) == Some(old_index))
+                .map(Self::component_index);
+            if let Some(new_index) = new_index {
+                self.change_component_index(old_index, new_index);
+            } else {
+                // This was the last vertex in the component.
+                component_exited = true;
             }
         }
 
-        Ok(())
+        // Clear the data about the vertex.
+        self.data[usize::from(vertex)] = 0;
+
+        Ok(component_exited)
+    }
+
+    /// When a connected component of size > 1 has exited, finishes a graph.
+    ///
+    /// Since the graph is only allowed to contain one component of size > 1,
+    /// when one exits, the graph is now either finished or invalid. So, this
+    /// will always either return `Err(ConstantNode::Zero)` or
+    /// `Err(ConstantNode::One)`.
+    ///
+    /// It's invalid if either there are vertices that haven't exited yet which
+    /// don't satisfy their degree constraints, or there's another connected
+    /// component with size > 1.
+    fn finish(
+        &mut self,
+        remaining_edges: &[Edge],
+        frontier: impl IntoIterator<Item = u8>,
+    ) -> Result<(), ConstantNode> {
+        if frontier
+            .into_iter()
+            .any(|vertex| self.component(vertex).is_some())
+        {
+            // There isn't allowed to be more than one connected component with size > 1, so
+            // this case is invalid.
+            return Err(ConstantNode::Zero);
+        }
+
+        // The graph is now finished, since there aren't any more edges that would
+        // expand this connected component, and creating any new connected components
+        // by adding more edges is illegal.
+        //
+        // Before we return `ConstantNode::One` to signal that, we handle the exit of
+        // all the vertices that haven't already exited, since we're cutting things off
+        // early and those checks won't get performed when they normally would when the
+        // vertices exit the frontier.
+        //
+        // Note that we can't just use the frontier for this because it's possible that
+        // there are some vertices that still haven't yet entered the frontier, and we
+        // need to check those too.
+        let remaining_vertices: HashSet<u8> = remaining_edges
+            .iter()
+            .flat_map(|edge| edge.vertices)
+            .collect();
+        for vertex in remaining_vertices {
+            self.handle_vertex_exit(vertex)?;
+        }
+
+        // Now we finish the graph.
+        Err(ConstantNode::One)
     }
 
     /// Returns the node that the 0-edge of this node should point to, when
@@ -200,51 +258,32 @@ impl NodeState {
         &self,
         edge: Edge,
         remaining_edges: &[Edge],
-        frontier: &[usize],
+        frontier: &[u8],
     ) -> Result<NodeState, ConstantNode> {
+        let mut new_node = self.clone();
+
         // First handle the exits of the individual vertices.
-        for vertex in edge.vertices {
+        let mut comp_exits: u8 = 0;
+        // Probably pointless micro-optimisation: handle the exits in reverse so that we
+        // don't have to reshuffle the component index twice.
+        for vertex in edge.vertices.into_iter().rev() {
             if !frontier.contains(&vertex) {
-                self.handle_vertex_exit(vertex)?;
+                let comp_exited = new_node.handle_vertex_exit(vertex)?;
+                if comp_exited {
+                    comp_exits += 1;
+                }
             }
         }
 
-        // Then check if the exits of these vertices result in the exit of their
-        // connected components.
-        match (
-            frontier.contains(&edge.vertices[0]),
-            frontier.contains(&edge.vertices[1]),
-        ) {
-            (false, false) => {
-                self.handle_component_exit(
-                    edge.vertices[0],
-                    remaining_edges,
-                    frontier.iter().copied().chain([edge.vertices[1]]),
-                )?;
-                self.handle_component_exit(
-                    edge.vertices[1],
-                    remaining_edges,
-                    frontier.iter().copied(),
-                )?;
-            }
-            (false, true) => {
-                self.handle_component_exit(
-                    edge.vertices[0],
-                    remaining_edges,
-                    frontier.iter().copied(),
-                )?;
-            }
-            (true, false) => {
-                self.handle_component_exit(
-                    edge.vertices[1],
-                    remaining_edges,
-                    frontier.iter().copied(),
-                )?;
-            }
-            (true, true) => {}
+        match comp_exits {
+            0 => {}
+            1 => new_node.finish(remaining_edges, frontier.iter().copied())?,
+            // Two components just exited with those vertices. That means for sure that the graph
+            // has finished with more than one connected component of size > 1, which is invalid.
+            2.. => return Err(ConstantNode::Zero),
         }
 
-        Ok(self.clone())
+        Ok(new_node)
     }
 
     /// Returns the node that the 1-edge of this node should point to, when
@@ -253,9 +292,11 @@ impl NodeState {
         &self,
         edge: Edge,
         remaining_edges: &[Edge],
-        frontier: &[usize],
+        frontier: &[u8],
     ) -> Result<NodeState, ConstantNode> {
-        if self.component(edge.vertices[0]) == self.component(edge.vertices[1]) {
+        if self.component(edge.vertices[0]).is_some()
+            && self.component(edge.vertices[0]) == self.component(edge.vertices[1])
+        {
             // Adding this edge would create a cycle, which isn't allowed, so
             // discard this possibility by pointing to the zero-edge.
             return Err(ConstantNode::Zero);
@@ -267,96 +308,36 @@ impl NodeState {
         new_node.add_edge(edge);
 
         // Then we handle exiting vertices.
-        for vertex in edge.vertices {
+        let mut comp_exited = false;
+        // Probably pointless micro-optimisation: handle the exits in reverse so that we
+        // don't have to reshuffle the component index twice.
+        for vertex in edge.vertices.into_iter().rev() {
             if !frontier.contains(&vertex) {
-                self.handle_vertex_exit(vertex)?;
+                // We don't have to worry about this happening more than once because we know
+                // that the two vertices are in the same component, since we just connected
+                // them.
+                comp_exited |= new_node.handle_vertex_exit(vertex)?;
             }
         }
 
-        // Then, if both vertices are exiting, we check if the component we've just
-        // merged the vertices into is also exiting.
-        if edge
-            .vertices
-            .into_iter()
-            .all(|vertex| !frontier.contains(&vertex))
-        {
-            new_node.handle_component_exit(
-                edge.vertices[0],
-                remaining_edges,
-                frontier.iter().copied(),
-            )?;
+        // If a component exited, finish the graph.
+        if comp_exited {
+            new_node.finish(remaining_edges, frontier.iter().copied())?;
         }
 
         Ok(new_node)
     }
 }
 
-/// A sort of compressed encoding for `NodeState` which just stores one of the paths through the ZDD that can be taken to get to it.
-///
-/// That can also just be interpreted as a set of edges.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct NodePath {
-    bits: [u8; (MAX_EDGES + 7) / 8],
-}
-
-impl NodePath {
-    /// Returns a new `NodePath` with no edges set.
-    pub(super) fn new() -> Self {
-        Self {
-            bits: [0; (MAX_EDGES + 7) / 8],
-        }
-    }
-
-    /// Evaluates this `NodePath` into a `NodeState`
-    fn evaluate(self) -> NodeState {
-        GEOMETRY.with(|cell| {
-            let &(num_vertices, ref edges) = cell.get().unwrap();
-            let mut res = NodeState::new(num_vertices);
-            edges
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|(i, _)| self.bits[i / 8] & (1 << (i % 8)) != 0)
-                .for_each(|(_, edge)| res.add_edge(edge));
-            res
-        })
-    }
-
-    /// Returns a copy of `self` with the edge at the given index set.
-    fn with_edge(mut self, edge: usize) -> Self {
-        self.bits[edge / 8] |= 1 << (edge % 8);
-        self
-    }
-}
-
-impl PartialEq for NodePath {
-    fn eq(&self, other: &Self) -> bool {
-        self.evaluate() == other.evaluate()
-    }
-}
-
-impl Eq for NodePath {}
-
-impl Hash for NodePath {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.evaluate().hash(state)
-    }
-}
-
 /// Entrypoint for a thread that computes one of the rows of a ZDD.
-pub(super) fn row_thread(
-    num_vertices: u8,
+fn row_thread(
     edges: &[Edge],
-    frontier: &[usize],
+    frontier: &[u8],
     progress_bars: &[ProgressBar],
     index: usize,
-    receiver: mpsc::Receiver<NodePath>,
-    sender: Option<mpsc::Sender<NodePath>>,
+    receiver: mpsc::Receiver<NodeState>,
+    sender: Option<mpsc::Sender<NodeState>>,
 ) -> Vec<Node> {
-    GEOMETRY.with(|cell| {
-        cell.set((num_vertices, edges.to_vec())).unwrap();
-    });
-
     let edge = edges[index];
     let progress_bar = progress_bars[index].clone();
     let next_progress_bar = progress_bars.get(index + 1).cloned();
@@ -366,15 +347,7 @@ pub(super) fn row_thread(
 
     // Store the the `NodeState`s we're passing off to the next row for
     // de-duplication.
-    //
-    // TODO: this might be able to be solved by storing one of the paths through the
-    // ZDD that you can take to get to a `NodeState`, probably as a `u128` bitfield
-    // of taken edges, and then recreating it on the fly. You don't actually
-    // need access to the ZDD to do that, just to the list of edges. If computing
-    // that's too slow, you could maybe use an LRU cache or something.
-    // Since we're storing hashes anyway, `NoopHasher` is a hasher which just
-    // returns an input `u64` verbatim.
-    let mut yielded_states: FxHashMap<NodePath, usize> = FxHashMap::default();
+    let mut yielded_states: FxHashMap<NodeState, u32> = FxHashMap::default();
     // A hack to work around not being able to access `yielded_states.len()` since
     // it's exclusively borrowed by `handle_state`.
     let num_yielded_states = Cell::new(0);
@@ -382,20 +355,25 @@ pub(super) fn row_thread(
     // Create a helper function that takes the result of `NodeState::zero_edge` or
     // `NodeState::one_edge` and turns it into a `NodeRef`, handling all the
     // de-duping and such.
-    let mut handle_state = |result: Result<NodeState, ConstantNode>, path: NodePath| -> NodeRef {
+    let mut handle_state = |result: Result<NodeState, ConstantNode>| -> NodeRef {
         match result {
-            Ok(_) => {
-                if let Some(&index) = yielded_states.get(&path) {
-                    NodeRef::NextRow { index }
+            Ok(new_node) => {
+                if let Some(&index) = yielded_states.get(&new_node) {
+                    NodeRef::NextRow {
+                        index: index.try_into().unwrap(),
+                    }
                 } else {
                     // We've found a new `NodeState`, send it to the next row.
                     sender
                         .as_ref()
                         .expect("node in last row doesn't lead to a constant node")
-                        .send(path)
+                        .send(new_node.clone())
                         .unwrap();
                     let index = yielded_states.len();
-                    yielded_states.insert(path, index);
+                    yielded_states.insert(
+                        new_node,
+                        index.try_into().expect("more than u32::MAX nodes in a row"),
+                    );
                     num_yielded_states.set(yielded_states.len());
                     NodeRef::NextRow { index }
                 }
@@ -410,18 +388,15 @@ pub(super) fn row_thread(
     let mut progress_last_updated = Instant::now();
 
     // Receive `NodeState`s from the previous row and turn them into actual `Node`s.
-    for path in receiver {
-        let state = path.evaluate();
-
+    for state in receiver {
         // First create the 0-edge, which represents not adding this edge to the graph.
         // We first create a new `NodeState` representing this, and then check
         // `state_hashes` to see if it already exists. If it does, use that one instead.
-        let zero_edge = handle_state(state.zero_edge(edge, &edges[index + 1..], frontier), path);
+        let zero_edge = handle_state(state.zero_edge(edge, &edges[index + 1..], frontier));
 
         // Then we do the same thing for the 1-edge, which represents adding this edge
         // to the graph.
-        let path = path.with_edge(index);
-        let one_edge = handle_state(state.one_edge(edge, &edges[index + 1..], frontier), path);
+        let one_edge = handle_state(state.one_edge(edge, &edges[index + 1..], frontier));
 
         // Now add the new node to the row.
         row.push(Node::new(zero_edge, one_edge));
@@ -433,13 +408,13 @@ pub(super) fn row_thread(
             progress_bar.set_message(format!(
                 "mem. usage: nodes: {}, states: {}, queue: {}",
                 HumanBytes((row.len() * mem::size_of::<Node>()) as u64),
-                HumanBytes((num_yielded_states.get() * mem::size_of::<NodePath>()) as u64),
+                HumanBytes((num_yielded_states.get() * mem::size_of::<NodeState>()) as u64),
                 HumanBytes(
                     progress_bar
                         .length()
                         .unwrap()
                         .saturating_sub(row.len() as u64)
-                        * mem::size_of::<NodePath>() as u64
+                        * mem::size_of::<NodeState>() as u64
                 )
             ));
             // Set the length of the next bar to the number of `NodeState`s we've sent it to
@@ -478,7 +453,7 @@ impl Zdd {
         // previous rows or are being considered for the first time this row, and which
         // will be considered again in future rows.
         let mut frontiers = vec![vec![]; edges.len()];
-        for v in 0..vertices.len() {
+        for v in 0..num_vertices {
             // Find the first and last time this vertex is considered, and then add the
             // vertex to the frontiers between them.
             let first_occurence = edges.iter().position(|e| e.vertices.contains(&v)).unwrap();
@@ -510,13 +485,13 @@ impl Zdd {
 
         let rows = thread::scope(|s| {
             let (senders, receivers): (Vec<_>, Vec<_>) = (0..edges.len())
-                .map(|_| mpsc::channel::<NodePath>())
+                .map(|_| mpsc::channel::<NodeState>())
                 .unzip();
             // Extract the first sender, which is used to send the initial `NodeState` to
             // the thread handling the first row.
             let mut senders = senders.into_iter();
             let first_sender = senders.next().unwrap();
-            first_sender.send(NodePath::new()).unwrap();
+            first_sender.send(NodeState::new(num_vertices)).unwrap();
             drop(first_sender);
 
             let mut handles: VecDeque<ScopedJoinHandle<_>> = VecDeque::new();
@@ -529,20 +504,12 @@ impl Zdd {
                     rows.push(row);
                 }
                 let edges = &edges;
-                let frontiers = &frontiers[index];
+                let frontier = &frontiers[index];
                 let progress_bars = &progress_bars;
                 let handle = thread::Builder::new()
                     .name(format!("row {}", index + 1))
                     .spawn_scoped(s, move || {
-                        row_thread(
-                            num_vertices,
-                            edges,
-                            frontiers,
-                            progress_bars,
-                            index,
-                            receiver,
-                            sender,
-                        )
+                        row_thread(edges, frontier, progress_bars, index, receiver, sender)
                     })
                     .unwrap();
                 handles.push_back(handle);
