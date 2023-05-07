@@ -323,7 +323,7 @@ impl Net {
     /// Returns a copy of this net rotated by the given number of clockwise
     /// turns.
     pub fn rotate(&self, turns: i8) -> Self {
-        let turns = turns.rem_euclid(4);
+        let turns = turns & 0b11;
         if turns == 0 {
             return self.clone();
         }
@@ -710,7 +710,7 @@ impl Pos {
     /// by `turns` clockwise turns, and the surface was of size `size` before
     /// being turned.
     fn rotate(&mut self, turns: i8, mut size: Size) {
-        for _ in 0..turns.rem_euclid(4) {
+        for _ in 0..turns & 0b11 {
             (self.x, self.y) = (self.y, size.width - self.x - 1);
             size.rotate(1);
         }
@@ -874,7 +874,7 @@ impl FacePos {
                 Down => self.pos.y = self.cuboid.face_size(new_face).height - 1,
             }
 
-            self.orientation = (self.orientation + turns).rem_euclid(4);
+            self.orientation = (self.orientation + turns) & 0b11;
             self.face = new_face;
         }
     }
