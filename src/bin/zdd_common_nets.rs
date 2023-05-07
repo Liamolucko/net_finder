@@ -45,7 +45,8 @@ fn main() -> anyhow::Result<()> {
     progress.add(zdd_progress.clone());
     progress.add(found_progress.clone());
 
-    // Then go through the ZDD and filter out the ones which work for all the cuboids.
+    // Then go through the ZDD and filter out the ones which work for all the
+    // cuboids.
     let common_nets: FxHashSet<Net> = zdd
         .par_nets()
         .progress_with(zdd_progress)

@@ -2,7 +2,6 @@
 
 // This file contains infrastructure shared between `primary.rs` and `alt.rs`.
 
-use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
 use std::iter::zip;
@@ -73,6 +72,15 @@ impl Cuboid {
         2 * self.width * self.depth + 2 * self.depth * self.height + 2 * self.width * self.height
     }
 
+    /// Returns all the face positions on the surface of a cuboid that can't be
+    /// reached by taking what another face position becomes when you rotate the
+    /// cuboid.
+    ///
+    /// This is useful because when picking spots on nets/surfaces to be
+    /// equivalent, there's no point trying two different face positions that
+    /// can be transformed into one another by rotating the cuboid, since then
+    /// you just end up with the exact same solution net but with squares
+    /// corresponding to different face positions.
     fn surface_squares(&self) -> Vec<FacePos> {
         let mut result = Vec::new();
         // Don't bother with east, south, and top because they're symmetrical with west,
@@ -81,15 +89,29 @@ impl Cuboid {
             let size = self.face_size(face);
             for x in 0..size.width {
                 for y in 0..size.height {
-                    // At first, I thought we would have to include all the different rotations
-                    // here. However, because of cuboids' rotational symmetry, any rotation is
-                    // equivalent to just putting the square somewhere else on the same face.
+                    // We only need to include orientations of 0 and 1 here, since 2 and 3 can be
+                    // transformed into other spots on the same face with orientations of 0 and 1
+                    // respectively with a 180 degree turn.
                     result.push(FacePos {
                         cuboid: *self,
                         face,
                         pos: Pos::new(x, y),
                         orientation: 0,
-                    })
+                    });
+                    // If the cuboid is square, we don't even have to include an orientation of 1,
+                    // since a 90 degree turn will transform it into another position on the same
+                    // face with an orientation of 0.
+                    // For non-square faces, this doesn't work because you end up with a completely
+                    // differently shaped face after a 90 degree turn; a 180 degree turn is needed
+                    // to get back to the same shape.
+                    if size.width != size.height {
+                        result.push(FacePos {
+                            cuboid: *self,
+                            face,
+                            pos: Pos::new(x, y),
+                            orientation: 1,
+                        })
+                    }
                 }
             }
         }
@@ -343,85 +365,121 @@ impl Net {
         }
     }
 
+    /// Returns a copy of this net flipped around the vertical axis.
+    pub fn vertically_flipped(&self) -> Self {
+        let mut result = self.clone();
+        result.vertical_flip();
+        result
+    }
+
     /// Return a version of this net with its squares 'colored' with which faces
     /// they're on.
     pub fn color(&self, cuboid: Cuboid) -> Option<ColoredNet> {
         if self.area() != cuboid.surface_area() {
             return None;
         }
-        // A lot of time is spent on repeatedly allocating/deallocating these, so share them between attempts.
-        let mut surface = Surface::new(cuboid);
-        let mut result = ColoredNet {
-            width: self.width,
-            squares: vec![None; self.squares.len()],
-        };
-        let mut queue = VecDeque::new();
 
-        for x in 0..self.width() {
-            for y in 0..self.height() {
-                let pos = Pos::new(x, y);
-                if self.filled(pos) {
-                    for orientation in 0..4 {
-                        if self.try_color(
-                            cuboid,
-                            pos,
-                            orientation,
-                            &mut queue,
-                            &mut surface,
-                            &mut result,
-                        ) {
-                            return Some(result);
-                        }
-                    }
-                }
+        // Find a filled-in square on the net, which we then assume maps to each spot on
+        // the surface of the cuboid in turn, and try to find what face each spot on the
+        // net would have to be if that was the case.
+        // If we don't run into any contradictions, we've found a valid colouring.
+        let index = self
+            .squares
+            .iter()
+            .position(|&square| square == true)
+            .unwrap();
+        let net_start = Pos {
+            x: index % self.width,
+            y: index / self.width,
+        };
+
+        // A lot of time is spent on repeatedly allocating/deallocating these, so share
+        // them between attempts.
+        let mut surface = Surface::new(cuboid);
+        // Create a mapping from net positions to face positions.
+        let mut pos_map = vec![None; self.squares.len()];
+
+        for square in cuboid.surface_squares() {
+            if self.try_color(cuboid, net_start, square, &mut surface, &mut pos_map) {
+                return Some(ColoredNet {
+                    width: self.width,
+                    // Created a colored net from the position map by just taking which face each
+                    // position is on.
+                    squares: pos_map
+                        .into_iter()
+                        .map(|maybe_pos| maybe_pos.map(|pos| pos.face))
+                        .collect(),
+                });
             }
         }
+
         None
     }
 
     fn try_color(
         &self,
         cuboid: Cuboid,
-        start: Pos,
-        orientation: i8,
-        queue: &mut VecDeque<(Pos, FacePos)>,
+        net_start: Pos,
+        surface_start: FacePos,
         surface: &mut Surface,
-        result: &mut ColoredNet,
+        pos_map: &mut [Option<FacePos>],
     ) -> bool {
-        queue.clear();
         surface.clear();
-        result.clear();
+        pos_map.fill(None);
 
-        let mut surface_start = FacePos::new(cuboid);
-        surface_start.orientation = orientation;
-
-        // This queue isn't a weird one like in `NetFinder`, it's a normal queue where
-        // we push things on and pop things off.
-        queue.push_back((start, surface_start));
-
-        while let Some((pos, surface_pos)) = queue.pop_front() {
-            result.set(pos, surface_pos.face);
+        fn fill(
+            net: &Net,
+            net_pos: Pos,
+            surface_pos: FacePos,
+            surface: &mut Surface,
+            pos_map: &mut [Option<FacePos>],
+        ) -> bool {
+            // Make a little helper function to get the index in `pos_map` which corresponds
+            // to a given position.
+            let index = |pos: Pos| pos.y * net.width + pos.x;
             surface.set(surface_pos, true);
+            pos_map[index(net_pos)] = Some(surface_pos);
             for direction in [Left, Up, Right, Down] {
-                let Some(pos) = pos.moved_in(direction, self.size()) else {
-                    continue
+                let Some(net_pos) = net_pos.moved_in(direction, net.size()) else {
+                    continue;
                 };
-                if !self.filled(pos) || result.get(pos).is_some() {
-                    // skip this if the square isn't present or we've already covered it.
+
+                if !net.filled(net_pos) {
+                    // Skip this if the square isn't present in the original net.
                     continue;
                 }
+
                 let surface_pos = surface_pos.moved_in(direction);
+
+                if let Some(existing_surface_pos) = pos_map[index(net_pos)] {
+                    if existing_surface_pos == surface_pos {
+                        // This square has already been covered, with the same result.
+                        continue;
+                    } else {
+                        // We got a different face position for this square by coming in from a
+                        // different direction, which is invalid.
+                        return false;
+                    }
+                }
+
                 if surface.filled(surface_pos) {
                     // This isn't a valid net for this cuboid (from this starting position) - this
                     // spot is on the net but the corresponding spot on the surface is filled, so
                     // the net doubles up which is invalid.
                     return false;
                 }
-                queue.push_back((pos, surface_pos));
+
+                // Now try filling in this new position as well.
+                if !fill(net, net_pos, surface_pos, surface, pos_map) {
+                    return false;
+                }
             }
+
+            true
         }
 
-        result.area() == cuboid.surface_area()
+        fill(self, net_start, surface_start, surface, pos_map)
+            && pos_map.iter().filter(|pos| pos.is_some()).count() == cuboid.surface_area()
     }
 
     pub fn area(&self) -> usize {
@@ -430,6 +488,29 @@ impl Net {
 
     fn clear(&mut self) {
         self.squares.fill(false);
+    }
+}
+
+#[test]
+fn color() {
+    const F: bool = false;
+    const T: bool = true;
+    let net = Net {
+        width: 10,
+        #[rustfmt::skip]
+        squares: vec![
+            T, T, F, F, F, F, F, F, F, F,
+            F, T, F, F, T, F, F, T, F, F,
+            T, T, T, T, T, F, F, T, F, F,
+            F, F, T, T, T, T, T, T, T, T,
+            F, F, F, F, F, F, F, T, F, F,
+            F, F, F, F, F, F, F, T, F, F,
+            F, F, F, F, F, F, F, T, F, F,
+        ],
+    };
+    let cuboids = [Cuboid::new(1, 1, 5), Cuboid::new(1, 2, 3)];
+    for cuboid in cuboids {
+        assert!(net.color(cuboid).is_some());
     }
 }
 
@@ -535,10 +616,6 @@ impl ColoredNet {
         }
 
         result
-    }
-
-    fn clear(&mut self) {
-        self.squares.fill(None);
     }
 }
 
@@ -684,16 +761,14 @@ use Direction::*;
 
 impl Direction {
     /// Returns `self` rotated by a given number of clockwise turns.
-    fn turned(mut self, turns: i8) -> Self {
-        for _ in 0..turns.rem_euclid(4) {
-            self = match self {
-                Left => Up,
-                Up => Right,
-                Right => Down,
-                Down => Left,
-            }
+    fn turned(self, turns: i8) -> Self {
+        match i8::wrapping_add(self as i8, turns) & 0b11 {
+            0 => Left,
+            1 => Up,
+            2 => Right,
+            3 => Down,
+            _ => unreachable!(),
         }
-        self
     }
 }
 
@@ -713,38 +788,39 @@ impl Face {
     /// as the amount of times you'll need to turn a position on the current
     /// face clockwise to translate it to the new face.
     fn adjacent_in(self, direction: Direction) -> (Face, i8) {
-        match (self, direction) {
+        let table = [
             // bottom
-            (Bottom, Left) => (West, 1),
-            (Bottom, Up) => (North, 0),
-            (Bottom, Right) => (East, -1),
-            (Bottom, Down) => (South, 2),
+            (West, 1),
+            (North, 0),
+            (East, -1),
+            (South, 2),
             // west
-            (West, Left) => (South, 0),
-            (West, Up) => (Top, 1),
-            (West, Right) => (North, 0),
-            (West, Down) => (Bottom, -1),
+            (South, 0),
+            (Top, 1),
+            (North, 0),
+            (Bottom, -1),
             // north
-            (North, Left) => (West, 0),
-            (North, Up) => (Top, 0),
-            (North, Right) => (East, 0),
-            (North, Down) => (Bottom, 0),
+            (West, 0),
+            (Top, 0),
+            (East, 0),
+            (Bottom, 0),
             // east
-            (East, Left) => (North, 0),
-            (East, Up) => (Top, -1),
-            (East, Right) => (South, 0),
-            (East, Down) => (Bottom, 1),
+            (North, 0),
+            (Top, -1),
+            (South, 0),
+            (Bottom, 1),
             // south
-            (South, Left) => (East, 0),
-            (South, Up) => (Top, 2),
-            (South, Right) => (West, 0),
-            (South, Down) => (Bottom, 2),
+            (East, 0),
+            (Top, 2),
+            (West, 0),
+            (Bottom, 2),
             // top
-            (Top, Left) => (West, -1),
-            (Top, Up) => (South, 2),
-            (Top, Right) => (East, 1),
-            (Top, Down) => (North, 0),
-        }
+            (West, -1),
+            (South, 2),
+            (East, 1),
+            (North, 0),
+        ];
+        table[(self as usize) << 2 | direction as usize]
     }
 }
 
