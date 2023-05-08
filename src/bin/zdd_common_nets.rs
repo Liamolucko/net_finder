@@ -69,6 +69,7 @@ fn main() -> anyhow::Result<()> {
         .into_iter()
         .collect();
     let bytes = postcard::to_stdvec(&common_nets)?;
+    fs::create_dir_all(path.parent().unwrap())?;
     fs::write(path, bytes)?;
 
     for (i, net) in common_nets.into_iter().enumerate() {
