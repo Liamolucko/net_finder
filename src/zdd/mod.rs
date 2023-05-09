@@ -11,18 +11,17 @@ use rayon::{
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use Direction::*;
-use Face::*;
+
+use self::geometry::{Edge, Rotation, Vertex};
 
 mod construct;
+mod geometry;
 
 /// The max. number of vertices allowed.
-/// This is 36 because that's all you need to be able to find ZDDs for 1x1x7 and
+/// This is 32 because that's all you need to be able to find ZDDs for 1x1x7 and
 /// 1x2x5 cuboids.
-/// (Oops, turns out I accidentally included support for 1x2x5 cuboids; 1x3x3
-/// cuboids only have 32 vertices and 60 edges the same as 1x1x7 cuboids... oh
-/// well)
-const MAX_VERTICES: u8 = 36;
-const MAX_EDGES: usize = 72;
+const MAX_VERTICES: u8 = 32;
+const MAX_EDGES: usize = 60;
 
 /// A zero-suppressed binary decision diagram (ZDD), specialised for the purpose
 /// of storing developments of a cuboid.
@@ -45,6 +44,9 @@ pub struct Zdd {
     vertices: Vec<Vertex>,
     /// The edges of the cuboid this is a ZDD for.
     edges: Vec<Edge>,
+
+    /// All the rotations of the cuboid.
+    rotations: Vec<Rotation>,
 
     /// The rows of nodes in the ZDD.
     rows: Vec<Vec<Node>>,
@@ -139,248 +141,7 @@ enum ConstantNode {
     One,
 }
 
-/// A vertex of a cuboid.
-///
-/// Unlike in `Net` and `Surface`, this isn't the middle of a square on the
-/// surface of a cuboid; it's the corner.
-/// To be clear, it's not just the corners of the entire cuboid, it still
-/// includes the corners of all the grid squares on the cuboid's surface.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-struct Vertex {
-    /// The cuboid this is a vertex of.
-    cuboid: Cuboid,
-    /// Which face of the cuboid this vertex lies on.
-    ///
-    /// Some vertices lie on the edge of 2 (or 3) faces. In that case, we just
-    /// pick one of them to specify here.
-    face: Face,
-    /// The position of this vertex on the face.
-    pos: Pos,
-}
-
-/// A edge between two vertices of a cuboid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub(self) struct Edge {
-    /// The indices of the two endpoints of this edge.
-    ///
-    /// Sorted from smallest to largest.
-    vertices: [u8; 2],
-}
-
-impl Edge {
-    fn new(v1: u8, v2: u8) -> Self {
-        let mut vertices = [v1, v2];
-        vertices.sort_unstable();
-        Self { vertices }
-    }
-}
-
-impl Vertex {
-    /// Returns the position of this vertex on the given face, if it's on that
-    /// face.
-    fn pos_on_face(&self, face: Face) -> Option<Pos> {
-        let pos_in_direction = |direction| {
-            let (new_face, turns) = self.face.adjacent_in(direction);
-            let mut new_pos = self.pos;
-            // First, rotate our position so that it's the right way around for the new
-            // face.
-            let mut size = self.cuboid.face_size(self.face);
-            for _ in 0..turns.rem_euclid(4) {
-                size.rotate(1);
-                new_pos = Pos {
-                    x: new_pos.y,
-                    y: size.height - new_pos.x,
-                };
-            }
-            // Then adjust the part of the position where we entered.
-            let entry_direction = direction.turned(turns);
-            let size = self.cuboid.face_size(new_face);
-            match entry_direction {
-                Left => new_pos.x = size.width,
-                Up => new_pos.y = 0,
-                Right => new_pos.x = 0,
-                Down => new_pos.y = size.height,
-            }
-            new_pos
-        };
-
-        if self.face == face {
-            Some(self.pos)
-        } else if self.pos.x == 0 && self.face.adjacent_in(Left).0 == face {
-            Some(pos_in_direction(Left))
-        } else if self.pos.y == self.cuboid.face_size(self.face).height
-            && self.face.adjacent_in(Up).0 == face
-        {
-            Some(pos_in_direction(Up))
-        } else if self.pos.x == self.cuboid.face_size(self.face).width
-            && self.face.adjacent_in(Right).0 == face
-        {
-            Some(pos_in_direction(Right))
-        } else if self.pos.y == 0 && self.face.adjacent_in(Down).0 == face {
-            Some(pos_in_direction(Down))
-        } else {
-            None
-        }
-    }
-
-    /// Returns the list of vertices adjacent to this one.
-    fn neighbours(&self) -> Vec<Vertex> {
-        let mut neighbours = Vec::new();
-        // Go through the version of this vertex on every face and find its neighbours
-        // on that face.
-        for (face, pos) in [Bottom, West, North, East, South, Top]
-            .into_iter()
-            .filter_map(|face| Some((face, self.pos_on_face(face)?)))
-        {
-            if pos.x > 0 {
-                neighbours.push(Vertex {
-                    cuboid: self.cuboid,
-                    face,
-                    pos: Pos {
-                        x: pos.x - 1,
-                        y: pos.y,
-                    },
-                })
-            }
-            if pos.x < self.cuboid.face_size(face).width {
-                neighbours.push(Vertex {
-                    cuboid: self.cuboid,
-                    face,
-                    pos: Pos {
-                        x: pos.x + 1,
-                        y: pos.y,
-                    },
-                })
-            }
-
-            if pos.y > 0 {
-                neighbours.push(Vertex {
-                    cuboid: self.cuboid,
-                    face,
-                    pos: Pos {
-                        x: pos.x,
-                        y: pos.y - 1,
-                    },
-                })
-            }
-            if pos.y < self.cuboid.face_size(face).height {
-                neighbours.push(Vertex {
-                    cuboid: self.cuboid,
-                    face,
-                    pos: Pos {
-                        x: pos.x,
-                        y: pos.y + 1,
-                    },
-                })
-            }
-        }
-        neighbours
-    }
-}
-
-#[test]
-fn pos_on_face() {
-    let cuboid = Cuboid::new(1, 1, 1);
-    let vertex = Vertex {
-        cuboid,
-        face: Bottom,
-        pos: Pos::new(0, 0),
-    };
-    assert_eq!(vertex.pos_on_face(Bottom), Some(Pos::new(0, 0)));
-    assert_eq!(vertex.pos_on_face(West), Some(Pos::new(0, 0)));
-    assert_eq!(vertex.pos_on_face(North), None);
-    assert_eq!(vertex.pos_on_face(East), None);
-    assert_eq!(vertex.pos_on_face(South), Some(Pos::new(1, 0)));
-    assert_eq!(vertex.pos_on_face(Top), None);
-
-    let vertex = Vertex {
-        cuboid,
-        face: Top,
-        pos: Pos::new(0, 0),
-    };
-    assert_eq!(vertex.pos_on_face(Bottom), None);
-    assert_eq!(vertex.pos_on_face(West), Some(Pos::new(1, 1)));
-    assert_eq!(vertex.pos_on_face(North), Some(Pos::new(0, 1)));
-    assert_eq!(vertex.pos_on_face(East), None);
-    assert_eq!(vertex.pos_on_face(South), None);
-    assert_eq!(vertex.pos_on_face(Top), Some(Pos::new(0, 0)));
-}
-
-impl PartialEq for Vertex {
-    fn eq(&self, other: &Self) -> bool {
-        other.pos_on_face(self.face) == Some(self.pos)
-    }
-}
-
-impl Eq for Vertex {}
-
 impl Zdd {
-    /// Computes the vertices and edges of a cuboid.
-    fn compute_geometry(cuboid: Cuboid) -> (Vec<Vertex>, Vec<Edge>) {
-        // Enumerate all the vertices of the cuboid, starting with the corners..
-        let mut vertices: Vec<_> = [
-            (Bottom, Pos::new(0, 0)),
-            (Bottom, Pos::new(0, cuboid.depth)),
-            (Bottom, Pos::new(cuboid.width, 0)),
-            (Bottom, Pos::new(cuboid.width, cuboid.depth)),
-            (Top, Pos::new(0, 0)),
-            (Top, Pos::new(0, cuboid.depth)),
-            (Top, Pos::new(cuboid.width, 0)),
-            (Top, Pos::new(cuboid.width, cuboid.depth)),
-        ]
-        .into_iter()
-        .map(|(face, pos)| Vertex { cuboid, face, pos })
-        .collect();
-
-        for face in [Bottom, West, North, East, South, Top] {
-            let size = cuboid.face_size(face);
-            for x in 0..=size.width {
-                for y in 0..=size.height {
-                    let vertex = Vertex {
-                        cuboid,
-                        face,
-                        pos: Pos { x, y },
-                    };
-                    if !vertices.contains(&vertex) {
-                        vertices.push(vertex);
-                    }
-                }
-            }
-        }
-
-        // Enumerate all the edges of the cuboid.
-        let mut edges = Vec::new();
-        for (i, v1) in vertices.iter().enumerate() {
-            for v2 in v1.neighbours() {
-                let j = vertices.iter().position(|&vertex| vertex == v2).unwrap();
-                let edge = Edge::new(i.try_into().unwrap(), j.try_into().unwrap());
-                if !edges.contains(&edge) {
-                    edges.push(edge);
-                }
-            }
-        }
-
-        (vertices, edges)
-    }
-
-    pub fn cuboid_info(cuboid: Cuboid) -> (usize, usize) {
-        let (vertices, edges) = Self::compute_geometry(cuboid);
-
-        (vertices.len(), edges.len())
-    }
-
-    pub fn vertex_indices(&self) -> FxHashMap<(Face, Pos), u8> {
-        let mut vertex_indices = FxHashMap::default();
-        for (i, vertex) in self.vertices.iter().copied().enumerate() {
-            for face in [Bottom, West, North, East, South, Top] {
-                if let Some(pos) = vertex.pos_on_face(face) {
-                    vertex_indices.insert((face, pos), i.try_into().unwrap());
-                }
-            }
-        }
-        vertex_indices
-    }
-
     /// Returns the number of developments this ZDD represents.
     pub fn size(&self) -> usize {
         // Set up a cache for the number of developments represented by each node.
@@ -405,15 +166,7 @@ impl Zdd {
         }
 
         let node = &self.rows[0][0];
-        let result = size(self, &mut cache, 0, node.zero_edge())
-            + size(self, &mut cache, 0, node.one_edge());
-        // for row in &cache[1..] {
-        //     for size in row {
-        //         print!("{} ", size.unwrap());
-        //     }
-        //     println!();
-        // }
-        result
+        size(self, &mut cache, 0, node.zero_edge()) + size(self, &mut cache, 0, node.one_edge())
     }
 
     /// Returns an iterator over the set of sets of cut edges this ZDD
@@ -527,6 +280,22 @@ impl Iterator for EdgeIter<'_> {
         }
 
         // If we broke out of the loop, we've found a path to a 1-node.
+        // First we build a bit-encoded version of this, which we use to check whether
+        // this is a non-canonical version of this set of edges, and if so skip it.
+        let bits = self
+            .stack
+            .iter()
+            .enumerate()
+            .fold(0, |result, (i, &(_, included))| {
+                result | ((included as u64) << i)
+            });
+
+        if !self.zdd.is_canon(bits) {
+            self.advance();
+            return self.next();
+        }
+
+        // Otherwise, yield the result.
         let result = self
             .stack
             .iter()

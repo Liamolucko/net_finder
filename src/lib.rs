@@ -282,7 +282,7 @@ impl Net {
             .skip(start_y)
             .map(|row| {
                 row.iter()
-                    .position(|&square| square == true)
+                    .position(|&square| square)
                     .unwrap_or(self.width())
             })
             .min()
@@ -291,7 +291,7 @@ impl Net {
             .rows()
             .take(end_y)
             .skip(start_y)
-            .map(|row| row.iter().rposition(|&square| square == true).unwrap_or(0) + 1)
+            .map(|row| row.iter().rposition(|&square| square).unwrap_or(0) + 1)
             .max()
             .unwrap();
 
@@ -383,11 +383,7 @@ impl Net {
         // the surface of the cuboid in turn, and try to find what face each spot on the
         // net would have to be if that was the case.
         // If we don't run into any contradictions, we've found a valid colouring.
-        let index = self
-            .squares
-            .iter()
-            .position(|&square| square == true)
-            .unwrap();
+        let index = self.squares.iter().position(|&square| square).unwrap();
         let net_start = Pos {
             x: index % self.width,
             y: index / self.width,
@@ -822,9 +818,73 @@ impl Face {
         ];
         table[(self as usize) << 2 | direction as usize]
     }
+
+    fn direction_of(self, other: Face) -> Option<(Direction, i8)> {
+        match (self, other) {
+            // bottom
+            (Bottom, West) => Some((Left, 1)),
+            (Bottom, North) => Some((Up, 0)),
+            (Bottom, East) => Some((Right, -1)),
+            (Bottom, South) => Some((Down, 2)),
+            // west
+            (West, South) => Some((Left, 0)),
+            (West, Top) => Some((Up, 1)),
+            (West, North) => Some((Right, 0)),
+            (West, Bottom) => Some((Down, -1)),
+            // north
+            (North, West) => Some((Left, 0)),
+            (North, Top) => Some((Up, 0)),
+            (North, East) => Some((Right, 0)),
+            (North, Bottom) => Some((Down, 0)),
+            // east
+            (East, North) => Some((Left, 0)),
+            (East, Top) => Some((Up, -1)),
+            (East, South) => Some((Right, 0)),
+            (East, Bottom) => Some((Down, 1)),
+            // south
+            (South, East) => Some((Left, 0)),
+            (South, Top) => Some((Up, 2)),
+            (South, West) => Some((Right, 0)),
+            (South, Bottom) => Some((Down, 2)),
+            // top
+            (Top, West) => Some((Left, -1)),
+            (Top, South) => Some((Up, 2)),
+            (Top, East) => Some((Right, 1)),
+            (Top, North) => Some((Down, 0)),
+
+            _ => None,
+        }
+    }
+
+    /// Returns the face opposite to this one.
+    fn opposite(self) -> Face {
+        match self {
+            Bottom => Top,
+            West => East,
+            North => South,
+            East => West,
+            South => North,
+            Top => Bottom,
+        }
+    }
+
+    /// Returns the transformation necessary to convert from a position on this
+    /// face to a position on the face opposite to it.
+    fn opposite_transform(&self) -> Transform {
+        match self {
+            Bottom | Top => Transform::VerticalFlip,
+            West | North | East | South => Transform::HorizontalFlip,
+        }
+    }
 }
 
 use Face::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Transform {
+    HorizontalFlip,
+    VerticalFlip,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FacePos {

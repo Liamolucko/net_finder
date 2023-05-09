@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
     let Options { cuboids } = Options::parse();
 
     // Load the ZDD for the first cuboid.
-    if cuboids.len() < 1 {
+    if cuboids.is_empty() {
         bail!("expected at least 1 cuboid");
     }
     let first_cuboid = cuboids[0];
@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
         .with_style(style.clone());
     let found_progress = ProgressBar::new_spinner()
         .with_prefix("common nets found")
-        .with_style(style.clone());
+        .with_style(style);
     progress.add(zdd_progress.clone());
     progress.add(found_progress.clone());
 
@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
     fs::write(path, bytes)?;
 
     for (i, net) in common_nets.into_iter().enumerate() {
-        println!("Net #{i}:\n{}", net.color(cuboids[0]).unwrap());
+        println!("Net #{}:\n{}", i + 1, net.color(cuboids[0]).unwrap());
     }
     Ok(())
 }

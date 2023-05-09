@@ -16,7 +16,10 @@ use rustc_hash::FxHashMap;
 
 use crate::Cuboid;
 
-use super::{ConstantNode, Edge, Node, NodeRef, Zdd, MAX_EDGES, MAX_VERTICES};
+use super::{
+    geometry::{rotations_for_cuboid, Edge},
+    ConstantNode, Node, NodeRef, Zdd, MAX_EDGES, MAX_VERTICES,
+};
 
 /// The state of the graph represented by a node in a ZDD.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -260,7 +263,7 @@ impl NodeState {
         remaining_edges: &[Edge],
         frontier: &[u8],
     ) -> Result<NodeState, ConstantNode> {
-        let mut new_node = self.clone();
+        let mut new_node = *self;
 
         // First handle the exits of the individual vertices.
         let mut comp_exits: u8 = 0;
@@ -302,7 +305,7 @@ impl NodeState {
             return Err(ConstantNode::Zero);
         }
 
-        let mut new_node = self.clone();
+        let mut new_node = *self;
 
         // Actually update the info in `new_node` to account for this edge being added.
         new_node.add_edge(edge);
@@ -367,7 +370,7 @@ fn row_thread(
                     sender
                         .as_ref()
                         .expect("node in last row doesn't lead to a constant node")
-                        .send(new_node.clone())
+                        .send(new_node)
                         .unwrap();
                     let index = yielded_states.len();
                     yielded_states.insert(
@@ -520,6 +523,7 @@ impl Zdd {
         });
 
         Self {
+            rotations: rotations_for_cuboid(cuboid, &vertices, &edges),
             cuboid,
             edges,
             vertices,
