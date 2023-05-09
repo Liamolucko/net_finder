@@ -422,7 +422,7 @@ fn net_from_edges(
         x: middle_x,
         y: middle_y,
     };
-    let face_pos = FacePos::new(cuboid);
+    let face_pos = FacePos::new();
 
     net.set(pos, true);
     let mut area = 1;
@@ -440,7 +440,7 @@ fn net_from_edges(
         if net.filled(new_pos) {
             continue;
         }
-        let new_face_pos = face_pos.moved_in(direction);
+        let new_face_pos = face_pos.moved_in(direction, cuboid);
 
         // Construct the edge that would stop this from happening.
 

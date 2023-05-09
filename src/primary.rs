@@ -19,6 +19,7 @@ use crate::{Cuboid, Direction::*, FacePos, Net, Pos, Surface};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NetFinder {
+    pub cuboids: Vec<Cuboid>,
     pub net: Net,
     surfaces: Vec<Surface>,
     queue: Vec<Instruction>,
@@ -41,6 +42,10 @@ struct Instruction {
     /// The position on the net where the square will be added.
     net_pos: Pos,
     /// The equivalent positions on the surfaces of the cuboids.
+    ///
+    /// This isn't actually supposed to represent an array of length 2, it's an
+    /// array of length *up to* 2; later elements are just ignored since it's
+    /// always zipped with something or other.
     face_positions: heapless::Vec<FacePos, 3>,
     state: InstructionState,
 }
@@ -103,7 +108,7 @@ impl NetFinder {
         // considering multiple starting spots is so that the same spot on the net can
         // map to any different spot on the different cuboids; for a single cuboid, we
         // can discover a net from any starting spot.
-        starting_points[0] = vec![FacePos::new(cuboids[0])];
+        starting_points[0] = vec![FacePos::new()];
 
         let mut starting_face_positions: Vec<heapless::Vec<FacePos, 3>> = Vec::new();
         let mut indices: Vec<_> = cuboids.iter().map(|_| 0_usize).collect();
@@ -144,6 +149,7 @@ impl NetFinder {
                         .unwrap(),
                 );
                 Self {
+                    cuboids: cuboids.to_owned(),
                     net: net.clone(),
                     surfaces: surfaces.clone(),
                     queue,
@@ -188,6 +194,7 @@ impl NetFinder {
 
     /// Handle the instruction at the current index in the queue, incrementing
     /// the index afterwards.
+    #[inline]
     fn handle_instruction(&mut self) {
         // for (index, instruction) in self.queue.iter().enumerate() {
         //     println!(
@@ -217,9 +224,8 @@ impl NetFinder {
                     // `heapless::Vec`'s `FromIterator` impl isn't very efficient, which is why we
                     // clone and modify instead.
                     let mut face_positions = self.queue[self.index].face_positions.clone();
-                    face_positions
-                        .iter_mut()
-                        .for_each(|pos| pos.move_in(direction));
+                    zip(&self.cuboids, &mut face_positions)
+                        .for_each(|(&cuboid, pos)| pos.move_in(direction, cuboid));
                     let instruction = Instruction {
                         net_pos,
                         face_positions,
@@ -265,15 +271,6 @@ impl NetFinder {
         for (surface, &pos) in zip(&mut self.surfaces, face_positions) {
             surface.set(pos, value);
         }
-    }
-
-    /// The cuboids this is finding nets for.
-    pub fn cuboids(&self) -> Vec<Cuboid> {
-        self.queue[0]
-            .face_positions
-            .iter()
-            .map(|face_pos| face_pos.cuboid)
-            .collect()
     }
 }
 

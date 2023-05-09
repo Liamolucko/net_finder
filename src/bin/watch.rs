@@ -122,7 +122,7 @@ fn render_contents(path: &Path, mode: Mode) -> anyhow::Result<String> {
     for (i, finder) in state.finders.into_iter().enumerate() {
         // We show one net for each cuboid.
         let mut nets =
-            vec![ColoredNet::new(finder.net.width(), finder.net.height()); finder.cuboids().len()];
+            vec![ColoredNet::new(finder.net.width(), finder.net.height()); finder.cuboids.len()];
         for x in 0..finder.net.width() {
             for y in 0..finder.net.height() {
                 let pos = Pos::new(x, y);

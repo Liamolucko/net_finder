@@ -19,16 +19,16 @@ pub use zdd::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Cuboid {
-    pub width: usize,
-    pub depth: usize,
-    pub height: usize,
+    pub width: u8,
+    pub depth: u8,
+    pub height: u8,
 }
 
 impl FromStr for Cuboid {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let dims: Vec<usize> = s
+        let dims: Vec<u8> = s
             .split('x')
             .map(|dim| dim.parse())
             .collect::<Result<_, _>>()
@@ -51,7 +51,7 @@ impl Display for Cuboid {
 }
 
 impl Cuboid {
-    pub fn new(width: usize, depth: usize, height: usize) -> Self {
+    pub fn new(width: u8, depth: u8, height: u8) -> Self {
         Self {
             width,
             depth,
@@ -69,7 +69,10 @@ impl Cuboid {
     }
 
     pub fn surface_area(&self) -> usize {
-        2 * self.width * self.depth + 2 * self.depth * self.height + 2 * self.width * self.height
+        let width: usize = self.width.into();
+        let height: usize = self.height.into();
+        let depth: usize = self.depth.into();
+        2 * width * depth + 2 * depth * height + 2 * width * height
     }
 
     /// Returns all the face positions on the surface of a cuboid that can't be
@@ -83,9 +86,32 @@ impl Cuboid {
     /// corresponding to different face positions.
     fn surface_squares(&self) -> Vec<FacePos> {
         let mut result = Vec::new();
+
         // Don't bother with east, south, and top because they're symmetrical with west,
         // north and bottom, and so won't reveal any new nets.
-        for face in [Bottom, West, North] {
+        let mut faces = vec![Bottom, West, North];
+
+        // Get rid of any faces that are the same size, since any point on one can be
+        // rotated to a point on the other.
+        let mut i = 0;
+        while i < faces.len() {
+            let face = faces[i];
+            let face_size = self.face_size(face);
+            if faces
+                .iter()
+                .filter(|&&other_face| other_face != face)
+                .any(|&other_face| {
+                    self.face_size(other_face) == face_size
+                        || self.face_size(other_face) == face_size.rotated(1)
+                })
+            {
+                faces.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        for face in faces {
             let size = self.face_size(face);
             for x in 0..size.width {
                 for y in 0..size.height {
@@ -93,7 +119,6 @@ impl Cuboid {
                     // transformed into other spots on the same face with orientations of 0 and 1
                     // respectively with a 180 degree turn.
                     result.push(FacePos {
-                        cuboid: *self,
                         face,
                         pos: Pos::new(x, y),
                         orientation: 0,
@@ -106,7 +131,6 @@ impl Cuboid {
                     // to get back to the same shape.
                     if size.width != size.height {
                         result.push(FacePos {
-                            cuboid: *self,
                             face,
                             pos: Pos::new(x, y),
                             orientation: 1,
@@ -121,7 +145,7 @@ impl Cuboid {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Net {
-    width: usize,
+    width: u8,
     /// A vec indicating whether a square is present in each spot.
     squares: Vec<bool>,
 }
@@ -192,7 +216,7 @@ fn rotated_cross() {
 
 impl<'a> Arbitrary<'a> for Net {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let (width, squares): (usize, Vec<bool>) = u.arbitrary()?;
+        let (width, squares): (u8, Vec<bool>) = u.arbitrary()?;
         if width == 0 || squares.is_empty() {
             return Err(arbitrary::Error::IncorrectFormat);
         }
@@ -202,10 +226,10 @@ impl<'a> Arbitrary<'a> for Net {
 
 impl Net {
     /// Creates a new, empty net with the given width and height.
-    pub fn new(width: usize, height: usize) -> Self {
+    pub fn new(width: u8, height: u8) -> Self {
         Self {
             width,
-            squares: vec![false; width * height],
+            squares: vec![false; usize::from(width) * usize::from(height)],
         }
     }
 
@@ -230,18 +254,20 @@ impl Net {
         // index.
         let width = 1 + 2 * middle_x;
         let height = 1 + 2 * middle_y;
-        Self::new(width, height)
+        Self::new(width.try_into().unwrap(), height.try_into().unwrap())
     }
 
-    pub fn width(&self) -> usize {
+    pub fn width(&self) -> u8 {
         self.width
     }
 
-    pub fn height(&self) -> usize {
+    pub fn height(&self) -> u8 {
         if self.width == 0 {
             0
         } else {
-            self.squares.len() / self.width
+            (self.squares.len() / usize::from(self.width))
+                .try_into()
+                .unwrap()
         }
     }
 
@@ -251,14 +277,14 @@ impl Net {
 
     /// Returns an iterator over the rows of the net.
     pub fn rows(&self) -> impl Iterator<Item = &[bool]> + DoubleEndedIterator + ExactSizeIterator {
-        self.squares.chunks(self.width)
+        self.squares.chunks(self.width.into())
     }
 
     /// Returns a mutable iterator over the rows of the net.
     pub fn rows_mut(
         &mut self,
     ) -> impl Iterator<Item = &mut [bool]> + DoubleEndedIterator + ExactSizeIterator {
-        self.squares.chunks_mut(self.width)
+        self.squares.chunks_mut(self.width.into())
     }
 
     /// Return a copy of this net with the empty space removed from around it.
@@ -283,7 +309,7 @@ impl Net {
             .map(|row| {
                 row.iter()
                     .position(|&square| square)
-                    .unwrap_or(self.width())
+                    .unwrap_or(self.width().into())
             })
             .min()
             .unwrap();
@@ -295,7 +321,10 @@ impl Net {
             .max()
             .unwrap();
 
-        let mut result = Net::new(end_x - start_x, end_y - start_y);
+        let mut result = Net::new(
+            (end_x - start_x).try_into().unwrap(),
+            (end_y - start_y).try_into().unwrap(),
+        );
 
         for (src, dst) in zip(self.rows().take(end_y).skip(start_y), result.rows_mut()) {
             dst.copy_from_slice(&src[start_x..end_x])
@@ -312,12 +341,12 @@ impl Net {
 
     /// Returns whether a given position on the net is filled.
     pub fn filled(&self, pos: Pos) -> bool {
-        self.squares[pos.y * self.width + pos.x]
+        self.squares[usize::from(pos.y) * usize::from(self.width) + usize::from(pos.x)]
     }
 
     /// Set whether a spot on the net is filled.
     fn set(&mut self, pos: Pos, value: bool) {
-        self.squares[pos.y * self.width + pos.x] = value;
+        self.squares[usize::from(pos.y) * usize::from(self.width) + usize::from(pos.x)] = value;
     }
 
     /// Returns a copy of this net rotated by the given number of clockwise
@@ -357,9 +386,12 @@ impl Net {
     pub fn vertical_flip(&mut self) {
         let midpoint = self.squares.len() / 2;
         let (start, end) = self.squares.split_at_mut(midpoint);
-        for (a, b) in zip(start.chunks_mut(self.width), end.rchunks_mut(self.width)) {
+        for (a, b) in zip(
+            start.chunks_mut(self.width.into()),
+            end.rchunks_mut(self.width.into()),
+        ) {
             // ignore the middle half-sized chunks if present
-            if a.len() == self.width {
+            if a.len() == self.width.into() {
                 a.swap_with_slice(b);
             }
         }
@@ -385,8 +417,8 @@ impl Net {
         // If we don't run into any contradictions, we've found a valid colouring.
         let index = self.squares.iter().position(|&square| square).unwrap();
         let net_start = Pos {
-            x: index % self.width,
-            y: index / self.width,
+            x: (index % usize::from(self.width)).try_into().unwrap(),
+            y: (index / usize::from(self.width)).try_into().unwrap(),
         };
 
         // A lot of time is spent on repeatedly allocating/deallocating these, so share
@@ -424,6 +456,7 @@ impl Net {
         pos_map.fill(None);
 
         fn fill(
+            cuboid: Cuboid,
             net: &Net,
             net_pos: Pos,
             surface_pos: FacePos,
@@ -432,7 +465,7 @@ impl Net {
         ) -> bool {
             // Make a little helper function to get the index in `pos_map` which corresponds
             // to a given position.
-            let index = |pos: Pos| pos.y * net.width + pos.x;
+            let index = |pos: Pos| usize::from(pos.y) * usize::from(net.width) + usize::from(pos.x);
             surface.set(surface_pos, true);
             pos_map[index(net_pos)] = Some(surface_pos);
             for direction in [Left, Up, Right, Down] {
@@ -445,7 +478,7 @@ impl Net {
                     continue;
                 }
 
-                let surface_pos = surface_pos.moved_in(direction);
+                let surface_pos = surface_pos.moved_in(direction, cuboid);
 
                 if let Some(existing_surface_pos) = pos_map[index(net_pos)] {
                     if existing_surface_pos == surface_pos {
@@ -466,7 +499,7 @@ impl Net {
                 }
 
                 // Now try filling in this new position as well.
-                if !fill(net, net_pos, surface_pos, surface, pos_map) {
+                if !fill(cuboid, net, net_pos, surface_pos, surface, pos_map) {
                     return false;
                 }
             }
@@ -474,7 +507,7 @@ impl Net {
             true
         }
 
-        fill(self, net_start, surface_start, surface, pos_map)
+        fill(cuboid, self, net_start, surface_start, surface, pos_map)
             && pos_map.iter().filter(|pos| pos.is_some()).count() == cuboid.surface_area()
     }
 
@@ -513,39 +546,32 @@ fn color() {
 /// A version of `Net` which stores which face each of its squares are on.
 #[derive(Debug, Clone)]
 pub struct ColoredNet {
-    width: usize,
+    width: u8,
     squares: Vec<Option<Face>>,
 }
 
 impl ColoredNet {
-    pub fn new(width: usize, height: usize) -> Self {
+    pub fn new(width: u8, height: u8) -> Self {
         Self {
             width,
-            squares: vec![None; width * height],
+            squares: vec![None; usize::from(width) * usize::from(height)],
         }
     }
 
     /// Set whether a spot on the net is filled.
     pub fn set(&mut self, pos: Pos, value: Face) {
-        self.squares[pos.y * self.width + pos.x] = Some(value);
+        self.squares[usize::from(pos.y) * usize::from(self.width) + usize::from(pos.x)] =
+            Some(value);
     }
 
     pub fn get(&mut self, pos: Pos) -> Option<Face> {
-        self.squares[pos.y * self.width + pos.x]
+        self.squares[usize::from(pos.y) * usize::from(self.width) + usize::from(pos.x)]
     }
 
     /// Returns an iterator over the rows of the net.
     fn rows(&self) -> impl Iterator<Item = &[Option<Face>]> {
         (self.width != 0)
-            .then(|| self.squares.chunks(self.width))
-            .into_iter()
-            .flatten()
-    }
-
-    /// Returns a mutable iterator over the rows of the net.
-    fn rows_mut(&mut self) -> impl Iterator<Item = &mut [Option<Face>]> {
-        (self.width != 0)
-            .then(|| self.squares.chunks_mut(self.width))
+            .then(|| self.squares.chunks(self.width.into()))
             .into_iter()
             .flatten()
     }
@@ -557,7 +583,7 @@ impl ColoredNet {
             .count()
     }
 
-    pub fn width(&self) -> usize {
+    pub fn width(&self) -> u8 {
         self.width
     }
 
@@ -565,53 +591,8 @@ impl ColoredNet {
         if self.width == 0 {
             0
         } else {
-            self.squares.len() / self.width
+            self.squares.len() / usize::from(self.width)
         }
-    }
-
-    /// Return a copy of this net with the empty space removed from around it.
-    pub fn shrink(&self) -> Self {
-        // The x and y at which the new net will start (inclusive).
-        // If these get left as their initial values after the end of the net, the net
-        // contains no squares.
-        let mut start_x = self.width();
-        let mut start_y = self.height();
-        // The x and y at which the new net will end (exclusive).
-        let mut end_x = 0;
-        let mut end_y = 0;
-
-        for (y, row) in self.rows().enumerate() {
-            for (x, &cell) in row.iter().enumerate() {
-                if cell.is_some() {
-                    // There's a cell in this row, so push the end row to the next row.
-                    end_y = y + 1;
-                    if x >= end_x {
-                        // There's a cell in this column, so push the end column to the next column.
-                        end_x = x + 1;
-                    }
-
-                    if x < start_x {
-                        start_x = x;
-                    }
-                    if y < start_y {
-                        start_y = y;
-                    }
-                }
-            }
-        }
-
-        if start_x == self.width() || start_y == self.height() {
-            // The net contains no squares. Just return an empty net.
-            return ColoredNet::new(0, 0);
-        }
-
-        let mut result = ColoredNet::new(end_x - start_x, end_y - start_y);
-
-        for (src, dst) in zip(self.rows().take(end_y).skip(start_y), result.rows_mut()) {
-            dst.copy_from_slice(&src[start_x..end_x])
-        }
-
-        result
     }
 }
 
@@ -665,12 +646,12 @@ impl Display for Net {
 // A position in 2D space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Pos {
-    x: usize,
-    y: usize,
+    x: u8,
+    y: u8,
 }
 
 impl Pos {
-    pub fn new(x: usize, y: usize) -> Self {
+    pub fn new(x: u8, y: u8) -> Self {
         Self { x, y }
     }
 
@@ -705,10 +686,13 @@ impl Pos {
     /// Returns what this position would be if the surface it was on was rotated
     /// by `turns` clockwise turns, and the surface was of size `size` before
     /// being turned.
-    fn rotate(&mut self, turns: i8, mut size: Size) {
-        for _ in 0..turns & 0b11 {
-            (self.x, self.y) = (self.y, size.width - self.x - 1);
-            size.rotate(1);
+    fn rotate(&mut self, turns: i8, size: Size) {
+        match turns & 0b11 {
+            0 => {}
+            1 => (self.x, self.y) = (self.y, size.width - self.x - 1),
+            2 => (self.x, self.y) = (size.width - self.x - 1, size.height - self.y - 1),
+            3 => (self.x, self.y) = (size.height - self.y - 1, self.x),
+            _ => unreachable!(),
         }
     }
 
@@ -727,12 +711,12 @@ impl Display for Pos {
 // A size in 2D space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Size {
-    width: usize,
-    height: usize,
+    width: u8,
+    height: u8,
 }
 
 impl Size {
-    fn new(width: usize, height: usize) -> Self {
+    fn new(width: u8, height: u8) -> Self {
         Self { width, height }
     }
 
@@ -742,6 +726,11 @@ impl Size {
         if turns % 2 != 0 {
             std::mem::swap(&mut self.width, &mut self.height);
         }
+    }
+
+    fn rotated(mut self, turns: i8) -> Size {
+        self.rotate(turns);
+        self
     }
 }
 
@@ -888,8 +877,6 @@ pub(crate) enum Transform {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FacePos {
-    /// The cuboid which this position is on.
-    cuboid: Cuboid,
     /// Which face this position is on.
     pub face: Face,
     /// The position within the face.
@@ -902,11 +889,10 @@ pub struct FacePos {
 }
 
 impl FacePos {
-    /// Creates a new face position at (0, 0) on the bottom face of the given
-    /// cuboid, oriented the same as the net.
-    fn new(cuboid: Cuboid) -> Self {
+    /// Creates a new face position at (0, 0) on the bottom face of a cuboid,
+    /// oriented the same as the net.
+    fn new() -> Self {
         Self {
-            cuboid,
             face: Bottom,
             pos: Pos::new(0, 0),
             orientation: 0,
@@ -914,24 +900,24 @@ impl FacePos {
     }
 
     /// Move the position 1 unit in the given direction on the net.
-    fn move_in(&mut self, direction: Direction) {
+    fn move_in(&mut self, direction: Direction, cuboid: Cuboid) {
         let face_direction = direction.turned(self.orientation);
         let success = self
             .pos
-            .move_in(face_direction, self.cuboid.face_size(self.face));
+            .move_in(face_direction, cuboid.face_size(self.face));
         if !success {
             // We went off the edge of the face, time to switch faces.
             let (new_face, turns) = self.face.adjacent_in(face_direction);
             let entry_direction = face_direction.turned(turns);
 
             // Rotate the position to be aligned with the new face.
-            self.pos.rotate(turns, self.cuboid.face_size(self.face));
+            self.pos.rotate(turns, cuboid.face_size(self.face));
             // Then set the coordinate we moved along to the appropriate edge of the face.
             match entry_direction {
-                Left => self.pos.x = self.cuboid.face_size(new_face).width - 1,
+                Left => self.pos.x = cuboid.face_size(new_face).width - 1,
                 Up => self.pos.y = 0,
                 Right => self.pos.x = 0,
-                Down => self.pos.y = self.cuboid.face_size(new_face).height - 1,
+                Down => self.pos.y = cuboid.face_size(new_face).height - 1,
             }
 
             self.orientation = (self.orientation + turns) & 0b11;
@@ -940,8 +926,8 @@ impl FacePos {
     }
 
     /// Returns this position moved 1 unit in the given direction on the net.
-    fn moved_in(mut self, direction: Direction) -> Self {
-        self.move_in(direction);
+    fn moved_in(mut self, direction: Direction, cuboid: Cuboid) -> Self {
+        self.move_in(direction, cuboid);
         self
     }
 }
