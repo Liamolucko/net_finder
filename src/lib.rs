@@ -709,7 +709,7 @@ impl Display for Pos {
 }
 
 // A size in 2D space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Size {
     width: u8,
     height: u8,
