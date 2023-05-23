@@ -327,8 +327,8 @@ impl NetFinder {
         let next_index = self.queue.len();
         let instruction = &mut self.queue[self.index];
         if !self.cuboid_info[0].filled(instruction.face_positions[0])
-            && !self.cuboid_info[1].filled(instruction.face_positions[1])
-            && matches!(
+            & !self.cuboid_info[1].filled(instruction.face_positions[1])
+            & matches!(
                 self.pos_states[instruction.net_pos.0],
                 PosState::Queued { .. }
             )
@@ -388,6 +388,7 @@ impl NetFinder {
 
     /// Set a square on the net and surfaces of the cuboids simultaneously,
     /// specifying the square by the index of an instruction which sets it.
+    #[inline]
     fn set_square(&mut self, instruction_index: usize, value: bool) {
         let Instruction {
             net_pos,
