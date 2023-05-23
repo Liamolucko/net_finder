@@ -55,7 +55,7 @@ struct CuboidInfo {
     /// If `index` is the index of a face position in `face_positions` and
     /// `direction` is the direction you want to find a position adjacent in,
     /// the index you need in this array is `index << 2 | (direction as usize)`.
-    adjacent_lookup: Vec<usize>,
+    adjacent_lookup: Vec<u8>,
     /// Whether each square on the cuboid's surface is filled.
     ///
     /// If `index` is an index of a position in `face_positions`, the index in
@@ -93,6 +93,8 @@ impl CuboidInfo {
                     .iter()
                     .position(|&other_pos| other_pos == pos)
                     .unwrap()
+                    .try_into()
+                    .unwrap()
             })
             .collect();
 
@@ -108,24 +110,26 @@ impl CuboidInfo {
 
     /// Given the index of a face position in `self.face_positions`, returns the
     /// index of the face position in `direction` from that position.
-    fn adjacent_in(&self, face_pos: usize, direction: Direction) -> usize {
-        self.adjacent_lookup[(face_pos << 2) | direction as usize]
+    fn adjacent_in(&self, face_pos: u8, direction: Direction) -> u8 {
+        self.adjacent_lookup[(usize::from(face_pos) << 2) | direction as usize]
     }
 
     /// Returns whether the square at a face position is filled.
-    fn filled(&self, face_pos: usize) -> bool {
-        self.filled[face_pos >> 2]
+    fn filled(&self, face_pos: u8) -> bool {
+        self.filled[usize::from(face_pos >> 2)]
     }
 
     /// Sets whether the square at a face position is filled.
-    fn set_filled(&mut self, face_pos: usize, value: bool) {
-        self.filled[face_pos >> 2] = value;
+    fn set_filled(&mut self, face_pos: u8, value: bool) {
+        self.filled[usize::from(face_pos >> 2)] = value;
     }
 
-    fn index_of(&self, face_pos: FacePos) -> usize {
+    fn index_of(&self, face_pos: FacePos) -> u8 {
         self.face_positions
             .iter()
             .position(|&pos| pos == face_pos)
+            .unwrap()
+            .try_into()
             .unwrap()
     }
 }
@@ -134,9 +138,10 @@ impl CuboidInfo {
 fn adjacent_lookup() {
     let cuboid_info = CuboidInfo::new(Cuboid::new(1, 2, 3));
     for (i, face_pos) in cuboid_info.face_positions.iter().enumerate() {
+        let i = u8::try_from(i).unwrap();
         for direction in [Left, Up, Right, Down] {
             assert_eq!(
-                cuboid_info.face_positions[cuboid_info.adjacent_in(i, direction)],
+                cuboid_info.face_positions[usize::from(cuboid_info.adjacent_in(i, direction))],
                 face_pos.moved_in(direction, cuboid_info.cuboid)
             );
         }
@@ -150,7 +155,7 @@ struct Instruction {
     net_pos: IndexPos,
     /// The equivalent positions on the surfaces of the cuboids, as indices into
     /// `face_positions` in `CuboidInfo`.
-    face_positions: [usize; 2],
+    face_positions: [u8; 2],
     state: InstructionState,
 }
 
@@ -208,7 +213,7 @@ enum PosState {
     Untouched,
     /// There's an instruction in the queue that wants to set this position to
     /// map to `face_positions`.
-    Queued { face_positions: [usize; 2] },
+    Queued { face_positions: [u8; 2] },
     /// There are two instructions in the queue that want to map this position
     /// to different positions. Any further instructions will see this and not
     /// be added.
@@ -216,7 +221,7 @@ enum PosState {
     /// `face_positions` is the what the first instruction wants this net
     /// position to map to, so that this can be restored to `Queued` if/when the
     /// second instruction gets backtracked.
-    Invalid { face_positions: [usize; 2] },
+    Invalid { face_positions: [u8; 2] },
     /// This position is filled.
     Filled,
 }
