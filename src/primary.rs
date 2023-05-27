@@ -518,7 +518,11 @@ fn run(
                 yielded_nets.insert(net);
             }
 
-            let file = File::create(state_path(&cuboids)).unwrap();
+            let path = state_path(&cuboids);
+            // Initially write to a temporary file so that the previous version is still
+            // there if we get Ctrl+C'd while writing or something like that.
+            let tmp_path = path.with_extension("json.tmp");
+            let file = File::create(&tmp_path).unwrap();
             serde_json::to_writer(
                 BufWriter::new(file),
                 &State {
@@ -527,6 +531,8 @@ fn run(
                 },
             )
             .unwrap();
+            // Then move it to the real path.
+            fs::rename(tmp_path, path).unwrap();
         }
     });
 
