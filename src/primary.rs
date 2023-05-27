@@ -1,6 +1,7 @@
 //! The initial home-grown algorithm I came up with.
 
 use std::{
+    array,
     collections::HashSet,
     fmt::Write,
     fs::{self, File},
@@ -170,6 +171,9 @@ enum InstructionState {
         /// this instruction begin.
         followup_index: usize,
     },
+    /// An instruction which could have been completed, but instead marked as
+    /// one that could potentially be completed.
+    Potential,
 }
 
 impl PartialEq for Instruction {
@@ -326,23 +330,20 @@ impl NetFinder {
     #[inline]
     fn handle_instruction(&mut self) {
         let next_index = self.queue.len();
-        let instruction = &mut self.queue[self.index];
-        if !self.cuboid_info[0].filled(instruction.face_positions[0])
+        let instruction = &self.queue[self.index];
+        if matches!(instruction.state, InstructionState::NotRun)
+            & !self.cuboid_info[0].filled(instruction.face_positions[0])
             & !self.cuboid_info[1].filled(instruction.face_positions[1])
             & matches!(
                 self.pos_states[instruction.net_pos.0],
                 PosState::Queued { .. }
             )
         {
-            // The space is free, so we fill it.
-            instruction.state = InstructionState::Completed {
-                followup_index: next_index,
-            };
-            self.pos_states[instruction.net_pos.0] = PosState::Filled;
             let net_pos = instruction.net_pos;
-            self.set_square(self.index, true);
 
             // Add the new things we can do from here to the queue.
+            // Keep track of whether any valid follow-up instructions actually get added.
+            let mut followup = false;
             for direction in [Left, Up, Right, Down] {
                 if let Some(net_pos) = net_pos.moved_in(direction, &self.net) {
                     // It's easier to just mutate the array in place than turn it into an iterator
@@ -366,6 +367,13 @@ impl NetFinder {
                             self.pos_states[instruction.net_pos.0] = PosState::Queued {
                                 face_positions: instruction.face_positions,
                             };
+                            // We only consider it a real followup instruction if none of the face
+                            // positions it sets are already filled.
+                            if zip(&self.cuboid_info, instruction.face_positions)
+                                .all(|(info, pos)| !info.filled(pos))
+                            {
+                                followup = true;
+                            }
                             self.queue.push(instruction);
                         }
                         // If it's already queued to do the same thing as this instruction, this
@@ -382,6 +390,20 @@ impl NetFinder {
                         }
                     }
                 }
+            }
+
+            // If no follow-up instructions we added, we don't actually fill the square,
+            // since we are now considering this a potentially filled square.
+            // Since it's possible for it to get invalidated later on, we just mark it as
+            // not having been run for now and do a pass when we find a template to find all
+            // the instructions which are valid potential squares.
+            if followup {
+                let instruction = &mut self.queue[self.index];
+                instruction.state = InstructionState::Completed {
+                    followup_index: next_index,
+                };
+                self.pos_states[instruction.net_pos.0] = PosState::Filled;
+                self.set_square(self.index, true);
             }
         }
         self.index += 1;
@@ -464,7 +486,7 @@ fn run(
 
             let mut send_counter: u16 = 0;
             loop {
-                while finder.area < finder.target_area {
+                while finder.area < finder.target_area && finder.index < finder.queue.len() {
                     while finder.index >= finder.queue.len() {
                         // We've exhausted the queue and haven't found a solution, so we must have
                         // done something wrong. Backtrack.
@@ -480,6 +502,34 @@ fn run(
                     send_counter = send_counter.wrapping_add(1);
                     if send_counter == 0 {
                         let _ = finder_tx.try_send(finder.clone());
+                    }
+                }
+
+                // We broke out of the loop, which means we've reached the end of the queue and might have found a valid template.
+                // First figure out which instructions now represent potential squares, which are just all the instructions which would be valid to fill in.
+                let potential_squares: Vec<_> = finder
+                    .queue
+                    .iter()
+                    .cloned()
+                    .filter(|instruction| {
+                        matches!(instruction.state, InstructionState::NotRun)
+                            & !finder.cuboid_info[0].filled(instruction.face_positions[0])
+                            & !finder.cuboid_info[1].filled(instruction.face_positions[1])
+                            & matches!(
+                                finder.pos_states[instruction.net_pos.0],
+                                PosState::Queued { .. }
+                            )
+                    })
+                    .collect();
+                // Then, we figure out which of them would conflict with each other.
+                // That occurs when they both want to set the same face positions; so, we keep track of the indices of all the instructions that want to set a given face position.
+                // It also occurs if they're neighbours on the net, but then they disagree on what each other's positions should map to on the surface.
+                let mut pos_setters: [Vec<Vec<usize>>; 2] = array::from_fn(|i| {
+                    vec![vec![]; finder.cuboid_info[i].face_positions.len() / 4]
+                });
+                for (i, instruction) in potential_squares.iter().enumerate() {
+                    for (pos_setters, pos) in zip(&mut pos_setters, instruction.face_positions) {
+                        pos_setters[usize::from(pos)].push(i)
                     }
                 }
 
