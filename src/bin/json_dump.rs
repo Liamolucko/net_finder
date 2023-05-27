@@ -1,6 +1,10 @@
 //! Dumps all the yielded nets stored in one of the saved state files.
 
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs::File,
+    io::{self, BufReader},
+    path::PathBuf,
+};
 
 use clap::Parser;
 use net_finder::State;
@@ -12,8 +16,8 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let Args { path } = Args::parse();
-    let bytes = fs::read(path)?;
-    let state: State = postcard::from_bytes(&bytes)?;
+    let file = File::open(path)?;
+    let state: State = serde_json::from_reader(BufReader::new(file))?;
 
     let mut serialized_nets = state
         .yielded_nets

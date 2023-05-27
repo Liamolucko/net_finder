@@ -391,7 +391,7 @@ impl Net {
             end.rchunks_mut(self.width.into()),
         ) {
             // ignore the middle half-sized chunks if present
-            if a.len() == self.width.into() {
+            if a.len() == usize::from(self.width) {
                 a.swap_with_slice(b);
             }
         }

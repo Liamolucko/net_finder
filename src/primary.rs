@@ -3,8 +3,9 @@
 use std::{
     collections::HashSet,
     fmt::Write,
-    fs,
+    fs::{self, File},
     hash::{Hash, Hasher},
+    io::{BufReader, BufWriter},
     iter::zip,
     path::{Path, PathBuf},
     sync::mpsc,
@@ -415,6 +416,7 @@ fn state_path(cuboids: &[Cuboid]) -> PathBuf {
         }
         write!(name, "{cuboid}").unwrap();
     }
+    write!(name, ".json").unwrap();
     Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
 }
 
@@ -431,8 +433,8 @@ pub struct State {
 }
 
 pub fn resume(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net>> {
-    let bytes = fs::read(state_path(cuboids)).context("no state to resume from")?;
-    let state: State = postcard::from_bytes(&bytes)?;
+    let file = File::open(state_path(cuboids)).context("no state to resume from")?;
+    let state: State = serde_json::from_reader(BufReader::new(file))?;
     Ok(run(cuboids, state.finders, state.yielded_nets))
 }
 
@@ -516,13 +518,13 @@ fn run(
                 yielded_nets.insert(net);
             }
 
-            fs::write(
-                state_path(&cuboids),
-                &postcard::to_stdvec(&State {
+            let file = File::create(state_path(&cuboids)).unwrap();
+            serde_json::to_writer(
+                BufWriter::new(file),
+                &State {
                     finders,
                     yielded_nets: yielded_nets.clone(),
-                })
-                .unwrap(),
+                },
             )
             .unwrap();
         }
