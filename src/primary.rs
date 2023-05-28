@@ -492,6 +492,12 @@ impl NetFinder {
     /// are valid, and figures out which combinations of them result in a valid
     /// net.
     fn finalize(&self) -> Finalize {
+        if self.area + self.potential.len() < self.target_area {
+            // If there aren't at least as many potential instructions as the number of
+            // squares left to fill, there's no way that this could produce a valid net.
+            return Finalize::Known(None);
+        }
+
         // First we make sure that there's at least one potential square that sets every
         // square on the surface. We do this before actually constructing the
         // list of potential squares because it's where 99% of calls to this function
@@ -570,7 +576,7 @@ impl NetFinder {
                     }
                     match found.as_slice() {
                         // We already made sure earlier that every unfilled square has at least one
-                        // instruction that sets it, si this is impossible.
+                        // instruction that sets it, so this is impossible.
                         &[] => unreachable!(),
                         // If there's only one instruction that fills this square, we have to
                         // include it so that the square gets filled.
