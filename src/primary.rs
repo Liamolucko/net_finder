@@ -162,7 +162,12 @@ struct Instruction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum InstructionState {
-    /// The instruction has not been run or has been reverted.
+    /// An instruction which has not been run, either because:
+    /// - We haven't gotten to it yet.
+    /// - It's invalid.
+    /// - It's been chosen as a 'potential' instruction to try at the end, which
+    ///   doesn't have a separate state because it's possible for it to become
+    ///   invalid later and so we'd need an extra check anyway.
     NotRun,
     /// The instruction has been run.
     Completed {
@@ -170,6 +175,17 @@ enum InstructionState {
         /// this instruction begin.
         followup_index: usize,
     },
+    /// An instruction which has been backtracked.
+    ///
+    /// An instruction can also have this state if we haven't gotten to it yet
+    /// but it was backtracked earlier and we haven't bothered resetting its
+    /// state.
+    ///
+    /// We keep track of this so that we don't waste time considering them as
+    /// potential instructions later, since all the cases where it's set will
+    /// have already been covered back when it was previously set before being
+    /// backtracked.
+    Backtracked,
 }
 
 impl PartialEq for Instruction {
@@ -297,7 +313,7 @@ impl NetFinder {
         };
         let InstructionState::Completed { followup_index } = instruction.state else { unreachable!() };
         // Mark it as reverted.
-        instruction.state = InstructionState::NotRun;
+        instruction.state = InstructionState::Backtracked;
         self.pos_states[instruction.net_pos.0] = PosState::Queued {
             face_positions: instruction.face_positions,
         };
@@ -327,6 +343,8 @@ impl NetFinder {
     fn handle_instruction(&mut self) {
         let next_index = self.queue.len();
         let instruction = &mut self.queue[self.index];
+        // Clear `InstructionState::Backtracked` from this instruction if present.
+        instruction.state = InstructionState::NotRun;
         if !self.cuboid_info[0].filled(instruction.face_positions[0])
             & !self.cuboid_info[1].filled(instruction.face_positions[1])
             & matches!(
@@ -334,28 +352,12 @@ impl NetFinder {
                 PosState::Queued { .. }
             )
         {
-            // The space is free, so we fill it.
-            instruction.state = InstructionState::Completed {
-                followup_index: next_index,
-            };
-            self.pos_states[instruction.net_pos.0] = PosState::Filled;
-            let net_pos = instruction.net_pos;
-            self.set_square(self.index, true);
-
             // Add the new things we can do from here to the queue.
+            // Keep track of whether any valid follow-up instructions actually get added.
+            let mut followup = false;
             for direction in [Left, Up, Right, Down] {
-                if let Some(net_pos) = net_pos.moved_in(direction, &self.net) {
-                    // It's easier to just mutate the array in place than turn it into an iterator
-                    // and back.
-                    let mut face_positions = self.queue[self.index].face_positions;
-                    zip(&self.cuboid_info, &mut face_positions)
-                        .for_each(|(info, pos)| *pos = info.adjacent_in(*pos, direction));
-                    let instruction = Instruction {
-                        net_pos,
-                        face_positions,
-                        state: InstructionState::NotRun,
-                    };
-
+                let instruction = &self.queue[self.index];
+                if let Some(instruction) = self.instruction_in(instruction, direction) {
                     // Look at the status of the spot on the net we're trying to fill.
                     match self.pos_states[instruction.net_pos.0] {
                         // If it's invalid or already filled, don't add this instruction to the
@@ -366,6 +368,13 @@ impl NetFinder {
                             self.pos_states[instruction.net_pos.0] = PosState::Queued {
                                 face_positions: instruction.face_positions,
                             };
+                            // We only consider it a real followup instruction if none of the face
+                            // positions it sets are already filled.
+                            if zip(&self.cuboid_info, instruction.face_positions)
+                                .all(|(info, pos)| !info.filled(pos))
+                            {
+                                followup = true;
+                            }
                             self.queue.push(instruction);
                         }
                         // If it's already queued to do the same thing as this instruction, this
@@ -383,8 +392,56 @@ impl NetFinder {
                     }
                 }
             }
+
+            // If no follow-up instructions we added, we don't actually fill the square,
+            // since we are now considering this a potentially filled square.
+            // Since it's possible for it to get invalidated later on, we just mark it as
+            // not having been run for now and do a pass through the whole queue to find all
+            // the instructions that are still valid, which have to be the ones that we
+            // intentionally didn't run here.
+            if followup {
+                let instruction = &mut self.queue[self.index];
+                instruction.state = InstructionState::Completed {
+                    followup_index: next_index,
+                };
+                self.pos_states[instruction.net_pos.0] = PosState::Filled;
+                self.set_square(self.index, true);
+            } else {
+                // Remove any marker instructions that we added.
+                for instruction in self.queue.drain(next_index..) {
+                    // Update the state of the net position the instruction wanted to set.
+                    self.pos_states[instruction.net_pos.0] = match self.pos_states
+                        [instruction.net_pos.0]
+                    {
+                        PosState::Untouched => unreachable!(),
+                        PosState::Queued { .. } => PosState::Untouched,
+                        PosState::Invalid { face_positions } => PosState::Queued { face_positions },
+                        PosState::Filled => unreachable!(),
+                    }
+                }
+            }
         }
         self.index += 1;
+    }
+
+    /// Creates a new instruction in a given direction from an instruction, if
+    /// the new net position is valid.
+    fn instruction_in(
+        &self,
+        instruction: &Instruction,
+        direction: Direction,
+    ) -> Option<Instruction> {
+        let net_pos = instruction.net_pos.moved_in(direction, &self.net)?;
+        // It's easier to just mutate the array in place than turn it into an iterator
+        // and back.
+        let mut face_positions = instruction.face_positions;
+        zip(&self.cuboid_info, &mut face_positions)
+            .for_each(|(info, pos)| *pos = info.adjacent_in(*pos, direction));
+        Some(Instruction {
+            net_pos,
+            face_positions,
+            state: InstructionState::NotRun,
+        })
     }
 
     /// Set a square on the net and surfaces of the cuboids simultaneously,
@@ -405,6 +462,266 @@ impl NetFinder {
         for (info, &pos) in zip(&mut self.cuboid_info, face_positions) {
             info.set_filled(pos, value);
         }
+    }
+
+    /// This method, which should be called when the end of the queue is
+    /// reached, goes through all of the unrun instructions to find which ones
+    /// are valid, and figures out which combinations of them result in a valid
+    /// net.
+    fn finalize(&self) -> Finalize {
+        // First we make sure that there's at least one potential square that sets every
+        // square on the surface. We do this before actually constructing the
+        // list of potential squares because it's where 99% of calls to this function
+        // end, so it needs to be fast. Use a bitfield to store which squares
+        // are filled in on each cuboid.
+        let mut filled: [u64; 2] = [0; 2];
+        for instruction in self.queue.iter() {
+            if matches!(instruction.state, InstructionState::Completed { .. })
+                | (matches!(instruction.state, InstructionState::NotRun)
+                    & !self.cuboid_info[0].filled(instruction.face_positions[0])
+                    & !self.cuboid_info[1].filled(instruction.face_positions[1])
+                    & matches!(
+                        self.pos_states[instruction.net_pos.0],
+                        PosState::Queued { .. }
+                    ))
+            {
+                for (filled, pos) in zip(&mut filled, instruction.face_positions) {
+                    *filled |= 1 << (pos >> 2);
+                }
+            }
+        }
+
+        // If either of the two cuboids don't have all their squares filled by either
+        // completed or potential instructions, there's no way this will produce a valid
+        // net.
+        if filled
+            .into_iter()
+            .any(|filled| filled.trailing_ones() != u32::try_from(self.target_area).unwrap())
+        {
+            return Finalize::Known(None);
+        }
+
+        // Now we actually store which instructions are potential squares, which are
+        // just all the instructions which would be valid to fill in.
+        let potential_squares: Vec<_> = self
+            .queue
+            .iter()
+            .cloned()
+            .filter(|instruction| {
+                matches!(instruction.state, InstructionState::NotRun)
+                    & !self.cuboid_info[0].filled(instruction.face_positions[0])
+                    & !self.cuboid_info[1].filled(instruction.face_positions[1])
+                    & matches!(
+                        self.pos_states[instruction.net_pos.0],
+                        PosState::Queued { .. }
+                    )
+            })
+            .collect();
+
+        // A list of the instructions we know we have to include.
+        let mut included = HashSet::new();
+        // For each instruction, the list of instructions it conflicts with.
+        let mut conflicts: Vec<HashSet<usize>> = vec![HashSet::new(); potential_squares.len()];
+        // Go through all the squares on the surfaces of the cuboids to find which
+        // instructions we have to include, because they're the only ones that can set a
+        // square, as well as which instructions conflict with one another because they
+        // set the same surface squares.
+        let mut found: Vec<usize> = Vec::new();
+        for cuboid in 0..2 {
+            let cuboid_info = &self.cuboid_info[cuboid];
+            for square in 0..cuboid_info.face_positions.len() / 4 {
+                if !cuboid_info.filled[square] {
+                    // If the square's not already filled, there has to be at least one potential
+                    // square that fills it.
+                    found.clear();
+                    for (i, instruction) in potential_squares.iter().enumerate() {
+                        if usize::from(instruction.face_positions[cuboid] >> 2) == square {
+                            // Note down the conflicts between this instruction and the rest in
+                            // `found` so far, then add it to `found`.
+                            conflicts[i].extend(found.iter().copied());
+                            for j in found.iter().copied() {
+                                conflicts[j].insert(i);
+                            }
+                            found.push(i);
+                        }
+                    }
+                    match found.as_slice() {
+                        // We already made sure earlier that every unfilled square has at least one
+                        // instruction that sets it, si this is impossible.
+                        &[] => unreachable!(),
+                        // If there's only one instruction that fills this square, we have to
+                        // include it so that the square gets filled.
+                        &[instruction] => {
+                            included.insert(instruction);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Two instructions also conflict if they're neighbours on the net, but
+        // they disagree on what each other's positions should map to on the
+        // surface. To work out when that happens, we go through the neighbours
+        // of each instruction's net position and make sure that any instructions that
+        // set those positions agree on the face positions they should map to. If they
+        // don't, it's a conflict.
+        for (i, instruction) in potential_squares.iter().enumerate() {
+            for direction in [Left, Up, Down, Right] {
+                if let Some(moved_instruction) = self.instruction_in(instruction, direction) {
+                    for (j, other_instruction) in potential_squares.iter().enumerate() {
+                        if other_instruction.net_pos == moved_instruction.net_pos
+                            && other_instruction.face_positions != moved_instruction.face_positions
+                        {
+                            conflicts[i].insert(j);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now that we've got all the conflicts, make sure that none of the included
+        // squares conflict with each other. At the same time, we construct a
+        // list of the remaining instructions which aren't guaranteed-included and don't
+        // conflict with the included instructions.
+        let mut remaining: Vec<_> = (0..potential_squares.len())
+            .filter(|instruction| !included.contains(instruction))
+            .collect();
+        for &instruction in included.iter() {
+            for &conflicting in conflicts[instruction].iter() {
+                if included.contains(&conflicting) {
+                    return Finalize::Known(None);
+                }
+                if let Ok(index) = remaining.binary_search(&conflicting) {
+                    remaining.remove(index);
+                }
+            }
+        }
+
+        // Make a net with all the included instructions filled in.
+        let mut net = self.net.clone();
+        for instruction in included.iter().map(|&index| &potential_squares[index]) {
+            net.squares[instruction.net_pos.0] = true;
+        }
+
+        // Calculate how many more squares we still need to fill.
+        let remaining_area = self.target_area - self.area - included.len();
+        if remaining_area == 0 {
+            // If we've already filled all the surface squares, we're done!
+            return Finalize::Known(Some(net));
+        }
+
+        if remaining.len() < remaining_area {
+            // There aren't enough instructions left to possibly fill the surface.
+            return Finalize::Known(None);
+        }
+
+        // Finally, we return an iterator which will just brute-force try all the
+        // combinations of remaining squares.
+        Finalize::Solve(FinishIter {
+            net,
+            potential_squares,
+            remaining,
+            conflicts,
+            next: (0..remaining_area).collect(),
+        })
+    }
+}
+
+/// The iterator returned by `NetFinder::finalize`.
+enum Finalize {
+    /// There's a single known solution, or no solution.
+    Known(Option<Net>),
+    /// There might be multiple solutions, and it's the inner `FinishIter`'s job
+    /// to find them.
+    Solve(FinishIter),
+}
+
+impl Iterator for Finalize {
+    type Item = Net;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Finalize::Known(net) => net.take(),
+            Finalize::Solve(iter) => iter.next(),
+        }
+    }
+}
+
+/// An iterator which tries all the combinations of the remaining valid
+/// potential squares and yields nets of the ones which work.
+struct FinishIter {
+    net: Net,
+    potential_squares: Vec<Instruction>,
+    conflicts: Vec<HashSet<usize>>,
+    remaining: Vec<usize>,
+    /// The next combination to try.
+    next: Vec<usize>,
+}
+
+impl FinishIter {
+    /// Returns whether the current combination we're trying has conflicts, or
+    /// `None` if we've run out of combinations.
+    fn has_conflicts(&self) -> Option<bool> {
+        if *self.next.last().unwrap() >= self.remaining.len() {
+            return None;
+        }
+        for (i, instruction) in self
+            .next
+            .iter()
+            .map(|&index| self.remaining[index])
+            .enumerate()
+        {
+            for other_instruction in self.next[i + 1..]
+                .iter()
+                .map(|&index| self.remaining[index])
+            {
+                if self.conflicts[instruction].contains(&other_instruction) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+
+    fn advance(&mut self) {
+        // Increment the last index.
+        let mut index = self.next.len() - 1;
+        self.next[index] += 1;
+        while *self.next.last().unwrap() >= self.remaining.len() && index != 0 {
+            // If it goes past the end of `remaining`, increment the previous one and then
+            // update everything after it to each be 1 more than the previous.
+            index -= 1;
+            self.next[index] += 1;
+            let base = self.next[index] + 1;
+            for (i, value) in self.next[index + 1..].iter_mut().enumerate() {
+                *value = base + i
+            }
+        }
+    }
+}
+
+impl Iterator for FinishIter {
+    type Item = Net;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.has_conflicts()? {
+            self.advance();
+        }
+        // If we got here, we've found a set of instructions which don't conflict.
+        // Fill in their squares on the net and yield it.
+        let mut net = self.net.clone();
+        for instruction in self
+            .next
+            .iter()
+            .map(|&index| &self.potential_squares[self.remaining[index]])
+        {
+            net.squares[instruction.net_pos.0] = true;
+        }
+
+        self.advance();
+
+        Some(net)
     }
 }
 
@@ -464,16 +781,7 @@ fn run(
 
             let mut send_counter: u16 = 0;
             loop {
-                while finder.area < finder.target_area {
-                    while finder.index >= finder.queue.len() {
-                        // We've exhausted the queue and haven't found a solution, so we must have
-                        // done something wrong. Backtrack.
-                        if !finder.backtrack() {
-                            // We're out of options, so we're done.
-                            return;
-                        }
-                    }
-
+                while finder.area < finder.target_area && finder.index < finder.queue.len() {
                     // Evaluate the next instruction in the queue.
                     finder.handle_instruction();
 
@@ -483,13 +791,19 @@ fn run(
                     }
                 }
 
-                // We broke out of the loop, which means we reached the target area and have a
-                // valid net!
-                let net = finder.net.shrink();
-                finder.backtrack();
+                // We broke out of the loop, which means we've reached the end of the queue or
+                // the target area. So, finalize the current net to find solutions and yield
+                // them.
+                for net in finder.finalize() {
+                    if net_tx.send(net.shrink()).is_err() {
+                        // The receiver is gone, i.e. the iterator was dropped.
+                        return;
+                    }
+                }
 
-                if net_tx.send(net).is_err() {
-                    // The receiver is gone, i.e. the iterator was dropped.
+                // Now backtrack and look for more solutions.
+                if !finder.backtrack() {
+                    // Backtracking failed which means there are no solutions left, we're done.
                     return;
                 }
             }
