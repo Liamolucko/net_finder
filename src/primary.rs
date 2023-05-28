@@ -22,12 +22,18 @@ use Face::*;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NetFinder {
-    cuboid_info: [CuboidInfo; 2],
+    queue: Vec<Instruction>,
+    /// The indices of all the 'potential' instructions that we're saving until
+    /// the end to run.
+    ///
+    /// Note that some of these may now be invalid.
+    potential: Vec<usize>,
 
     pub net: Net,
-    queue: Vec<Instruction>,
+    cuboid_info: [CuboidInfo; 2],
     /// Information about the state of each position in the net.
     pos_states: Vec<PosState>,
+
     /// The index of the next instruction in `queue` that will be evaluated.
     index: usize,
     /// The size of the net so far.
@@ -57,12 +63,13 @@ struct CuboidInfo {
     /// `direction` is the direction you want to find a position adjacent in,
     /// the index you need in this array is `index << 2 | (direction as usize)`.
     adjacent_lookup: Vec<u8>,
-    /// Whether each square on the cuboid's surface is filled.
+    /// A bitfield that encodes whether each square on the cuboid's surface is
+    /// filled.
     ///
-    /// If `index` is an index of a position in `face_positions`, the index in
-    /// this array of the square that represents is `index >> 2`, since the
-    /// lower two bits are the orientation which doesn't matter here.
-    filled: Vec<bool>,
+    /// If `index` is an index of a position in `face_positions`, the index of
+    /// the bit repesenting that square (little endian) is `index >> 2`, since
+    /// the lower two bits are the orientation which doesn't matter here.
+    filled: u64,
 }
 
 impl CuboidInfo {
@@ -103,7 +110,7 @@ impl CuboidInfo {
             cuboid,
             // This is only a quarter the length of `face_positions` because we don't consider
             // orientation.
-            filled: vec![false; face_positions.len() / 4],
+            filled: 0,
             face_positions,
             adjacent_lookup,
         }
@@ -117,12 +124,16 @@ impl CuboidInfo {
 
     /// Returns whether the square at a face position is filled.
     fn filled(&self, face_pos: u8) -> bool {
-        self.filled[usize::from(face_pos >> 2)]
+        self.filled & 1 << (face_pos >> 2) != 0
     }
 
     /// Sets whether the square at a face position is filled.
     fn set_filled(&mut self, face_pos: u8, value: bool) {
-        self.filled[usize::from(face_pos >> 2)] = value;
+        if value {
+            self.filled |= 1 << (face_pos >> 2);
+        } else {
+            self.filled &= !(1 << (face_pos >> 2));
+        }
     }
 
     fn index_of(&self, face_pos: FacePos) -> u8 {
@@ -285,10 +296,13 @@ impl NetFinder {
                     face_positions: queue[0].face_positions,
                 };
                 Self {
-                    cuboid_info: cuboid_info.clone(),
-                    net: net.clone(),
                     queue,
+                    potential: Vec::new(),
+
+                    net: net.clone(),
+                    cuboid_info: cuboid_info.clone(),
                     pos_states,
+
                     index: 0,
                     area: 0,
                     target_area: cuboids[0].surface_area(),
@@ -332,6 +346,13 @@ impl NetFinder {
                 PosState::Filled => unreachable!(),
             }
         }
+
+        // Also un-mark any instructions that come after this instruction as potential,
+        // since they would otherwise have been backtracked first.
+        while matches!(self.potential.last(), Some(&index) if index > last_success_index) {
+            self.potential.pop();
+        }
+
         // We continue executing from just after the instruction we undid.
         self.index = last_success_index + 1;
         true
@@ -419,6 +440,8 @@ impl NetFinder {
                         PosState::Filled => unreachable!(),
                     }
                 }
+                // Add this to the list of potential instructions.
+                self.potential.push(self.index);
             }
         }
         self.index += 1;
@@ -472,18 +495,18 @@ impl NetFinder {
         // First we make sure that there's at least one potential square that sets every
         // square on the surface. We do this before actually constructing the
         // list of potential squares because it's where 99% of calls to this function
-        // end, so it needs to be fast. Use a bitfield to store which squares
-        // are filled in on each cuboid.
+        // end, so it needs to be fast.
+        // Use a bitfield to store which squares are filled in on each cuboid, starting
+        // off with the ones that are already properly filled in.
         let mut filled: [u64; 2] = [0; 2];
-        for instruction in self.queue.iter() {
-            if matches!(instruction.state, InstructionState::Completed { .. })
-                | (matches!(instruction.state, InstructionState::NotRun)
-                    & !self.cuboid_info[0].filled(instruction.face_positions[0])
-                    & !self.cuboid_info[1].filled(instruction.face_positions[1])
-                    & matches!(
-                        self.pos_states[instruction.net_pos.0],
-                        PosState::Queued { .. }
-                    ))
+        zip(&mut filled, &self.cuboid_info).for_each(|(filled, info)| *filled = info.filled);
+        for instruction in self.potential.iter().map(|&index| &self.queue[index]) {
+            if !self.cuboid_info[0].filled(instruction.face_positions[0])
+                & !self.cuboid_info[1].filled(instruction.face_positions[1])
+                & matches!(
+                    self.pos_states[instruction.net_pos.0],
+                    PosState::Queued { .. }
+                )
             {
                 for (filled, pos) in zip(&mut filled, instruction.face_positions) {
                     *filled |= 1 << (pos >> 2);
@@ -530,7 +553,7 @@ impl NetFinder {
         for cuboid in 0..2 {
             let cuboid_info = &self.cuboid_info[cuboid];
             for square in 0..cuboid_info.face_positions.len() / 4 {
-                if !cuboid_info.filled[square] {
+                if !cuboid_info.filled((square << 2).try_into().unwrap()) {
                     // If the square's not already filled, there has to be at least one potential
                     // square that fills it.
                     found.clear();
