@@ -257,8 +257,7 @@ enum PosState {
 impl NetFinder {
     /// Create a bunch of `NetFinder`s that search for all the nets that fold
     /// into all of the passed cuboids.
-    fn new(cuboids: &[Cuboid]) -> anyhow::Result<Vec<Self>> {
-        let cuboids: [Cuboid; 2] = cuboids.try_into().context("expected 2 cuboids")?;
+    fn new(cuboids: [Cuboid; 2]) -> anyhow::Result<Vec<Self>> {
         if cuboids
             .iter()
             .any(|cuboid| cuboid.surface_area() != cuboids[0].surface_area())
@@ -766,7 +765,22 @@ fn state_path(cuboids: &[Cuboid]) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
 }
 
-pub fn find_nets(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net>> {
+/// Sorts cuboids first in descending order of how many of their surface squares
+/// we have to consider, since we only have to consider 1 on the first one and
+/// so we want to pick the biggest number of them to eliminate, and then in
+/// ascending lexicographic order of their components if two have the same
+/// number of surface squares to consider.
+fn sort_cuboids(cuboids: &mut [Cuboid]) {
+    cuboids.sort_by(|a, b| {
+        b.surface_squares()
+            .len()
+            .cmp(&a.surface_squares().len())
+            .then(a.cmp(b))
+    });
+}
+
+pub fn find_nets(mut cuboids: [Cuboid; 2]) -> anyhow::Result<impl Iterator<Item = Net>> {
+    sort_cuboids(&mut cuboids);
     let finders = NetFinder::new(cuboids)?;
 
     Ok(run(cuboids, finders, HashSet::new()))
@@ -778,14 +792,15 @@ pub struct State {
     pub yielded_nets: HashSet<Net>,
 }
 
-pub fn resume(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net>> {
-    let file = File::open(state_path(cuboids)).context("no state to resume from")?;
+pub fn resume(mut cuboids: [Cuboid; 2]) -> anyhow::Result<impl Iterator<Item = Net>> {
+    sort_cuboids(&mut cuboids);
+    let file = File::open(state_path(&cuboids)).context("no state to resume from")?;
     let state: State = serde_json::from_reader(BufReader::new(file))?;
     Ok(run(cuboids, state.finders, state.yielded_nets))
 }
 
 fn run(
-    cuboids: &[Cuboid],
+    cuboids: [Cuboid; 2],
     finders: Vec<NetFinder>,
     mut yielded_nets: HashSet<Net>,
 ) -> impl Iterator<Item = Net> {

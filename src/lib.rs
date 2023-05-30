@@ -17,7 +17,7 @@ mod zdd;
 pub use primary::*;
 pub use zdd::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Cuboid {
     pub width: u8,
     pub depth: u8,
