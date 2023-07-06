@@ -186,17 +186,6 @@ enum InstructionState {
         /// this instruction begin.
         followup_index: usize,
     },
-    /// An instruction which has been backtracked.
-    ///
-    /// An instruction can also have this state if we haven't gotten to it yet
-    /// but it was backtracked earlier and we haven't bothered resetting its
-    /// state.
-    ///
-    /// We keep track of this so that we don't waste time considering them as
-    /// potential instructions later, since all the cases where it's set will
-    /// have already been covered back when it was previously set before being
-    /// backtracked.
-    Backtracked,
 }
 
 impl PartialEq for Instruction {
@@ -326,7 +315,7 @@ impl NetFinder {
         };
         let InstructionState::Completed { followup_index } = instruction.state else { unreachable!() };
         // Mark it as reverted.
-        instruction.state = InstructionState::Backtracked;
+        instruction.state = InstructionState::NotRun;
         self.pos_states[instruction.net_pos.0] = PosState::Queued {
             face_positions: instruction.face_positions,
         };
@@ -532,9 +521,9 @@ impl NetFinder {
         // Now we actually store which instructions are potential squares, which are
         // just all the instructions which would be valid to fill in.
         let potential_squares: Vec<_> = self
-            .queue
+            .potential
             .iter()
-            .cloned()
+            .map(|&index| self.queue[index].clone())
             .filter(|instruction| {
                 matches!(instruction.state, InstructionState::NotRun)
                     & !self.cuboid_info[0].filled(instruction.face_positions[0])
