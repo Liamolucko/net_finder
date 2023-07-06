@@ -132,7 +132,7 @@ enum NodeRef {
 }
 
 /// One of the constant nodes (the 0-node or the 1-node). Used as an `Err`
-/// variant for when an edge should point to one of these instead of new node.
+/// variant for when an edge should point to one of these instead of a new node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ConstantNode {
     /// The 0-node.
