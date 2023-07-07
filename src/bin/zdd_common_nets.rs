@@ -1,12 +1,12 @@
 //! Finds the common developments of two cuboids from their ZDDs (well, from
 //! their already-serialized nets that originated from their ZDDs.)
 
-use std::{fs, path::PathBuf};
+use std::{fs, iter::zip, path::PathBuf};
 
 use anyhow::bail;
 use clap::Parser;
 use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
-use net_finder::{Cuboid, Net, Zdd};
+use net_finder::{Cuboid, Net, SquareCache, Zdd};
 use rayon::prelude::ParallelIterator;
 use rustc_hash::FxHashSet;
 
@@ -45,16 +45,16 @@ fn main() -> anyhow::Result<()> {
     progress.add(zdd_progress.clone());
     progress.add(found_progress.clone());
 
+    let square_caches: Vec<_> = cuboids.iter().copied().map(SquareCache::new).collect();
+
     // Then go through the ZDD and filter out the ones which work for all the
     // cuboids.
     let common_nets: FxHashSet<Net> = zdd
         .par_nets()
         .progress_with(zdd_progress)
         .filter(|net| {
-            cuboids
-                .iter()
-                .copied()
-                .all(|cuboid| net.color(cuboid).is_some())
+            zip(&cuboids, &square_caches)
+                .all(|(&cuboid, square_cache)| net.color_with_cache(cuboid, square_cache).is_some())
         })
         .progress_with(found_progress)
         .collect();

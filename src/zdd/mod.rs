@@ -2,7 +2,7 @@
 
 use std::{collections::VecDeque, hash::Hash, mem};
 
-use crate::{Cuboid, Direction, Face, FacePos, Net, Pos};
+use crate::{Cuboid, CursorData, Direction, Face, Net, Pos};
 
 use rayon::{
     iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer},
@@ -422,7 +422,7 @@ fn net_from_edges(
         x: middle_x,
         y: middle_y,
     };
-    let face_pos = FacePos::new();
+    let face_pos = CursorData::new();
 
     net.set(pos, true);
     let mut area = 1;
@@ -453,49 +453,49 @@ fn net_from_edges(
         let (pos1, pos2) = match direction.turned(face_pos.orientation) {
             Left => (
                 Pos {
-                    x: face_pos.pos.x,
-                    y: face_pos.pos.y,
+                    x: face_pos.square.pos.x,
+                    y: face_pos.square.pos.y,
                 },
                 Pos {
-                    x: face_pos.pos.x,
-                    y: face_pos.pos.y + 1,
+                    x: face_pos.square.pos.x,
+                    y: face_pos.square.pos.y + 1,
                 },
             ),
             Up => (
                 Pos {
-                    x: face_pos.pos.x,
-                    y: face_pos.pos.y + 1,
+                    x: face_pos.square.pos.x,
+                    y: face_pos.square.pos.y + 1,
                 },
                 Pos {
-                    x: face_pos.pos.x + 1,
-                    y: face_pos.pos.y + 1,
+                    x: face_pos.square.pos.x + 1,
+                    y: face_pos.square.pos.y + 1,
                 },
             ),
             Right => (
                 Pos {
-                    x: face_pos.pos.x + 1,
-                    y: face_pos.pos.y,
+                    x: face_pos.square.pos.x + 1,
+                    y: face_pos.square.pos.y,
                 },
                 Pos {
-                    x: face_pos.pos.x + 1,
-                    y: face_pos.pos.y + 1,
+                    x: face_pos.square.pos.x + 1,
+                    y: face_pos.square.pos.y + 1,
                 },
             ),
             Down => (
                 Pos {
-                    x: face_pos.pos.x,
-                    y: face_pos.pos.y,
+                    x: face_pos.square.pos.x,
+                    y: face_pos.square.pos.y,
                 },
                 Pos {
-                    x: face_pos.pos.x + 1,
-                    y: face_pos.pos.y,
+                    x: face_pos.square.pos.x + 1,
+                    y: face_pos.square.pos.y,
                 },
             ),
         };
 
         // Then find the vertices at those positions.
-        let v1 = vertex_indices[&(face_pos.face, pos1)];
-        let v2 = vertex_indices[&(face_pos.face, pos2)];
+        let v1 = vertex_indices[&(face_pos.square.face, pos1)];
+        let v2 = vertex_indices[&(face_pos.square.face, pos2)];
         let edge = Edge::new(v1, v2);
 
         // Finally, check if that edge that would stop us exists. If not, we add the

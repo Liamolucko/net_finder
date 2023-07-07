@@ -84,7 +84,7 @@ impl Cuboid {
     /// can be transformed into one another by rotating the cuboid, since then
     /// you just end up with the exact same solution net but with squares
     /// corresponding to different face positions.
-    fn surface_squares(&self) -> Vec<FacePos> {
+    fn unique_cursors(&self) -> Vec<CursorData> {
         let mut result = Vec::new();
 
         // Don't bother with east, south, and top because they're symmetrical with west,
@@ -118,9 +118,11 @@ impl Cuboid {
                     // We only need to include orientations of 0 and 1 here, since 2 and 3 can be
                     // transformed into other spots on the same face with orientations of 0 and 1
                     // respectively with a 180 degree turn.
-                    result.push(FacePos {
-                        face,
-                        pos: Pos::new(x, y),
+                    result.push(CursorData {
+                        square: SquareData {
+                            face,
+                            pos: Pos::new(x, y),
+                        },
                         orientation: 0,
                     });
                     // If the cuboid is square, we don't even have to include an orientation of 1,
@@ -130,9 +132,11 @@ impl Cuboid {
                     // differently shaped face after a 90 degree turn; a 180 degree turn is needed
                     // to get back to the same shape.
                     if size.width != size.height {
-                        result.push(FacePos {
-                            face,
-                            pos: Pos::new(x, y),
+                        result.push(CursorData {
+                            square: SquareData {
+                                face,
+                                pos: Pos::new(x, y),
+                            },
                             orientation: 1,
                         })
                     }
@@ -407,6 +411,19 @@ impl Net {
     /// Return a version of this net with its squares 'colored' with which faces
     /// they're on.
     pub fn color(&self, cuboid: Cuboid) -> Option<ColoredNet> {
+        let square_cache = SquareCache::new(cuboid);
+        self.color_with_cache(cuboid, &square_cache)
+    }
+
+    /// Return a version of this net with its squares 'colored' with which faces
+    /// they're on.
+    ///
+    /// This version of the method takes a `SquareCache` so it doesn't need to be re-computed every time.
+    pub fn color_with_cache(
+        &self,
+        cuboid: Cuboid,
+        square_cache: &SquareCache,
+    ) -> Option<ColoredNet> {
         if self.area() != cuboid.surface_area() {
             return None;
         }
@@ -421,21 +438,25 @@ impl Net {
             y: (index / usize::from(self.width)).try_into().unwrap(),
         };
 
-        // A lot of time is spent on repeatedly allocating/deallocating these, so share
-        // them between attempts.
-        let mut surface = Surface::new(cuboid);
         // Create a mapping from net positions to face positions.
+        // A lot of time is spent on repeatedly allocating/deallocating this, so share
+        // it between attempts.
         let mut pos_map = vec![None; self.squares.len()];
 
-        for square in cuboid.surface_squares() {
-            if self.try_color(cuboid, net_start, square, &mut surface, &mut pos_map) {
+        for cursor in cuboid.unique_cursors() {
+            let cursor = Cursor::from_data(&square_cache, &cursor);
+            if self.try_color(cuboid, &square_cache, net_start, cursor, &mut pos_map) {
                 return Some(ColoredNet {
                     width: self.width,
                     // Created a colored net from the position map by just taking which face each
                     // position is on.
                     squares: pos_map
                         .into_iter()
-                        .map(|maybe_pos| maybe_pos.map(|pos| pos.face))
+                        .map(|maybe_cursor| {
+                            maybe_cursor.map(|cursor| {
+                                square_cache.squares[usize::from(cursor.square().0)].face
+                            })
+                        })
                         .collect(),
                 });
             }
@@ -447,26 +468,27 @@ impl Net {
     fn try_color(
         &self,
         cuboid: Cuboid,
+        square_cache: &SquareCache,
         net_start: Pos,
-        surface_start: FacePos,
-        surface: &mut Surface,
-        pos_map: &mut [Option<FacePos>],
+        surface_start: Cursor,
+        pos_map: &mut [Option<Cursor>],
     ) -> bool {
-        surface.clear();
         pos_map.fill(None);
+        // Make a bitmask of what spots are filled.
+        let mut surface: u64 = 0;
 
         fn fill(
-            cuboid: Cuboid,
+            square_cache: &SquareCache,
             net: &Net,
             net_pos: Pos,
-            surface_pos: FacePos,
-            surface: &mut Surface,
-            pos_map: &mut [Option<FacePos>],
+            surface_pos: Cursor,
+            surface: &mut u64,
+            pos_map: &mut [Option<Cursor>],
         ) -> bool {
             // Make a little helper function to get the index in `pos_map` which corresponds
             // to a given position.
             let index = |pos: Pos| usize::from(pos.y) * usize::from(net.width) + usize::from(pos.x);
-            surface.set(surface_pos, true);
+            *surface |= 1 << surface_pos.square().0;
             pos_map[index(net_pos)] = Some(surface_pos);
             for direction in [Left, Up, Right, Down] {
                 let Some(net_pos) = net_pos.moved_in(direction, net.size()) else {
@@ -478,7 +500,7 @@ impl Net {
                     continue;
                 }
 
-                let surface_pos = surface_pos.moved_in(direction, cuboid);
+                let surface_pos = surface_pos.moved_in(square_cache, direction);
 
                 if let Some(existing_surface_pos) = pos_map[index(net_pos)] {
                     if existing_surface_pos == surface_pos {
@@ -491,7 +513,7 @@ impl Net {
                     }
                 }
 
-                if surface.filled(surface_pos) {
+                if *surface & (1 << surface_pos.square().0) != 0 {
                     // This isn't a valid net for this cuboid (from this starting position) - this
                     // spot is on the net but the corresponding spot on the surface is filled, so
                     // the net doubles up which is invalid.
@@ -499,7 +521,7 @@ impl Net {
                 }
 
                 // Now try filling in this new position as well.
-                if !fill(cuboid, net, net_pos, surface_pos, surface, pos_map) {
+                if !fill(square_cache, net, net_pos, surface_pos, surface, pos_map) {
                     return false;
                 }
             }
@@ -507,16 +529,18 @@ impl Net {
             true
         }
 
-        fill(cuboid, self, net_start, surface_start, surface, pos_map)
-            && pos_map.iter().filter(|pos| pos.is_some()).count() == cuboid.surface_area()
+        fill(
+            square_cache,
+            self,
+            net_start,
+            surface_start,
+            &mut surface,
+            pos_map,
+        ) && pos_map.iter().filter(|pos| pos.is_some()).count() == cuboid.surface_area()
     }
 
     pub fn area(&self) -> usize {
         self.squares.iter().filter(|&&square| square).count()
-    }
-
-    fn clear(&mut self) {
-        self.squares.fill(false);
     }
 }
 
@@ -875,40 +899,40 @@ pub(crate) enum Transform {
     VerticalFlip,
 }
 
+/// A square on the surface of a cuboid.
+///
+/// You should pretty much always use `Square` (along with a `SquareCache`)
+/// instead of this type, since it's smaller and has quicker lookup of
+/// neighbouring squares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FacePos {
+struct SquareData {
     /// Which face this position is on.
-    pub face: Face,
+    face: Face,
     /// The position within the face.
     pos: Pos,
-    /// The orientation of the current face.
-    ///
-    /// Formatted as the number of clockwise turns that must be made to a
-    /// direction on the net to convert it to a direction on the current face
-    orientation: i8,
 }
 
-impl FacePos {
-    /// Creates a new face position at (0, 0) on the bottom face of a cuboid,
-    /// oriented the same as the net.
+impl SquareData {
+    /// Creates a square representing (0, 0) on the bottom face of a cuboid.
     fn new() -> Self {
         Self {
             face: Bottom,
             pos: Pos::new(0, 0),
-            orientation: 0,
         }
     }
 
-    /// Move the position 1 unit in the given direction on the net.
+    /// Moves this square over by one in `direction`, assuming this square has
+    /// the default orientation for its face.
+    ///
+    /// Note that if the square changes face, its implicit orientation isn't
+    /// preserved, since that can change between faces. You need `CursorData`
+    /// for that.
     fn move_in(&mut self, direction: Direction, cuboid: Cuboid) {
-        let face_direction = direction.turned(self.orientation);
-        let success = self
-            .pos
-            .move_in(face_direction, cuboid.face_size(self.face));
+        let success = self.pos.move_in(direction, cuboid.face_size(self.face));
         if !success {
             // We went off the edge of the face, time to switch faces.
-            let (new_face, turns) = self.face.adjacent_in(face_direction);
-            let entry_direction = face_direction.turned(turns);
+            let (new_face, turns) = self.face.adjacent_in(direction);
+            let entry_direction = direction.turned(turns);
 
             // Rotate the position to be aligned with the new face.
             self.pos.rotate(turns, cuboid.face_size(self.face));
@@ -920,64 +944,323 @@ impl FacePos {
                 Down => self.pos.y = cuboid.face_size(new_face).height - 1,
             }
 
-            self.orientation = (self.orientation + turns) & 0b11;
             self.face = new_face;
         }
     }
 
-    /// Returns this position moved 1 unit in the given direction on the net.
+    /// Returns the square adjacent to this square in `direction`, assuming this
+    /// square has the default orientation for its face.
+    ///
+    /// Note that if the square changes face, its implicit orientation isn't
+    /// preserved, since that can change between faces. You need `CursorData`
+    /// for that.
     fn moved_in(mut self, direction: Direction, cuboid: Cuboid) -> Self {
         self.move_in(direction, cuboid);
         self
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Surface {
-    faces: [Net; 6],
+/// A cursor onto the surface of a cuboid.
+///
+/// A cursor lies on top of a square on the surface of a cuboid, and points in a
+/// direction. I tend to imagine this as a square with a little chevron arrow
+/// inside it.
+///
+/// The direction the cursor points in indicates which direction is up relative
+/// to the cursor, so that you can then specify directions in terms of left, up,
+/// down and right relative to the cursor.
+///
+/// To encode the direction, every face has a default cursor direction, and
+/// `orientation` is the number of right turns away from that direction this
+/// cursor is.
+///
+/// The main purpose of cursors are for keeping track of where squares move to
+/// when you fold/unfold a cuboid. This includes both where squares end up on
+/// the net after unfolding, and where they end up after unfolding into a net
+/// and folding back up into a different cuboid.
+///
+/// Examples of usage:
+/// - `Mapping` holds a cursor onto two different cuboids, and indicates that
+///   with the net that's being built, when you unfold the first cuboid into
+///   that net and then fold it back up into the second cuboid the first cursor
+///   gets moved to the second cursor.
+/// - `Instruction` holds a net position and a cursor onto each cuboid. The net
+///   position is an implicit cursor onto the net pointing upwards, and then
+///   each cursor on the cuboids is the position that the cursor on the net
+///   moves to when you fold the net up into each cuboid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CursorData {
+    /// The square the cursor is on.
+    square: SquareData,
+    /// The orientation of the cursor.
+    orientation: i8,
 }
 
-impl Surface {
-    fn new(cuboid: Cuboid) -> Self {
+impl CursorData {
+    /// Creates a new curosr at (0, 0) on the bottom face of a cuboid, facing
+    /// upwards.
+    fn new() -> Self {
         Self {
-            faces: [
-                Net::new(cuboid.width, cuboid.depth),
-                Net::new(cuboid.depth, cuboid.height),
-                Net::new(cuboid.width, cuboid.height),
-                Net::new(cuboid.depth, cuboid.height),
-                Net::new(cuboid.width, cuboid.height),
-                Net::new(cuboid.width, cuboid.depth),
-            ],
+            square: SquareData::new(),
+            orientation: 0,
         }
     }
 
-    fn filled(&self, pos: FacePos) -> bool {
-        self.faces[pos.face as usize].filled(pos.pos)
-    }
+    /// Moves the cursor 1 unit in the given direction.
+    fn move_in(&mut self, direction: Direction, cuboid: Cuboid) {
+        let face_direction = direction.turned(self.orientation);
+        let success = self
+            .square
+            .pos
+            .move_in(face_direction, cuboid.face_size(self.square.face));
+        if !success {
+            // We went off the edge of the face, time to switch faces.
+            let (new_face, turns) = self.square.face.adjacent_in(face_direction);
+            let entry_direction = face_direction.turned(turns);
 
-    fn set(&mut self, pos: FacePos, value: bool) {
-        self.faces[pos.face as usize].set(pos.pos, value)
-    }
+            // Rotate the position to be aligned with the new face.
+            self.square
+                .pos
+                .rotate(turns, cuboid.face_size(self.square.face));
+            // Then set the coordinate we moved along to the appropriate edge of the face.
+            match entry_direction {
+                Left => self.square.pos.x = cuboid.face_size(new_face).width - 1,
+                Up => self.square.pos.y = 0,
+                Right => self.square.pos.x = 0,
+                Down => self.square.pos.y = cuboid.face_size(new_face).height - 1,
+            }
 
-    fn clear(&mut self) {
-        for face in &mut self.faces {
-            face.clear();
+            self.orientation = (self.orientation + turns) & 0b11;
+            self.square.face = new_face;
         }
     }
-}
 
-impl PartialEq for Surface {
-    fn eq(&self, other: &Self) -> bool {
-        zip(&self.faces, &other.faces).all(|(a, b)| a.squares == b.squares)
+    /// Returns this cursor moved 1 unit in the given direction.
+    fn moved_in(mut self, direction: Direction, cuboid: Cuboid) -> Self {
+        self.move_in(direction, cuboid);
+        self
     }
 }
 
-impl Eq for Surface {}
+/// A cache of all the squares on the surface of a cuboid, along with a lookup
+/// table for which square you reach by moving in any direction from another
+/// square.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SquareCache {
+    /// All the squares on the surface of a cuboid.
+    ///
+    /// This allows us to represent a square as an index in this array instead
+    /// of having to copy it around everywhere, and also then reuse that index
+    /// in a lookup table.
+    squares: Vec<SquareData>,
+    /// A lookup table which stores the face position you get by moving in every
+    /// possible direction from a square, assuming the default orientation for
+    /// its face.
+    ///
+    /// If `index` is the index of a square in `squares` and `direction` is the
+    /// direction you want to find a face position adjacent in, the index you
+    /// need in this array is `index << 2 | (direction as usize)`.
+    neighbour_lookup: Vec<Cursor>,
+}
 
-impl Hash for Surface {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        for face in &self.faces {
-            face.squares.hash(state);
+impl SquareCache {
+    /// Returns a `SquareCache` for the given cuboid.
+    pub fn new(cuboid: Cuboid) -> SquareCache {
+        assert!(
+            cuboid.surface_area() <= 64,
+            "`SquareCache` only supports up to 64 squares"
+        );
+
+        let mut squares = Vec::new();
+        for face in [Bottom, West, North, East, South, Top] {
+            for x in 0..cuboid.face_size(face).width {
+                for y in 0..cuboid.face_size(face).height {
+                    squares.push(SquareData {
+                        face,
+                        pos: Pos { x, y },
+                    })
+                }
+            }
+        }
+
+        let neighbour_lookup = squares
+            .iter()
+            .flat_map(|&square| {
+                [Left, Up, Right, Down].into_iter().map(move |direction| {
+                    CursorData {
+                        square,
+                        orientation: 0,
+                    }
+                    .moved_in(direction, cuboid)
+                })
+            })
+            .map(|cursor| {
+                let square = squares
+                    .iter()
+                    .position(|&square| square == cursor.square)
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                Cursor::new(Square(square), cursor.orientation)
+            })
+            .collect();
+
+        Self {
+            squares,
+            neighbour_lookup,
+        }
+    }
+
+    /// Returns an iterator over all the squares in this `SquareCache`.
+    fn squares(&self) -> impl Iterator<Item = Square> + DoubleEndedIterator + ExactSizeIterator {
+        let num_squares: u8 = self
+            .squares
+            .len()
+            .try_into()
+            .expect("`SquareCache` contained more than 64 squares");
+        (0..num_squares).map(Square)
+    }
+}
+
+/// A square on the surface of a cuboid, represented by an index into
+/// `SquareCache::squares`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct Square(u8);
+
+impl Square {
+    /// Returns a square representing (0, 0) on the bottom face of a cuboid.
+    fn new() -> Self {
+        Self(0)
+    }
+
+    /// Returns the square adjacent to this square in `direction`, assuming this
+    /// square has the default orientation for its face.
+    ///
+    /// Note that if the square changes face, its implicit orientation isn't
+    /// preserved, since that can change between faces. You need `Cursor` for
+    /// that.
+    fn moved_in(self, cache: &SquareCache, direction: Direction) -> Self {
+        cache.neighbour_lookup[usize::from(self.0 << 2) | direction as usize].square()
+    }
+
+    /// Creates a `Square` from a `SquareData`.
+    fn from_data(cache: &SquareCache, square: &SquareData) -> Self {
+        let index = cache
+            .squares
+            .iter()
+            .position(|other_square| other_square == square)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        Self(index)
+    }
+}
+
+/// A cursor, bitwise-encoded as a square and an orientation. The square is
+/// encoded in the upper 6 bits, and the orientation is encoded in the lower 2
+/// bits.
+///
+/// A cursor lies on top of a square on the surface of a cuboid, and points in a
+/// direction. I tend to imagine this as a square with a little chevron arrow
+/// inside it.
+///
+/// The direction the cursor points in indicates which direction is up relative
+/// to the cursor, so that you can then specify directions in terms of left, up,
+/// down and right relative to the cursor.
+///
+/// To encode the direction, every face has a default cursor direction, and the
+/// orientation is the number of right turns away from that direction this
+/// cursor is pointing.
+///
+/// The main purpose of cursors are for keeping track of where squares move to
+/// when you fold/unfold a cuboid. This includes both where squares end up on
+/// the net after unfolding, and where they end up after unfolding into a net
+/// and folding back up into a different cuboid.
+///
+/// Examples of usage:
+/// - `Mapping` holds a cursor onto two different cuboids, and indicates that
+///   with the net that's being built, when you unfold the first cuboid into
+///   that net and then fold it back up into the second cuboid the first cursor
+///   gets moved to the second cursor.
+/// - `Instruction` holds a net position and a cursor onto each cuboid. The net
+///   position is an implicit cursor onto the net pointing upwards, and then
+///   each cursor on the cuboids is the position that the cursor on the net
+///   moves to when you fold the net up into each cuboid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct Cursor(u8);
+
+impl Cursor {
+    /// Builds a cursor from a square and an orientation.
+    fn new(square: Square, orientation: i8) -> Self {
+        assert!(square.0 < 64);
+        Self(square.0 << 2 | (orientation & 0b11) as u8)
+    }
+
+    /// Returns the square where this position is.
+    fn square(self) -> Square {
+        Square(self.0 >> 2)
+    }
+
+    /// Returns the orientation of this position.
+    fn orientation(self) -> i8 {
+        (self.0 & 0b11) as i8
+    }
+
+    /// Returns this cursor moved over by one in `direction`.
+    fn moved_in(self, cache: &SquareCache, direction: Direction) -> Self {
+        let cursor = cache.neighbour_lookup
+            [usize::from(self.0 & 0b11111100) | direction.turned(self.orientation()) as usize];
+        // The neighbour lookup table only contains what you get when you move
+        // in some direction from a particular _square_, which means our
+        // orientation's been ignored; to fix that we just add it back on
+        // afterwards.
+        Cursor::new(cursor.square(), cursor.orientation() + self.orientation())
+    }
+
+    fn from_data(cache: &SquareCache, data: &CursorData) -> Self {
+        let square = Square::from_data(cache, &data.square);
+        Self(square.0 << 2 | (data.orientation & 0b11) as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Cuboid, Cursor, CursorData, Direction, Square, SquareCache};
+    use Direction::*;
+
+    #[test]
+    fn square_cache() {
+        let cuboid = Cuboid::new(1, 1, 5);
+        let cache = SquareCache::new(cuboid);
+        for square_data in cache.squares.iter().copied() {
+            let square = Square::from_data(&cache, &square_data);
+            assert_eq!(cache.squares[usize::from(square.0)], square_data);
+            for direction in [Left, Up, Down, Right] {
+                assert_eq!(
+                    cache.squares[usize::from(square.moved_in(&cache, direction).0)],
+                    square_data.moved_in(direction, cuboid)
+                );
+                assert_eq!(
+                    square.moved_in(&cache, direction),
+                    Square::from_data(&cache, &square_data.moved_in(direction, cuboid))
+                );
+            }
+
+            for orientation in -4..=4 {
+                let cursor = Cursor::new(square, orientation);
+                assert_eq!(cursor.square(), square);
+                assert_eq!(cursor.orientation(), orientation & 0b11);
+                let cursor_data = CursorData {
+                    square: square_data,
+                    orientation,
+                };
+                for direction in [Left, Up, Down, Right] {
+                    assert_eq!(
+                        cursor.moved_in(&cache, direction),
+                        Cursor::from_data(&cache, &cursor_data.moved_in(direction, cuboid))
+                    );
+                }
+            }
         }
     }
 }
