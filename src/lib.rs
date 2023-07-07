@@ -453,9 +453,7 @@ impl Net {
                     squares: pos_map
                         .into_iter()
                         .map(|maybe_cursor| {
-                            maybe_cursor.map(|cursor| {
-                                square_cache.squares[usize::from(cursor.square().0)].face
-                            })
+                            maybe_cursor.map(|cursor| cursor.to_data(square_cache).square.face)
                         })
                         .collect(),
                 });
@@ -1154,6 +1152,11 @@ impl Square {
             .unwrap();
         Self(index)
     }
+
+    /// Converts a `Square` into a `SquareData`.
+    fn to_data(self, cache: &SquareCache) -> SquareData {
+        cache.squares[usize::from(self.0)]
+    }
 }
 
 /// A cursor, bitwise-encoded as a square and an orientation. The square is
@@ -1220,6 +1223,15 @@ impl Cursor {
     fn from_data(cache: &SquareCache, data: &CursorData) -> Self {
         let square = Square::from_data(cache, &data.square);
         Self(square.0 << 2 | (data.orientation & 0b11) as u8)
+    }
+
+    /// Converts a `Cursor` into a `CursorData`.
+    fn to_data(self, cache: &SquareCache) -> CursorData {
+        let square = self.square().to_data(cache);
+        CursorData {
+            square,
+            orientation: self.orientation(),
+        }
     }
 }
 
