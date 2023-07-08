@@ -17,9 +17,7 @@ use anyhow::{bail, Context};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    Cuboid, Cursor, CursorData, Direction, Mapping, MappingData, Net, Square, SquareCache,
-};
+use crate::{Cuboid, CursorData, Direction, Mapping, MappingData, Net, Square, SquareCache};
 
 use Direction::*;
 
@@ -29,6 +27,9 @@ pub struct NetFinder {
     cuboids: [Cuboid; 2],
     /// Square caches for the cuboids.
     square_caches: [SquareCache; 2],
+    /// Mappings that we should skip over because they're the responsibility of
+    /// another `NetFinder`.
+    skip: FxHashSet<Mapping>,
 
     queue: Vec<Instruction>,
     /// The indices of all the 'potential' instructions that we're saving until
@@ -56,7 +57,7 @@ struct Instruction {
     /// The index in `net.squares` where the square will be added.
     net_pos: IndexPos,
     /// The cursors on each of the cuboids that that square folds up into.
-    cursors: [Cursor; 2],
+    mapping: Mapping,
     state: InstructionState,
 }
 
@@ -79,7 +80,7 @@ enum InstructionState {
 
 impl PartialEq for Instruction {
     fn eq(&self, other: &Self) -> bool {
-        self.net_pos == other.net_pos && self.cursors == other.cursors
+        self.net_pos == other.net_pos && self.mapping == other.mapping
     }
 }
 
@@ -88,7 +89,7 @@ impl Eq for Instruction {}
 impl Hash for Instruction {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.net_pos.hash(state);
-        self.cursors.hash(state);
+        self.mapping.hash(state);
     }
 }
 
@@ -119,7 +120,7 @@ enum PosState {
     Untouched,
     /// There's an instruction in the queue that wants to map this position to
     /// `cursors`.
-    Queued { cursors: [Cursor; 2] },
+    Queued { mapping: Mapping },
     /// There are two instructions in the queue that want to map this position
     /// to different positions. Any further instructions will see this and not
     /// be added.
@@ -127,7 +128,7 @@ enum PosState {
     /// `cursors` is the what the first instruction wants this net position to
     /// map to, so that this can be restored to `Queued` if/when the second
     /// instruction gets backtracked.
-    Invalid { cursors: [Cursor; 2] },
+    Invalid { mapping: Mapping },
     /// This position is filled.
     Filled,
 }
@@ -149,7 +150,8 @@ impl NetFinder {
 
         let square_caches = cuboids.map(SquareCache::new);
 
-        // Divide all of the possible starting mappings up several equivalence classes of mappings that will result in the same set of nets.
+        // Divide all of the possible starting mappings up several equivalence classes
+        // of mappings that will result in the same set of nets.
         let mut equivalence_classes: Vec<FxHashSet<Mapping>> = Vec::new();
 
         for cursor in cuboids[1].unique_cursors() {
@@ -175,23 +177,30 @@ impl NetFinder {
         let finders = equivalence_classes
             .iter()
             .map(|class| class.iter().next().unwrap())
-            .map(|start_mapping| {
+            .enumerate()
+            .map(|(i, &start_mapping)| {
                 // The first instruction is to add the first square.
                 let start_pos = IndexPos(
                     usize::from(middle_y) * usize::from(net.width()) + usize::from(middle_x),
                 );
                 let queue = vec![Instruction {
                     net_pos: start_pos,
-                    cursors: start_mapping.cursors,
+                    mapping: start_mapping,
                     state: InstructionState::NotRun,
                 }];
                 let mut pos_states = vec![PosState::Untouched; net.squares.len()];
                 pos_states[start_pos.0] = PosState::Queued {
-                    cursors: queue[0].cursors,
+                    mapping: queue[0].mapping,
                 };
+                // Skip all of the equivalence classes prior to this one.
+                let skip = equivalence_classes[..i]
+                    .iter()
+                    .flat_map(|class| class.iter().copied())
+                    .collect();
                 Self {
                     cuboids,
                     square_caches: square_caches.clone(),
+                    skip,
 
                     queue,
                     potential: Vec::new(),
@@ -228,7 +237,7 @@ impl NetFinder {
         // Mark it as reverted.
         instruction.state = InstructionState::NotRun;
         self.pos_states[instruction.net_pos.0] = PosState::Queued {
-            cursors: instruction.cursors,
+            mapping: instruction.mapping,
         };
         // Remove the square it added.
         self.set_square(last_success_index, false);
@@ -240,7 +249,7 @@ impl NetFinder {
                 // is impossible.
                 PosState::Untouched => unreachable!(),
                 PosState::Queued { .. } => PosState::Untouched,
-                PosState::Invalid { cursors } => PosState::Queued { cursors },
+                PosState::Invalid { mapping } => PosState::Queued { mapping },
                 // This is an instruction that hasn't been run, so this should be impossible.
                 PosState::Filled => unreachable!(),
             }
@@ -280,11 +289,12 @@ impl NetFinder {
                         // If it's untouched, queue this instruction and mark it as queued.
                         PosState::Untouched => {
                             self.pos_states[instruction.net_pos.0] = PosState::Queued {
-                                cursors: instruction.cursors,
+                                mapping: instruction.mapping,
                             };
                             // We only consider it a real followup instruction if none of the
                             // squares it sets are already filled.
                             if instruction
+                                .mapping
                                 .cursors
                                 .iter()
                                 .enumerate()
@@ -296,12 +306,12 @@ impl NetFinder {
                         }
                         // If it's already queued to do the same thing as this instruction, this
                         // instruction is redundant. Don't add it to the queue.
-                        PosState::Queued { cursors } if cursors == instruction.cursors => {}
+                        PosState::Queued { mapping } if mapping == instruction.mapping => {}
                         // If it's queued to do something different, mark it as invalid and queue
                         // this instruction so that it'll become valid again if/when the instruction
                         // is unqueued.
-                        PosState::Queued { cursors } => {
-                            self.pos_states[instruction.net_pos.0] = PosState::Invalid { cursors };
+                        PosState::Queued { mapping } => {
+                            self.pos_states[instruction.net_pos.0] = PosState::Invalid { mapping };
                             self.queue.push(instruction);
                         }
                     }
@@ -329,11 +339,7 @@ impl NetFinder {
                         match self.pos_states[instruction.net_pos.0] {
                             PosState::Untouched => unreachable!(),
                             PosState::Queued { .. } => PosState::Untouched,
-                            PosState::Invalid {
-                                cursors: face_positions,
-                            } => PosState::Queued {
-                                cursors: face_positions,
-                            },
+                            PosState::Invalid { mapping } => PosState::Queued { mapping },
                             PosState::Filled => unreachable!(),
                         }
                 }
@@ -346,8 +352,9 @@ impl NetFinder {
 
     /// Returns whether an instruction is valid to run.
     fn valid(&self, instruction: &Instruction) -> bool {
-        !self.filled(0, instruction.cursors[0].square())
-            & !self.filled(1, instruction.cursors[1].square())
+        !self.filled(0, instruction.mapping.cursors[0].square())
+            & !self.filled(1, instruction.mapping.cursors[1].square())
+            & !self.skip.contains(&instruction.mapping)
             & matches!(
                 self.pos_states[instruction.net_pos.0],
                 PosState::Queued { .. }
@@ -376,12 +383,12 @@ impl NetFinder {
         let net_pos = instruction.net_pos.moved_in(direction, &self.net)?;
         // It's easier to just mutate the array in place than turn it into an iterator
         // and back.
-        let mut cursors = instruction.cursors;
-        zip(&self.square_caches, &mut cursors)
+        let mut mapping = instruction.mapping;
+        zip(&self.square_caches, &mut mapping.cursors)
             .for_each(|(cache, cursor)| *cursor = cursor.moved_in(cache, direction));
         Some(Instruction {
             net_pos,
-            cursors,
+            mapping,
             state: InstructionState::NotRun,
         })
     }
@@ -391,7 +398,7 @@ impl NetFinder {
     #[inline]
     fn set_square(&mut self, instruction_index: usize, value: bool) {
         let Instruction {
-            net_pos, cursors, ..
+            net_pos, mapping, ..
         } = self.queue[instruction_index];
         match (self.net.squares[net_pos.0], value) {
             (false, true) => self.area += 1,
@@ -399,7 +406,7 @@ impl NetFinder {
             _ => {}
         }
         self.net.squares[net_pos.0] = value;
-        for (cuboid, cursor) in cursors.into_iter().enumerate() {
+        for (cuboid, cursor) in mapping.cursors.into_iter().enumerate() {
             self.set_filled(cuboid, cursor.square(), value)
         }
     }
@@ -424,7 +431,7 @@ impl NetFinder {
         let mut filled: [u64; 2] = self.filled;
         for instruction in self.potential.iter().map(|&index| &self.queue[index]) {
             if self.valid(instruction) {
-                for (filled, cursor) in zip(&mut filled, instruction.cursors) {
+                for (filled, cursor) in zip(&mut filled, instruction.mapping.cursors) {
                     *filled |= 1 << cursor.square().0;
                 }
             }
@@ -467,7 +474,7 @@ impl NetFinder {
                     // square that fills it.
                     found.clear();
                     for (i, instruction) in potential_squares.iter().enumerate() {
-                        if instruction.cursors[cuboid].square() == square {
+                        if instruction.mapping.cursors[cuboid].square() == square {
                             // Note down the conflicts between this instruction and the rest in
                             // `found` so far, then add it to `found`.
                             conflicts[i].extend(found.iter().copied());
@@ -503,7 +510,7 @@ impl NetFinder {
                 if let Some(moved_instruction) = self.instruction_in(instruction, direction) {
                     for (j, other_instruction) in potential_squares.iter().enumerate() {
                         if other_instruction.net_pos == moved_instruction.net_pos
-                            && other_instruction.cursors != moved_instruction.cursors
+                            && other_instruction.mapping != moved_instruction.mapping
                         {
                             conflicts[i].insert(j);
                         }

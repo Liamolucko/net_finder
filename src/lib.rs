@@ -1450,7 +1450,7 @@ impl MappingData {
 ///
 /// This can also be used to indicate where a spot on the net maps to on each
 /// cuboid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 // Aligning this to two bytes lets the compiler bitwise-encode it as a `u16`, making things faster.
 #[repr(align(2))]
 struct Mapping {
@@ -1465,7 +1465,8 @@ impl Mapping {
         }
     }
 
-    /// Creates a `Mapping` from a `MappingData`, given the square caches for the two cursors in order.
+    /// Creates a `Mapping` from a `MappingData`, given the square caches for
+    /// the two cursors in order.
     fn from_data(caches: &[SquareCache; 2], data: &MappingData) -> Self {
         Self {
             cursors: array::from_fn(|i| Cursor::from_data(&caches[i], &data.cursors[i])),
@@ -1583,7 +1584,8 @@ mod tests {
 
         let mapping1 = MappingData::new(cursor1, cursor2);
         let expected_equivalents = hash_set([
-            // First, there are all the direction combinations of equivalents of `cursor1` and `cursor2`.
+            // First, there are all the direction combinations of equivalents of `cursor1` and
+            // `cursor2`.
             MappingData::new(
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 0, 0, 1),
@@ -1712,7 +1714,8 @@ mod tests {
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 1, 2, 3),
             ),
-            // Then, by performing a vertical flip you get a slightly different version of each of those combinations.
+            // Then, by performing a vertical flip you get a slightly different version of each of
+            // those combinations.
             MappingData::new(
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 1, 0, 1),
@@ -1841,7 +1844,8 @@ mod tests {
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 0, 2, 3),
             ),
-            // And _then_ there are the versions of all of those that you get by rotating both cuboids at once.
+            // And _then_ there are the versions of all of those that you get by rotating both
+            // cuboids at once.
             MappingData::new(
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 0, 0, 2),
