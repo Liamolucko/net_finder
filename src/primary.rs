@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
     thread,
+    time::Duration,
 };
 
 use anyhow::{bail, Context};
@@ -168,10 +169,6 @@ impl NetFinder {
                         .collect(),
                 )
             }
-        }
-
-        for (i, class) in equivalence_classes.iter().enumerate() {
-            eprintln!("class {i}: {} mappings", class.len());
         }
 
         // Then create one `NetFinder` per equivalence class.
@@ -798,6 +795,9 @@ fn run(
             .unwrap();
             // Then move it to the real path.
             fs::rename(tmp_path, path).unwrap();
+
+            // Wait 50ms before writing the state again.
+            thread::sleep(Duration::from_millis(50));
         }
     });
 
