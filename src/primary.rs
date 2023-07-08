@@ -13,9 +13,12 @@ use std::{
 };
 
 use anyhow::{bail, Context};
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
-use crate::{Cuboid, Cursor, Direction, Net, Square, SquareCache};
+use crate::{
+    Cuboid, Cursor, CursorData, Direction, Mapping, MappingData, Net, Square, SquareCache,
+};
 
 use Direction::*;
 
@@ -145,23 +148,44 @@ impl NetFinder {
 
         let square_caches = cuboids.map(SquareCache::new);
 
-        let starting_cursors: Vec<_> = cuboids[1]
-            .unique_cursors()
-            .into_iter()
-            .map(|cursor| Cursor::from_data(&square_caches[1], &cursor))
-            .map(|cursor| [Cursor::new(Square::new(), 0), cursor])
-            .collect();
+        // Divide all of the possible starting mappings up several equivalence classes of mappings that will result in the same set of nets.
+        let mut equivalence_classes: Vec<FxHashSet<Mapping>> = Vec::new();
 
-        Ok(starting_cursors
-            .into_iter()
-            .map(|cursors| {
+        for cursor in cuboids[1].unique_cursors() {
+            let mapping_data = MappingData::new(CursorData::new(cuboids[0]), cursor);
+            let mapping = Mapping::from_data(&square_caches, &mapping_data);
+
+            if !equivalence_classes
+                .iter()
+                .any(|class| class.contains(&mapping))
+            {
+                // We've found a mapping that's in a new equivalence class. Add it to the list.
+                equivalence_classes.push(
+                    mapping_data
+                        .equivalents()
+                        .into_iter()
+                        .map(|mapping| Mapping::from_data(&square_caches, &mapping))
+                        .collect(),
+                )
+            }
+        }
+
+        for (i, class) in equivalence_classes.iter().enumerate() {
+            eprintln!("class {i}: {} mappings", class.len());
+        }
+
+        // Then create one `NetFinder` per equivalence class.
+        let finders = equivalence_classes
+            .iter()
+            .map(|class| class.iter().next().unwrap())
+            .map(|start_mapping| {
                 // The first instruction is to add the first square.
                 let start_pos = IndexPos(
                     usize::from(middle_y) * usize::from(net.width()) + usize::from(middle_x),
                 );
                 let queue = vec![Instruction {
                     net_pos: start_pos,
-                    cursors,
+                    cursors: start_mapping.cursors,
                     state: InstructionState::NotRun,
                 }];
                 let mut pos_states = vec![PosState::Untouched; net.squares.len()];
@@ -184,7 +208,9 @@ impl NetFinder {
                     target_area: cuboids[0].surface_area(),
                 }
             })
-            .collect())
+            .collect();
+
+        Ok(finders)
     }
 
     /// Undoes the last instruction that was successfully carried out.

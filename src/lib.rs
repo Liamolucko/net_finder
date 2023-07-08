@@ -2,6 +2,8 @@
 
 // This file contains infrastructure shared between `primary.rs` and `alt.rs`.
 
+use std::array;
+use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
 use std::iter::zip;
@@ -120,6 +122,7 @@ impl Cuboid {
                     // respectively with a 180 degree turn.
                     result.push(CursorData {
                         square: SquareData {
+                            cuboid: *self,
                             face,
                             pos: Pos::new(x, y),
                         },
@@ -134,6 +137,7 @@ impl Cuboid {
                     if size.width != size.height {
                         result.push(CursorData {
                             square: SquareData {
+                                cuboid: *self,
                                 face,
                                 pos: Pos::new(x, y),
                             },
@@ -418,7 +422,8 @@ impl Net {
     /// Return a version of this net with its squares 'colored' with which faces
     /// they're on.
     ///
-    /// This version of the method takes a `SquareCache` so it doesn't need to be re-computed every time.
+    /// This version of the method takes a `SquareCache` so it doesn't need to
+    /// be re-computed every time.
     pub fn color_with_cache(
         &self,
         cuboid: Cuboid,
@@ -754,6 +759,10 @@ impl Size {
         self.rotate(turns);
         self
     }
+
+    fn is_square(&self) -> bool {
+        self.width == self.height
+    }
 }
 
 // A direction in 2D space.
@@ -904,6 +913,8 @@ pub(crate) enum Transform {
 /// neighbouring squares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct SquareData {
+    /// The cuboid that this square is on.
+    cuboid: Cuboid,
     /// Which face this position is on.
     face: Face,
     /// The position within the face.
@@ -912,8 +923,9 @@ struct SquareData {
 
 impl SquareData {
     /// Creates a square representing (0, 0) on the bottom face of a cuboid.
-    fn new() -> Self {
+    fn new(cuboid: Cuboid) -> Self {
         Self {
+            cuboid,
             face: Bottom,
             pos: Pos::new(0, 0),
         }
@@ -925,21 +937,23 @@ impl SquareData {
     /// Note that if the square changes face, its implicit orientation isn't
     /// preserved, since that can change between faces. You need `CursorData`
     /// for that.
-    fn move_in(&mut self, direction: Direction, cuboid: Cuboid) {
-        let success = self.pos.move_in(direction, cuboid.face_size(self.face));
+    fn move_in(&mut self, direction: Direction) {
+        let success = self
+            .pos
+            .move_in(direction, self.cuboid.face_size(self.face));
         if !success {
             // We went off the edge of the face, time to switch faces.
             let (new_face, turns) = self.face.adjacent_in(direction);
             let entry_direction = direction.turned(turns);
 
             // Rotate the position to be aligned with the new face.
-            self.pos.rotate(turns, cuboid.face_size(self.face));
+            self.pos.rotate(turns, self.cuboid.face_size(self.face));
             // Then set the coordinate we moved along to the appropriate edge of the face.
             match entry_direction {
-                Left => self.pos.x = cuboid.face_size(new_face).width - 1,
+                Left => self.pos.x = self.cuboid.face_size(new_face).width - 1,
                 Up => self.pos.y = 0,
                 Right => self.pos.x = 0,
-                Down => self.pos.y = cuboid.face_size(new_face).height - 1,
+                Down => self.pos.y = self.cuboid.face_size(new_face).height - 1,
             }
 
             self.face = new_face;
@@ -952,8 +966,8 @@ impl SquareData {
     /// Note that if the square changes face, its implicit orientation isn't
     /// preserved, since that can change between faces. You need `CursorData`
     /// for that.
-    fn moved_in(mut self, direction: Direction, cuboid: Cuboid) -> Self {
-        self.move_in(direction, cuboid);
+    fn moved_in(mut self, direction: Direction) -> Self {
+        self.move_in(direction);
         self
     }
 }
@@ -997,20 +1011,25 @@ pub struct CursorData {
 impl CursorData {
     /// Creates a new curosr at (0, 0) on the bottom face of a cuboid, facing
     /// upwards.
-    fn new() -> Self {
+    fn new(cuboid: Cuboid) -> Self {
         Self {
-            square: SquareData::new(),
+            square: SquareData::new(cuboid),
             orientation: 0,
         }
     }
 
+    /// Returns the cuboid that this cursor is on.
+    fn cuboid(&self) -> Cuboid {
+        self.square.cuboid
+    }
+
     /// Moves the cursor 1 unit in the given direction.
-    fn move_in(&mut self, direction: Direction, cuboid: Cuboid) {
+    fn move_in(&mut self, direction: Direction) {
         let face_direction = direction.turned(self.orientation);
         let success = self
             .square
             .pos
-            .move_in(face_direction, cuboid.face_size(self.square.face));
+            .move_in(face_direction, self.cuboid().face_size(self.square.face));
         if !success {
             // We went off the edge of the face, time to switch faces.
             let (new_face, turns) = self.square.face.adjacent_in(face_direction);
@@ -1019,13 +1038,13 @@ impl CursorData {
             // Rotate the position to be aligned with the new face.
             self.square
                 .pos
-                .rotate(turns, cuboid.face_size(self.square.face));
+                .rotate(turns, self.cuboid().face_size(self.square.face));
             // Then set the coordinate we moved along to the appropriate edge of the face.
             match entry_direction {
-                Left => self.square.pos.x = cuboid.face_size(new_face).width - 1,
+                Left => self.square.pos.x = self.cuboid().face_size(new_face).width - 1,
                 Up => self.square.pos.y = 0,
                 Right => self.square.pos.x = 0,
-                Down => self.square.pos.y = cuboid.face_size(new_face).height - 1,
+                Down => self.square.pos.y = self.cuboid().face_size(new_face).height - 1,
             }
 
             self.orientation = (self.orientation + turns) & 0b11;
@@ -1034,9 +1053,84 @@ impl CursorData {
     }
 
     /// Returns this cursor moved 1 unit in the given direction.
-    fn moved_in(mut self, direction: Direction, cuboid: Cuboid) -> Self {
-        self.move_in(direction, cuboid);
+    fn moved_in(mut self, direction: Direction) -> Self {
+        self.move_in(direction);
         self
+    }
+
+    /// Returns the list of cursors that are 'equivalent' to this one.
+    ///
+    /// This is the opposite of `unique_cursors`: it returns all of the cursors
+    /// which can be reached by rotating the cuboid that this cursor lies on
+    /// into an indistinguishable position while leaving the cursor where it is.
+    fn equivalents(&self) -> Vec<CursorData> {
+        let mut result = vec![*self];
+        // If there are any other faces which are the same size, it's possible to rotate
+        // the cuboid so that that face replaces this cursor's face and we get a cursor
+        // on that face. So add an equivalent cursor on each so that everything we do
+        // next gets applied to those faces too.
+        for face in [Bottom, West, North]
+            .into_iter()
+            .filter(|&face| face != self.square.face && face != self.square.face.opposite())
+            .filter(|&face| {
+                self.cuboid().face_size(face) == self.cuboid().face_size(self.square.face)
+                    || self.cuboid().face_size(face)
+                        == self.cuboid().face_size(self.square.face).rotated(1)
+            })
+        {
+            // Rotate our position to be correct on the new face.
+            let mut cursor = *self;
+            let (_, turns) = self.square.face.direction_of(face).unwrap();
+            cursor
+                .square
+                .pos
+                .rotate(turns, self.cuboid().face_size(self.square.face));
+            cursor.orientation = (cursor.orientation + turns) & 0b11;
+            cursor.square.face = face;
+            result.push(cursor);
+        }
+
+        // Then we add an equivalent cursor on the opposite face, that you can get to by
+        // rotating the cuboid 180 degrees.
+        //
+        // Funnily enough, you can actually get one by simply using the existing
+        // coordinates on the new face - the way we've laid things out, everything has a
+        // path to its opposite face which doesn't involve having to go through any
+        // rotations, and so following that path around by 180 degrees leaves you with
+        // the same position and orientation on the new face.
+        for i in 0..result.len() {
+            let mut cursor = result[i];
+            cursor.square.face = cursor.square.face.opposite();
+            result.push(cursor);
+        }
+
+        // Then add the cursors you get by rotating the face 180 degrees.
+        for i in 0..result.len() {
+            let mut cursor = result[i];
+            cursor
+                .square
+                .pos
+                .rotate(2, cursor.cuboid().face_size(cursor.square.face));
+            cursor.orientation = (cursor.orientation + 2) & 0b11;
+            result.push(cursor);
+        }
+
+        // Then, if the face is square, add the cursors you get by rotating the face 90
+        // degrees (including from the 180-degree-rotated one we just made to get a
+        // 270-degree version).
+        if self.cuboid().face_size(self.square.face).is_square() {
+            for i in 0..result.len() {
+                let mut cursor = result[i];
+                cursor
+                    .square
+                    .pos
+                    .rotate(1, cursor.cuboid().face_size(cursor.square.face));
+                cursor.orientation = (cursor.orientation + 1) & 0b11;
+                result.push(cursor);
+            }
+        }
+
+        result
     }
 }
 
@@ -1074,6 +1168,7 @@ impl SquareCache {
             for x in 0..cuboid.face_size(face).width {
                 for y in 0..cuboid.face_size(face).height {
                     squares.push(SquareData {
+                        cuboid,
                         face,
                         pos: Pos { x, y },
                     })
@@ -1089,7 +1184,7 @@ impl SquareCache {
                         square,
                         orientation: 0,
                     }
-                    .moved_in(direction, cuboid)
+                    .moved_in(direction)
                 })
             })
             .map(|cursor| {
@@ -1115,6 +1210,8 @@ impl SquareCache {
             .squares
             .len()
             .try_into()
+            .ok()
+            .filter(|&squares| squares < 64)
             .expect("`SquareCache` contained more than 64 squares");
         (0..num_squares).map(Square)
     }
@@ -1235,10 +1332,158 @@ impl Cursor {
     }
 }
 
+/// A mapping between the surfaces of two cuboids, implemented as a pair of
+/// cursors.
+///
+/// This can also be used to indicate where a spot on the net maps to on each
+/// cuboid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MappingData {
+    cursors: [CursorData; 2],
+}
+
+impl MappingData {
+    /// Creates a `MappingData` between two cursors.
+    fn new(cursor1: CursorData, cursor2: CursorData) -> Self {
+        Self {
+            cursors: [cursor1, cursor2],
+        }
+    }
+
+    /// Returns the list of mappings that are 'equivalent' to this one.
+    ///
+    /// In effect, a mapping that's equivalent to this one is any mapping which
+    /// will lead to the exact same list of common nets when used as a starting
+    /// point from `NetFinder` (possibly rotated/flipped, but still the same
+    /// net).
+    ///
+    /// The way I imagine this is that you overlay the two cuboids on top of one
+    /// another, with the two cursors touching. Then, you can either:
+    /// - Rotate one cuboid into an indistinguishable position, leaving its
+    ///   cursor where it is, or
+    /// - Rotate or flip both cuboids at the same time around the cursors,
+    ///   leaving the cursors where they are.
+    ///
+    /// After doing either of those things to the pair of cuboids, they're
+    /// pretty obviously still going to unfold into all the same things, but
+    /// the cursors are now sitting on different spots on the cuboids. Thus
+    /// we've got a mapping which is equivalent.
+    fn equivalents(&self) -> HashSet<MappingData> {
+        // First we get the list of equivalent cursors on each cuboid.
+        let equivalent_cursors = self.cursors.map(|cursor| cursor.equivalents());
+        // Then we create a mapping for every combination of those equivalent
+        // cursors. This is a `HashSet` this time around because it's possible
+        // for flipping to result in the same mapping we started with, and we
+        // don't want any duplicates.
+        let mut result = HashSet::new();
+        for cursor1 in equivalent_cursors[0].iter().copied() {
+            for cursor2 in equivalent_cursors[1].iter().copied() {
+                result.insert(MappingData {
+                    cursors: [cursor1, cursor2],
+                });
+            }
+        }
+
+        // Then try flipping both cuboids to get more equivalent mappings.
+        // We have to store them in this intermediate `Vec` since we can't mutate
+        // `result` while iterating over it.
+        let mut batch = Vec::new();
+
+        // First try doing a horizontal flip around the cursors.
+        for mapping in result.iter() {
+            let mut mapping = *mapping;
+            for cursor in mapping.cursors.iter_mut() {
+                let face_size = cursor.cuboid().face_size(cursor.square.face);
+                if cursor.orientation % 2 == 0 {
+                    // If the cursor is pointing vertically relative to its face, that means that it
+                    // agrees with what the face thinks is horizontal, and we can just flip the x
+                    // coordinate around.
+                    cursor.square.pos.x = face_size.width - cursor.square.pos.x - 1;
+                } else {
+                    // Otherwise, horizontal relative to the cursor is vertical relative to the
+                    // face, so we need to flip the y coordinate instead.
+                    cursor.square.pos.y = face_size.height - cursor.square.pos.y - 1;
+                }
+            }
+            batch.push(mapping);
+        }
+        result.extend(batch.drain(..));
+
+        // Then a vertical flip.
+        for mapping in result.iter() {
+            let mut mapping = *mapping;
+            for cursor in mapping.cursors.iter_mut() {
+                let face_size = cursor.cuboid().face_size(cursor.square.face);
+                // This logic is the same as for horizontal flips but in reverse.
+                if cursor.orientation % 2 == 0 {
+                    cursor.square.pos.y = face_size.height - cursor.square.pos.y - 1;
+                } else {
+                    cursor.square.pos.x = face_size.width - cursor.square.pos.x - 1;
+                }
+            }
+            batch.push(mapping);
+        }
+        result.extend(batch.drain(..));
+
+        // Then try rotating both cuboids to get more equivalent mappings. This just
+        // amounts to simultaneously incrementing both cursors' orientations.
+        for mapping in result.iter() {
+            for turns in 1..=3 {
+                let mut mapping = *mapping;
+                for cursor in mapping.cursors.iter_mut() {
+                    // The reason we have to AND this with `0b11` is so that the mapping
+                    // de-duplication works properly: we need cursors with orientations of 0 and
+                    // orientations of 4 to be considered the same (by translating them both to 0).
+                    cursor.orientation = (cursor.orientation + turns) & 0b11;
+                }
+                batch.push(mapping);
+            }
+        }
+        result.extend(batch.drain(..));
+
+        result
+    }
+}
+
+/// A mapping between the surfaces of two cuboids, implemented as a pair of
+/// cursors.
+///
+/// This can also be used to indicate where a spot on the net maps to on each
+/// cuboid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// Aligning this to two bytes lets the compiler bitwise-encode it as a `u16`, making things faster.
+#[repr(align(2))]
+struct Mapping {
+    cursors: [Cursor; 2],
+}
+
+impl Mapping {
+    /// Creates a `Mapping` between two `Cursor`s.
+    fn new(cursor1: Cursor, cursor2: Cursor) -> Self {
+        Self {
+            cursors: [cursor1, cursor2],
+        }
+    }
+
+    /// Creates a `Mapping` from a `MappingData`, given the square caches for the two cursors in order.
+    fn from_data(caches: &[SquareCache; 2], data: &MappingData) -> Self {
+        Self {
+            cursors: array::from_fn(|i| Cursor::from_data(&caches[i], &data.cursors[i])),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{Cuboid, Cursor, CursorData, Direction, Square, SquareCache};
+    use std::collections::HashSet;
+    use std::hash::Hash;
+
+    use crate::{
+        Cuboid, Cursor, CursorData, Direction, Face, MappingData, Pos, Square, SquareCache,
+        SquareData,
+    };
     use Direction::*;
+    use Face::*;
 
     #[test]
     fn square_cache() {
@@ -1250,11 +1495,11 @@ mod tests {
             for direction in [Left, Up, Down, Right] {
                 assert_eq!(
                     cache.squares[usize::from(square.moved_in(&cache, direction).0)],
-                    square_data.moved_in(direction, cuboid)
+                    square_data.moved_in(direction)
                 );
                 assert_eq!(
                     square.moved_in(&cache, direction),
-                    Square::from_data(&cache, &square_data.moved_in(direction, cuboid))
+                    Square::from_data(&cache, &square_data.moved_in(direction))
                 );
             }
 
@@ -1269,10 +1514,1103 @@ mod tests {
                 for direction in [Left, Up, Down, Right] {
                     assert_eq!(
                         cursor.moved_in(&cache, direction),
-                        Cursor::from_data(&cache, &cursor_data.moved_in(direction, cuboid))
+                        Cursor::from_data(&cache, &cursor_data.moved_in(direction))
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn equivalents() {
+        fn cursor(cuboid: Cuboid, face: Face, x: u8, y: u8, orientation: i8) -> CursorData {
+            CursorData {
+                square: SquareData {
+                    cuboid,
+                    face,
+                    pos: Pos { x, y },
+                },
+                orientation,
+            }
+        }
+
+        fn hash_set<T: Eq + Hash>(iter: impl IntoIterator<Item = T>) -> HashSet<T> {
+            iter.into_iter().collect()
+        }
+
+        let cuboid1 = Cuboid::new(1, 1, 5);
+        let cursor1 = cursor(cuboid1, Bottom, 0, 0, 0);
+        assert_eq!(
+            hash_set(cursor1.equivalents()),
+            hash_set([
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid1, Top, 0, 0, 3),
+            ])
+        );
+
+        let cuboid2 = Cuboid::new(1, 2, 3);
+        let cursor2 = cursor(cuboid2, West, 0, 0, 1);
+        assert_eq!(
+            hash_set(cursor2.equivalents()),
+            hash_set([
+                cursor(cuboid2, West, 0, 0, 1),
+                cursor(cuboid2, West, 1, 2, 3),
+                cursor(cuboid2, East, 0, 0, 1),
+                cursor(cuboid2, East, 1, 2, 3),
+            ])
+        );
+
+        let cursor3 = cursor(cuboid1, North, 0, 1, 2);
+        assert_eq!(
+            hash_set(cursor3.equivalents()),
+            hash_set([
+                cursor(cuboid1, North, 0, 1, 2),
+                cursor(cuboid1, North, 0, 3, 0),
+                cursor(cuboid1, East, 0, 1, 2),
+                cursor(cuboid1, East, 0, 3, 0),
+                cursor(cuboid1, South, 0, 1, 2),
+                cursor(cuboid1, South, 0, 3, 0),
+                cursor(cuboid1, West, 0, 1, 2),
+                cursor(cuboid1, West, 0, 3, 0),
+            ])
+        );
+
+        let mapping1 = MappingData::new(cursor1, cursor2);
+        let expected_equivalents = hash_set([
+            // First, there are all the direction combinations of equivalents of `cursor1` and `cursor2`.
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 1, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 0, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 1, 2, 3),
+            ),
+            // Then, by performing a vertical flip you get a slightly different version of each of those combinations.
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 0, 2, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 1, 0, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 0, 2, 3),
+            ),
+            // And _then_ there are the versions of all of those that you get by rotating both cuboids at once.
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 0, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 1, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 1, 0, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 0, 2, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 0, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 1, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 1, 0, 3),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 0, 2, 1),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 0, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 1, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, West, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 3),
+                cursor(cuboid2, East, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, West, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 0),
+                cursor(cuboid2, East, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, West, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 1),
+                cursor(cuboid2, East, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, West, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Bottom, 0, 0, 2),
+                cursor(cuboid2, East, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, West, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 3),
+                cursor(cuboid2, East, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, West, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 0),
+                cursor(cuboid2, East, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, West, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 1),
+                cursor(cuboid2, East, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, West, 0, 2, 2),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 1, 0, 0),
+            ),
+            MappingData::new(
+                cursor(cuboid1, Top, 0, 0, 2),
+                cursor(cuboid2, East, 0, 2, 2),
+            ),
+        ]);
+        assert_eq!(mapping1.equivalents(), expected_equivalents)
     }
 }
