@@ -695,22 +695,7 @@ fn state_path(cuboids: &[Cuboid]) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
 }
 
-/// Sorts cuboids first in descending order of how many of their surface squares
-/// we have to consider, since we only have to consider 1 on the first one and
-/// so we want to pick the biggest number of them to eliminate, and then in
-/// ascending lexicographic order of their components if two have the same
-/// number of surface squares to consider.
-fn sort_cuboids(cuboids: &mut [Cuboid]) {
-    cuboids.sort_by(|a, b| {
-        b.unique_cursors()
-            .len()
-            .cmp(&a.unique_cursors().len())
-            .then(a.cmp(b))
-    });
-}
-
-pub fn find_nets(mut cuboids: [Cuboid; 2]) -> anyhow::Result<impl Iterator<Item = Net>> {
-    sort_cuboids(&mut cuboids);
+pub fn find_nets(cuboids: [Cuboid; 2]) -> anyhow::Result<impl Iterator<Item = Net>> {
     let finders = NetFinder::new(cuboids)?;
 
     Ok(run(cuboids, finders, HashSet::new()))
@@ -779,8 +764,7 @@ fn update_and_write_state(
     fs::rename(tmp_path, path).unwrap();
 }
 
-pub fn resume(mut cuboids: [Cuboid; 2]) -> anyhow::Result<impl Iterator<Item = Net>> {
-    sort_cuboids(&mut cuboids);
+pub fn resume(cuboids: [Cuboid; 2]) -> anyhow::Result<impl Iterator<Item = Net>> {
     let file = File::open(state_path(&cuboids)).context("no state to resume from")?;
     let state: State = serde_json::from_reader(BufReader::new(file))?;
     Ok(run(cuboids, state.finders, state.yielded_nets))
