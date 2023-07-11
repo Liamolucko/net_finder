@@ -4,12 +4,10 @@ use std::{collections::VecDeque, hash::Hash, mem};
 
 use crate::{Cuboid, CursorData, Direction, Face, Net, Pos};
 
-use rayon::{
-    iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer},
-    prelude::ParallelIterator,
-};
+use rayon::prelude::ParallelIterator;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use spliter::{ParallelSpliterator, Spliterator};
 use Direction::*;
 
 use self::geometry::{Edge, Rotation, Vertex};
@@ -182,9 +180,8 @@ impl Zdd {
         // of vertices every time.
         let vertex_indices = self.vertex_indices();
 
-        Iterator::map(self.edges(), move |edges| {
-            net_from_edges(self.cuboid, edges, &vertex_indices)
-        })
+        self.edges()
+            .map(move |edges| net_from_edges(self.cuboid, edges, &vertex_indices))
     }
 
     /// Returns a parallel iterator over the list of nets that this ZDD
@@ -195,9 +192,9 @@ impl Zdd {
         // of vertices every time.
         let vertex_indices = self.vertex_indices();
 
-        ParallelIterator::map(self.edges(), move |edges| {
-            net_from_edges(self.cuboid, edges, &vertex_indices)
-        })
+        self.edges()
+            .par_split()
+            .map(move |edges| net_from_edges(self.cuboid, edges, &vertex_indices))
     }
 
     /// Returns the (approximate) amount of space this ZDD takes up on the heap.
@@ -310,13 +307,11 @@ impl Iterator for EdgeIter<'_> {
     }
 }
 
-impl UnindexedProducer for EdgeIter<'_> {
-    type Item = Vec<Edge>;
-
-    fn split(mut self) -> (Self, Option<Self>) {
+impl Spliterator for EdgeIter<'_> {
+    fn split(&mut self) -> Option<Self> {
         if self.endpoint().is_none() {
             // This iterator's already exhausted, don't bother splitting it.
-            return (self, None);
+            return None;
         }
 
         let old_split_point = self.split_point;
@@ -345,7 +340,7 @@ impl UnindexedProducer for EdgeIter<'_> {
                 // Don't bother splitting.
                 _ => {
                     self.split_point = old_split_point;
-                    return (self, None);
+                    return None;
                 }
             }
         }
@@ -360,7 +355,7 @@ impl UnindexedProducer for EdgeIter<'_> {
             // we do if we find a 1-node that we should be yielding?
             // It's a lot of hassle for what's probably a very rare case.
             self.split_point = old_split_point;
-            return (self, None);
+            return None;
         };
         let mut other = self.clone();
 
@@ -385,25 +380,7 @@ impl UnindexedProducer for EdgeIter<'_> {
         other.stack.push((node, false));
         other.split_point += 1;
 
-        (self, Some(other))
-    }
-
-    fn fold_with<F>(self, folder: F) -> F
-    where
-        F: Folder<Self::Item>,
-    {
-        folder.consume_iter(self)
-    }
-}
-
-impl ParallelIterator for EdgeIter<'_> {
-    type Item = Vec<Edge>;
-
-    fn drive_unindexed<C>(self, consumer: C) -> C::Result
-    where
-        C: UnindexedConsumer<Self::Item>,
-    {
-        bridge_unindexed(self, consumer)
+        Some(other)
     }
 }
 
