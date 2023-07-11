@@ -353,8 +353,9 @@ impl UnindexedProducer for EdgeIter<'_> {
         // Finally, we can use the two edges of the previous split point as the split
         // points for the two new iterators.
         let (split_point, _) = self.stack[self.split_point];
-        let (NodeRef::NextRow { index: index1 }, NodeRef::NextRow { index: index2 })
-            = (split_point.zero_edge(), split_point.one_edge()) else {
+        let (NodeRef::NextRow { index: index1 }, NodeRef::NextRow { index: index2 }) =
+            (split_point.zero_edge(), split_point.one_edge())
+        else {
             // We could try to traverse further to find a working split point, but what do
             // we do if we find a 1-node that we should be yielding?
             // It's a lot of hassle for what's probably a very rare case.

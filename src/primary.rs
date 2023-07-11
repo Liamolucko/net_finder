@@ -8,14 +8,16 @@ use std::{
     io::{BufReader, BufWriter},
     iter::zip,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError},
     thread,
     time::Duration,
 };
 
 use anyhow::{bail, Context};
+use rayon::prelude::ParallelIterator;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
+use spliter::{ParallelSpliterator, Spliterator};
 
 use crate::{Cuboid, CursorData, Direction, Mapping, MappingData, Net, Square, SquareCache};
 
@@ -46,6 +48,15 @@ pub struct NetFinder {
 
     /// The index of the next instruction in `queue` that will be evaluated.
     index: usize,
+    /// The index of the first instruction that isn't fixed: when we attempt to
+    /// backtrack past this, the `NetFinder` is finished.
+    ///
+    /// This becomes non-zero when splitting a `NetFinder` in two: if it's
+    /// `base_index` instruction hasn't already been backtracked, the existing
+    /// `NetFinder` has its `base_index` incremented by one, and it's the new
+    /// `NetFinder`'s job to explore all the possibilities where that
+    /// instruction isn't run.
+    base_index: usize,
     /// The size of the net so far.
     pub area: usize,
     pub target_area: usize,
@@ -66,6 +77,7 @@ enum InstructionState {
     /// An instruction which has not been run, either because:
     /// - We haven't gotten to it yet.
     /// - It's invalid.
+    /// - It's been backtracked.
     /// - It's been chosen as a 'potential' instruction to try at the end, which
     ///   doesn't have a separate state because it's possible for it to become
     ///   invalid later and so we'd need an extra check anyway.
@@ -210,6 +222,7 @@ impl NetFinder {
                     filled: [0; 2],
 
                     index: 0,
+                    base_index: 0,
                     area: 0,
                     target_area: cuboids[0].surface_area(),
                 }
@@ -225,15 +238,19 @@ impl NetFinder {
     /// there are no more available options.
     fn backtrack(&mut self) -> bool {
         // Find the last instruction that was successfully carried out.
-        let Some((last_success_index, instruction)) = self
-            .queue
-            .iter_mut()
-            .enumerate()
-            .rfind(|(_, instruction)| matches!(instruction.state, InstructionState::Completed { .. }))
+        let Some((last_success_index, instruction)) =
+            self.queue.iter_mut().enumerate().rfind(|(_, instruction)| {
+                matches!(instruction.state, InstructionState::Completed { .. })
+            })
         else {
-            return false
+            return false;
         };
-        let InstructionState::Completed { followup_index } = instruction.state else { unreachable!() };
+        if last_success_index < self.base_index {
+            return false;
+        }
+        let InstructionState::Completed { followup_index } = instruction.state else {
+            unreachable!()
+        };
         // Mark it as reverted.
         instruction.state = InstructionState::NotRun;
         self.pos_states[instruction.net_pos.0] = PosState::Queued {
@@ -568,6 +585,7 @@ impl NetFinder {
 }
 
 /// The iterator returned by `NetFinder::finalize`.
+#[derive(Clone)]
 enum Finalize {
     /// There's a single known solution, or no solution.
     Known(Option<Net>),
@@ -589,6 +607,7 @@ impl Iterator for Finalize {
 
 /// An iterator which tries all the combinations of the remaining valid
 /// potential squares and yields nets of the ones which work.
+#[derive(Clone)]
 struct FinishIter {
     net: Net,
     potential_squares: Vec<Instruction>,
@@ -703,6 +722,63 @@ pub struct State {
     pub yielded_nets: HashSet<Net>,
 }
 
+/// Updates the passed `state` with the most recently sent `NetFinder`s, then
+/// writes it out to a file.
+fn update_and_write_state(
+    state: &mut State,
+    cuboids: [Cuboid; 2],
+    finder_receivers: &mut Vec<Receiver<NetFinder>>,
+    channel_rx: &mut Receiver<Receiver<NetFinder>>,
+) {
+    // Check if there are any neW `NetFinder`s we need to add to our list.
+    loop {
+        match channel_rx.try_recv() {
+            Err(TryRecvError::Empty) => break,
+            Ok(rx) => {
+                // There should always be an initial state for the `NetFinder` sent
+                // immediately after creating the channel.
+                let finder = rx.try_recv().unwrap();
+                state.finders.push(finder);
+                finder_receivers.push(rx);
+            }
+            Err(TryRecvError::Disconnected) => {
+                // If this was disconnected, the iterator must have been dropped. In that case
+                // break from the loop, since we want to write the final state with all the
+                // yielded nets.
+                break;
+            }
+        }
+    }
+
+    let mut i = 0;
+    while i < state.finders.len() {
+        match finder_receivers[i].try_recv() {
+            Ok(finder) => {
+                state.finders[i] = finder;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                // That `NetFinder` has finished; remove it from our lists.
+                state.finders.remove(i);
+                finder_receivers.remove(i);
+                // Skip over incrementing `i`, since `i` corresponds to the next
+                // `NetFinder` in the list now that we're removed one.
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    let path = state_path(&cuboids);
+    // Initially write to a temporary file so that the previous version is still
+    // there if we get Ctrl+C'd while writing or something like that.
+    let tmp_path = path.with_extension("json.tmp");
+    let file = File::create(&tmp_path).unwrap();
+    serde_json::to_writer(BufWriter::new(file), &state).unwrap();
+    // Then move it to the real path.
+    fs::rename(tmp_path, path).unwrap();
+}
+
 pub fn resume(mut cuboids: [Cuboid; 2]) -> anyhow::Result<impl Iterator<Item = Net>> {
     sort_cuboids(&mut cuboids);
     let file = File::open(state_path(&cuboids)).context("no state to resume from")?;
@@ -710,12 +786,164 @@ pub fn resume(mut cuboids: [Cuboid; 2]) -> anyhow::Result<impl Iterator<Item = N
     Ok(run(cuboids, state.finders, state.yielded_nets))
 }
 
+/// A `NetFinder` stored alongside a channel so that it can be sent to another
+/// thread which will periodically save our current state.
+#[derive(Clone)]
+struct ActiveNetFinder {
+    finder: NetFinder,
+    /// A channel through which copies of `finder` are sent to be saved to a
+    /// file recording our current state.
+    finder_tx: SyncSender<NetFinder>,
+}
+
+impl ActiveNetFinder {
+    /// Splits this `ActiveNetFinder` in place, so that its work is now split
+    /// between `self` and the returned `ActiveNetFinder`.
+    ///
+    /// This also returns the receiving end of a channel through which copies of
+    /// the current state of the returned `ActiveNetFinder` will be sent.
+    ///
+    /// Returns `None` if this can't be done, in which case `self` is unchanged.
+    fn split(&mut self) -> Option<(ActiveNetFinder, Receiver<NetFinder>)> {
+        let mut new_base_index = self.finder.base_index + 1;
+        // Find the first instruction that this `NetFinder` controls which has been run,
+        // since that's what gets tried first and so that means that the other
+        // possibility hasn't been tried yet.
+        while self
+            .finder
+            .queue
+            // Remember, the base index is the index of the first instruction _after_ the ones that
+            // are fixed, so the one we're attempting to fix is the one _before_ the base index.
+            .get(new_base_index - 1)
+            .is_some_and(|instruction| {
+                !matches!(instruction.state, InstructionState::Completed { .. })
+            })
+        {
+            new_base_index += 1;
+        }
+        if new_base_index - 1 >= self.finder.queue.len() {
+            // We couldn't find one, so this can't be split.
+            None
+        } else {
+            // Create the new `NetFinder` by backtracking this one until the instruction at
+            // `new_base_index` hasn't been run.
+            let mut new_finder = self.finder.clone();
+            while matches!(
+                new_finder.queue[new_base_index - 1].state,
+                InstructionState::Completed { .. }
+            ) {
+                new_finder.backtrack();
+            }
+
+            self.finder.base_index = new_base_index;
+            new_finder.base_index = new_base_index;
+
+            // Now `self.finder` is responsible for the case where the instruction at
+            // `new_base_index` is run, and `new_finder` is responsible for the case where
+            // it isn't.
+
+            // Create the channel through which we send `NetFinder`s.
+            let (finder_tx, finder_rx) = mpsc::sync_channel(1);
+            finder_tx.send(new_finder.clone()).unwrap();
+
+            let new_finder = ActiveNetFinder {
+                finder: new_finder,
+                finder_tx,
+            };
+            Some((new_finder, finder_rx))
+        }
+    }
+}
+
+/// A `ParallelIterator` over a bunch of `NetFinder`s.
+#[derive(Clone)]
+struct NetIter {
+    finders: Vec<ActiveNetFinder>,
+    /// A channel through which the receiving ends of channels for sending the
+    /// states of newly created `NetFinder`s are sent.
+    channel_tx: Sender<Receiver<NetFinder>>,
+    /// A counter used to introduce a delay between when we try to send through
+    /// copies of our `NetFinder`s.
+    send_counter: u16,
+    /// Nets that we're currently in the process of yielding, or
+    /// `Finalize::Known(None)` initially.
+    yielding: Finalize,
+}
+
+impl Iterator for NetIter {
+    type Item = Net;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(net) = self.yielding.next() {
+                return Some(net);
+            }
+
+            // `yielding` either finished or was empty to begin with; find the next
+            // potential net and set `yielding` to it before looping back around.
+
+            // When we run out of `NetFinder`s, we're done.
+            let Some(ActiveNetFinder { finder, finder_tx }) = self.finders.get_mut(0) else {
+                return None;
+            };
+            while finder.area < finder.target_area && finder.index < finder.queue.len() {
+                // Evaluate the next instruction in the queue.
+                finder.handle_instruction();
+
+                self.send_counter = self.send_counter.wrapping_add(1);
+                if self.send_counter == 0 {
+                    let _ = finder_tx.try_send(finder.clone());
+                }
+            }
+
+            // We broke out of the loop, which means we've reached the end of the queue or
+            // the target area. So, finalize the current net to find solutions and set
+            // `self.yielding`.
+            self.yielding = finder.finalize();
+
+            // Now backtrack and look for more solutions. Note that `self.yielding` is
+            // untouched by this.
+            if !finder.backtrack() {
+                // Backtracking failed which means there are no solutions left, so this
+                // `NetFinder` is done.
+                self.finders.remove(0);
+            }
+        }
+    }
+}
+
+impl Spliterator for NetIter {
+    fn split(&mut self) -> Option<Self> {
+        let new_finders = if self.finders.len() > 1 {
+            // Since `NetFinder`s earlier in the list have more work to do, we split the
+            // list up into the first `NetFinder` and everything else.
+            Some(self.finders.split_off(1))
+        } else if let Some((finder, finder_rx)) =
+            self.finders.get_mut(0).and_then(|finder| finder.split())
+        {
+            self.channel_tx.send(finder_rx).unwrap();
+            Some(vec![finder])
+        } else {
+            None
+        };
+        new_finders.map(|finders| NetIter {
+            finders,
+            channel_tx: self.channel_tx.clone(),
+            send_counter: 0,
+            yielding: Finalize::Known(None),
+        })
+    }
+}
+
 fn run(
     cuboids: [Cuboid; 2],
     finders: Vec<NetFinder>,
-    mut yielded_nets: HashSet<Net>,
+    yielded_nets: HashSet<Net>,
 ) -> impl Iterator<Item = Net> {
-    let (net_tx, net_rx) = mpsc::channel();
+    // Create a channel for sending yielded nets to the main thread.
+    let (net_tx, net_rx) = mpsc::channel::<Net>();
+    // Create channels for sending the states of all our initial `NetFinder`s to the
+    // main thread, which will save them to a file.
     let (finder_senders, mut finder_receivers): (Vec<_>, Vec<_>) = finders
         .iter()
         .map(|_| {
@@ -724,99 +952,69 @@ fn run(
             mpsc::sync_channel::<NetFinder>(1)
         })
         .unzip();
-    for (mut finder, finder_tx) in zip(finders, finder_senders) {
-        let net_tx = net_tx.clone();
-        thread::spawn(move || {
-            // We start from the bottom-left of the bottom face of the cuboid, and work our
-            // way out from there. The net is aligned with the bottom face, so left, right,
-            // up, down on the net correspond to the same directions on the bottom face.
-            // From there they continue up other faces, e.g. left on the net can become up
-            // on the left face.
-            // We think of directions on each face as they appear from the inside.
+    // Then create a channel for sending the receiving ends of new such channels
+    // that get created down the line.
+    let (channel_tx, mut channel_rx) = mpsc::channel();
 
-            let mut send_counter: u16 = 0;
-            loop {
-                while finder.area < finder.target_area && finder.index < finder.queue.len() {
-                    // Evaluate the next instruction in the queue.
-                    finder.handle_instruction();
+    let iter = NetIter {
+        finders: zip(finders.clone(), finder_senders)
+            .map(|(finder, finder_tx)| ActiveNetFinder { finder, finder_tx })
+            .collect(),
+        channel_tx,
+        send_counter: 0,
+        yielding: Finalize::Known(None),
+    };
 
-                    send_counter = send_counter.wrapping_add(1);
-                    if send_counter == 0 {
-                        let _ = finder_tx.try_send(finder.clone());
-                    }
-                }
+    // Spin up the parallel iterator on another thread and send all the results
+    // through a channel.
+    //
+    // Even though rayon uses a thread pool, there unfortunately doesn't seem to be
+    // any way to do this without blocking the current thread, which is why we need
+    // to spawn a new one.
+    thread::Builder::new()
+        .name("iter thread".to_owned())
+        .spawn(move || {
+            iter.par_split()
+                .for_each_with(net_tx, |net_tx, net| net_tx.send(net.shrink()).unwrap());
+        })
+        .unwrap();
 
-                // We broke out of the loop, which means we've reached the end of the queue or
-                // the target area. So, finalize the current net to find solutions and yield
-                // them.
-                for net in finder.finalize() {
-                    if net_tx.send(net.shrink()).is_err() {
-                        // The receiver is gone, i.e. the iterator was dropped.
-                        return;
-                    }
-                }
+    // Create the folder where we're going to store our state.
+    fs::create_dir_all(Path::new(env!("CARGO_MANIFEST_DIR")).join("state")).unwrap();
 
-                // Now backtrack and look for more solutions.
-                if !finder.backtrack() {
-                    // Backtracking failed which means there are no solutions left, we're done.
-                    return;
-                }
-            }
-        });
-    }
+    let mut state = State {
+        finders,
+        yielded_nets: yielded_nets.clone(),
+    };
 
-    println!("threads spawned!");
-
-    let (yielded_nets_tx, yielded_nets_rx) = mpsc::channel();
-
-    let cuboids = cuboids.to_vec();
-    let yielded_nets_clone = yielded_nets.clone();
-    // Spawn a thread whose sole purpose is to periodically record our state to a
-    // file.
-    thread::spawn(move || {
-        // Create the folder where we're going to store our state.
-        fs::create_dir_all(Path::new(env!("CARGO_MANIFEST_DIR")).join("state")).unwrap();
-        let mut yielded_nets = yielded_nets_clone;
-        loop {
-            let finders: Vec<_> = finder_receivers
-                .iter_mut()
-                .filter_map(|rx| rx.recv().ok())
-                .collect();
-
-            while let Ok(net) = yielded_nets_rx.try_recv() {
-                yielded_nets.insert(net);
-            }
-
-            let path = state_path(&cuboids);
-            // Initially write to a temporary file so that the previous version is still
-            // there if we get Ctrl+C'd while writing or something like that.
-            let tmp_path = path.with_extension("json.tmp");
-            let file = File::create(&tmp_path).unwrap();
-            serde_json::to_writer(
-                BufWriter::new(file),
-                &State {
-                    finders,
-                    yielded_nets: yielded_nets.clone(),
-                },
-            )
-            .unwrap();
-            // Then move it to the real path.
-            fs::rename(tmp_path, path).unwrap();
-
-            // Wait 50ms before writing the state again.
-            thread::sleep(Duration::from_millis(50));
-        }
-    });
-
-    // Yield all our previous yielded nets before starting the new ones
+    // Yield all our previous yielded nets before starting the new ones.
     yielded_nets
-        .clone()
         .into_iter()
-        .chain(net_rx.into_iter().filter(move |net| {
-            let new = yielded_nets.insert(net.clone());
-            if new {
-                yielded_nets_tx.send(net.clone()).unwrap();
+        .chain(std::iter::from_fn(move || loop {
+            match net_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(net) => {
+                    let new = state.yielded_nets.insert(net.clone());
+                    if new {
+                        return Some(net);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => update_and_write_state(
+                    &mut state,
+                    cuboids,
+                    &mut finder_receivers,
+                    &mut channel_rx,
+                ),
+                Err(RecvTimeoutError::Disconnected) => {
+                    // Update the state with the final value of `yielded_nets`, since it serves as
+                    // our way of retrieving results afterwards.
+                    update_and_write_state(
+                        &mut state,
+                        cuboids,
+                        &mut finder_receivers,
+                        &mut channel_rx,
+                    );
+                    return None;
+                }
             }
-            new
         }))
 }
