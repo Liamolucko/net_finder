@@ -767,7 +767,7 @@ impl Size {
 
 // A direction in 2D space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Direction {
+pub enum Direction {
     Left,
     Up,
     Right,
@@ -912,18 +912,18 @@ pub(crate) enum Transform {
 /// instead of this type, since it's smaller and has quicker lookup of
 /// neighbouring squares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct SquareData {
+pub struct SquareData {
     /// The cuboid that this square is on.
-    cuboid: Cuboid,
+    pub cuboid: Cuboid,
     /// Which face this position is on.
-    face: Face,
+    pub face: Face,
     /// The position within the face.
-    pos: Pos,
+    pub pos: Pos,
 }
 
 impl SquareData {
     /// Creates a square representing (0, 0) on the bottom face of a cuboid.
-    fn new(cuboid: Cuboid) -> Self {
+    pub fn new(cuboid: Cuboid) -> Self {
         Self {
             cuboid,
             face: Bottom,
@@ -937,7 +937,7 @@ impl SquareData {
     /// Note that if the square changes face, its implicit orientation isn't
     /// preserved, since that can change between faces. You need `CursorData`
     /// for that.
-    fn move_in(&mut self, direction: Direction) {
+    pub fn move_in(&mut self, direction: Direction) {
         let success = self
             .pos
             .move_in(direction, self.cuboid.face_size(self.face));
@@ -966,7 +966,7 @@ impl SquareData {
     /// Note that if the square changes face, its implicit orientation isn't
     /// preserved, since that can change between faces. You need `CursorData`
     /// for that.
-    fn moved_in(mut self, direction: Direction) -> Self {
+    pub fn moved_in(mut self, direction: Direction) -> Self {
         self.move_in(direction);
         self
     }
@@ -1003,9 +1003,9 @@ impl SquareData {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CursorData {
     /// The square the cursor is on.
-    square: SquareData,
+    pub square: SquareData,
     /// The orientation of the cursor.
-    orientation: i8,
+    pub orientation: i8,
 }
 
 impl CursorData {
@@ -1338,8 +1338,8 @@ impl Cursor {
 /// This can also be used to indicate where a spot on the net maps to on each
 /// cuboid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct MappingData {
-    cursors: [CursorData; 2],
+pub struct MappingData {
+    pub cursors: [CursorData; 2],
 }
 
 impl MappingData {
@@ -1443,6 +1443,23 @@ impl MappingData {
 
         result
     }
+}
+
+/// Returns a list of equivalence classes of mappings which all lead to the same set of nets when used as starting positions.
+/// These classes should cover all possible mappings between the input cuboids.
+pub fn equivalence_classes(cuboids: [Cuboid; 2]) -> Vec<HashSet<MappingData>> {
+    let mut result: Vec<HashSet<MappingData>> = Vec::new();
+
+    for cursor in cuboids[1].unique_cursors() {
+        let mapping = MappingData::new(CursorData::new(cuboids[0]), cursor);
+
+        if !result.iter().any(|class| class.contains(&mapping)) {
+            // We've found a mapping that's in a new equivalence class. Add it to the list.
+            result.push(mapping.equivalents())
+        }
+    }
+
+    result
 }
 
 /// A mapping between the surfaces of two cuboids, implemented as a pair of

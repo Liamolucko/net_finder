@@ -19,7 +19,7 @@ use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use spliter::{ParallelSpliterator, Spliterator};
 
-use crate::{Cuboid, CursorData, Direction, Mapping, MappingData, Net, Square, SquareCache};
+use crate::{equivalence_classes, Cuboid, Direction, Mapping, Net, Square, SquareCache};
 
 use Direction::*;
 
@@ -164,26 +164,15 @@ impl NetFinder {
 
         // Divide all of the possible starting mappings up several equivalence classes
         // of mappings that will result in the same set of nets.
-        let mut equivalence_classes: Vec<FxHashSet<Mapping>> = Vec::new();
-
-        for cursor in cuboids[1].unique_cursors() {
-            let mapping_data = MappingData::new(CursorData::new(cuboids[0]), cursor);
-            let mapping = Mapping::from_data(&square_caches, &mapping_data);
-
-            if !equivalence_classes
-                .iter()
-                .any(|class| class.contains(&mapping))
-            {
-                // We've found a mapping that's in a new equivalence class. Add it to the list.
-                equivalence_classes.push(
-                    mapping_data
-                        .equivalents()
-                        .into_iter()
-                        .map(|mapping| Mapping::from_data(&square_caches, &mapping))
-                        .collect(),
-                )
-            }
-        }
+        let equivalence_classes: Vec<FxHashSet<Mapping>> = equivalence_classes(cuboids)
+            .into_iter()
+            .map(|class| {
+                class
+                    .into_iter()
+                    .map(|data| Mapping::from_data(&square_caches, &data))
+                    .collect()
+            })
+            .collect();
 
         // Then create one `NetFinder` per equivalence class.
         let finders = equivalence_classes
