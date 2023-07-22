@@ -1445,8 +1445,9 @@ impl MappingData {
     }
 }
 
-/// Returns a list of equivalence classes of mappings which all lead to the same set of nets when used as starting positions.
-/// These classes should cover all possible mappings between the input cuboids.
+/// Returns a list of equivalence classes of mappings which all lead to the same
+/// set of nets when used as starting positions. These classes should cover all
+/// possible mappings between the input cuboids.
 pub fn equivalence_classes(cuboids: [Cuboid; 2]) -> Vec<HashSet<MappingData>> {
     let mut result: Vec<HashSet<MappingData>> = Vec::new();
 
