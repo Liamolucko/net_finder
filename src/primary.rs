@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering::Relaxed},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError},
         Arc,
     },
     thread,
@@ -809,15 +809,11 @@ pub fn resume(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net> + 
 fn run_finder<'scope>(
     mut finder: NetFinder,
     net_tx: Sender<Net>,
+    finder_tx: SyncSender<NetFinder>,
     channel_tx: Sender<Receiver<NetFinder>>,
     scope: &rayon::Scope<'scope>,
     current_finders: &'scope AtomicUsize,
 ) {
-    // Make a channel to perodically send our state through.
-    let (finder_tx, finder_rx) = mpsc::sync_channel(1);
-    finder_tx.send(finder.clone()).unwrap();
-    channel_tx.send(finder_rx).unwrap();
-
     let mut send_counter: u16 = 0;
     loop {
         while finder.area < finder.target_area && finder.index < finder.queue.len() {
@@ -827,13 +823,22 @@ fn run_finder<'scope>(
             send_counter = send_counter.wrapping_add(1);
             if send_counter == 0 {
                 let _ = finder_tx.try_send(finder.clone());
-                if current_finders.load(Relaxed) < rayon::current_num_threads() {
+                if current_finders.load(Relaxed) < rayon::current_num_threads() + 1 {
                     // Split this `NetFinder` if there aren't currently enough of them to give all
                     // our threads something to do.
                     if let Some(finder) = finder.split() {
+                        current_finders.fetch_add(1, Relaxed);
+
+                        // Make a `finder_tx` for the new `NetFinder` to use.
+                        let (finder_tx, finder_rx) = mpsc::sync_channel(1);
+                        finder_tx.send(finder.clone()).unwrap();
+                        channel_tx.send(finder_rx).unwrap();
+
                         let net_tx = net_tx.clone();
                         let channel_tx = channel_tx.clone();
-                        scope.spawn(|s| run_finder(finder, net_tx, channel_tx, s, current_finders))
+                        scope.spawn(|s| {
+                            run_finder(finder, net_tx, finder_tx, channel_tx, s, current_finders)
+                        });
                     }
                 }
             }
@@ -849,6 +854,7 @@ fn run_finder<'scope>(
         // Now backtrack and look for more solutions.
         if !finder.backtrack() {
             // Backtracking failed which means there are no solutions left and we're done.
+            current_finders.fetch_sub(1, Relaxed);
             return;
         }
     }
@@ -861,26 +867,30 @@ fn run(
 ) -> impl Iterator<Item = Net> + '_ {
     // Create a channel for sending yielded nets to the main thread.
     let (net_tx, net_rx) = mpsc::channel::<Net>();
-    // Create a channel through which we send the recieving ends of one channel per
-    // `NetFinder`, through which we periocially send copies of that `NetFinder` to
-    // be saved to a file.
+    // Create a channel for each `NetFinder` to periodically send its state through.
+    let (finder_senders, mut finder_receivers) = finders
+        .iter()
+        .map(|_| mpsc::sync_channel(1))
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+    // Then create a channel through which we send the receiving ends of new such channels.
     let (channel_tx, mut channel_rx) = mpsc::channel();
 
-    let current_finders = Arc::new(AtomicUsize::new(0));
+    let current_finders = Arc::new(AtomicUsize::new(finders.len()));
     thread::Builder::new()
         .name("scope thread".to_owned())
         .spawn({
-            let current_finders = current_finders.clone();
+            let finders = finders.clone();
             move || {
                 rayon::scope(|s| {
                     // Force these to get moved into the closure without moving `current_finders`
                     // into it as well (since then it gets dropped before the scope ends).
                     let net_tx = net_tx;
                     let channel_tx = channel_tx;
-                    for finder in finders {
+                    for (finder, finder_tx) in zip(finders, finder_senders) {
                         run_finder(
                             finder,
                             net_tx.clone(),
+                            finder_tx,
                             channel_tx.clone(),
                             s,
                             &current_finders,
@@ -895,12 +905,9 @@ fn run(
     fs::create_dir_all(Path::new(env!("CARGO_MANIFEST_DIR")).join("state")).unwrap();
 
     let mut state = State {
-        // Even though we already know the initial set of `NetFinder`s, we need the length of this
-        // to be consistent with `finder_receivers` so initialize it to empty.
-        finders: Vec::new(),
+        finders,
         yielded_nets: yielded_nets.clone(),
     };
-    let mut finder_receivers = Vec::new();
 
     // Yield all our previous yielded nets before starting the new ones.
     yielded_nets
@@ -931,6 +938,5 @@ fn run(
                     return None;
                 }
             }
-            current_finders.store(state.finders.len(), Relaxed);
         }))
 }
