@@ -1,8 +1,7 @@
 use std::time::Instant;
 
-use anyhow::anyhow;
 use clap::Parser;
-use net_finder::{find_nets, resume, Cuboid, Net};
+use net_finder::{find_nets, resume, Cuboid, Net, MAX_CUBOIDS};
 
 #[derive(Parser)]
 struct Options {
@@ -13,12 +12,7 @@ struct Options {
 
 fn main() -> anyhow::Result<()> {
     let options = Options::parse();
-    let cuboids: [Cuboid; 2] = options.cuboids.try_into().map_err(|_| {
-        anyhow!(
-            "`net_finder` can currently exclusively operate on a pair of cuboids. This could be \
-             changed if necessary but that's all it really needs to do right now."
-        )
-    })?;
+    assert!(options.cuboids.len() <= MAX_CUBOIDS);
 
     let mut count = 0;
     let start = Instant::now();
@@ -26,15 +20,15 @@ fn main() -> anyhow::Result<()> {
         count += 1;
         println!("#{count} after {:?}:", start.elapsed());
         let mut nets = vec![net.to_string()];
-        for cuboid in cuboids {
+        for &cuboid in options.cuboids.iter() {
             nets.push(net.color(cuboid).unwrap().to_string());
         }
         println!("{}\n", join_horizontal(nets));
     };
     if options.resume {
-        resume(cuboids)?.for_each(callback);
+        resume(&options.cuboids)?.for_each(callback);
     } else {
-        find_nets(cuboids)?.for_each(callback);
+        find_nets(&options.cuboids)?.for_each(callback);
     }
     println!("Number of nets: {count} (took {:?})", start.elapsed());
     Ok(())

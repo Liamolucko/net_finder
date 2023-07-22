@@ -19,11 +19,9 @@ fn main() {
         println!();
     }
 
-    if let Ok(cuboid_array) = cuboids.try_into() {
-        let equivalence_classes = equivalence_classes(cuboid_array);
-        println!("Equivalence classes:");
-        for (i, class) in equivalence_classes.iter().enumerate() {
-            println!("Class {}: {} members", i + 1, class.len());
-        }
+    let equivalence_classes = equivalence_classes(&cuboids);
+    println!("Equivalence classes:");
+    for (i, class) in equivalence_classes.iter().enumerate() {
+        println!("Class {}: {} members", i + 1, class.len());
     }
 }

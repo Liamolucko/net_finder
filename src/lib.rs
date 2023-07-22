@@ -2,7 +2,6 @@
 
 // This file contains infrastructure shared between `primary.rs` and `alt.rs`.
 
-use std::array;
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
@@ -12,11 +11,14 @@ use std::str::FromStr;
 use anyhow::{bail, Context};
 use arbitrary::Arbitrary;
 use serde::{Deserialize, Serialize};
+use tinyvec::ArrayVec;
 
 mod primary;
+mod utils;
 mod zdd;
 
 pub use primary::*;
+use utils::Combinations;
 pub use zdd::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1286,7 +1288,7 @@ impl Square {
 ///   position is an implicit cursor onto the net pointing upwards, and then
 ///   each cursor on the cuboids is the position that the cursor on the net
 ///   moves to when you fold the net up into each cuboid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Cursor(u8);
 
 impl Cursor {
@@ -1332,22 +1334,47 @@ impl Cursor {
     }
 }
 
+/// A buffer for storing which squares on the surface of a cuboid are filled.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct Surface(u64);
+
+impl Surface {
+    /// Creates a new `Surface` with no squares filled.
+    fn new() -> Self {
+        Self(0)
+    }
+
+    /// Returns whether a square on this surface is filled.
+    fn filled(&self, square: Square) -> bool {
+        self.0 & (1 << square.0) != 0
+    }
+
+    /// Sets whether a square on this surface is filled.
+    fn set_filled(&mut self, square: Square, value: bool) {
+        self.0 &= !(1 << square.0);
+        self.0 |= (value as u64) << square.0;
+    }
+
+    /// Returns the number of squares on this surface which are filled.
+    fn num_filled(&self) -> u32 {
+        self.0.count_ones()
+    }
+}
+
 /// A mapping between the surfaces of two cuboids, implemented as a pair of
 /// cursors.
 ///
 /// This can also be used to indicate where a spot on the net maps to on each
 /// cuboid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MappingData {
-    pub cursors: [CursorData; 2],
+    pub cursors: Vec<CursorData>,
 }
 
 impl MappingData {
     /// Creates a `MappingData` between two cursors.
-    fn new(cursor1: CursorData, cursor2: CursorData) -> Self {
-        Self {
-            cursors: [cursor1, cursor2],
-        }
+    fn new(cursors: Vec<CursorData>) -> Self {
+        Self { cursors }
     }
 
     /// Returns the list of mappings that are 'equivalent' to this one.
@@ -1370,19 +1397,18 @@ impl MappingData {
     /// we've got a mapping which is equivalent.
     fn equivalents(&self) -> HashSet<MappingData> {
         // First we get the list of equivalent cursors on each cuboid.
-        let equivalent_cursors = self.cursors.map(|cursor| cursor.equivalents());
+        let equivalent_cursors: Vec<_> = self
+            .cursors
+            .iter()
+            .map(|cursor| cursor.equivalents())
+            .collect();
         // Then we create a mapping for every combination of those equivalent
         // cursors. This is a `HashSet` this time around because it's possible
         // for flipping to result in the same mapping we started with, and we
         // don't want any duplicates.
-        let mut result = HashSet::new();
-        for cursor1 in equivalent_cursors[0].iter().copied() {
-            for cursor2 in equivalent_cursors[1].iter().copied() {
-                result.insert(MappingData {
-                    cursors: [cursor1, cursor2],
-                });
-            }
-        }
+        let mut result: HashSet<MappingData> = Combinations::new(&equivalent_cursors)
+            .map(MappingData::new)
+            .collect();
 
         // Then try flipping both cuboids to get more equivalent mappings.
         // We have to store them in this intermediate `Vec` since we can't mutate
@@ -1391,7 +1417,7 @@ impl MappingData {
 
         // First try doing a horizontal flip around the cursors.
         for mapping in result.iter() {
-            let mut mapping = *mapping;
+            let mut mapping = mapping.clone();
             for cursor in mapping.cursors.iter_mut() {
                 let face_size = cursor.cuboid().face_size(cursor.square.face);
                 if cursor.orientation % 2 == 0 {
@@ -1411,7 +1437,7 @@ impl MappingData {
 
         // Then a vertical flip.
         for mapping in result.iter() {
-            let mut mapping = *mapping;
+            let mut mapping = mapping.clone();
             for cursor in mapping.cursors.iter_mut() {
                 let face_size = cursor.cuboid().face_size(cursor.square.face);
                 // This logic is the same as for horizontal flips but in reverse.
@@ -1429,7 +1455,7 @@ impl MappingData {
         // amounts to simultaneously incrementing both cursors' orientations.
         for mapping in result.iter() {
             for turns in 1..=3 {
-                let mut mapping = *mapping;
+                let mut mapping = mapping.clone();
                 for cursor in mapping.cursors.iter_mut() {
                     // The reason we have to AND this with `0b11` is so that the mapping
                     // de-duplication works properly: we need cursors with orientations of 0 and
@@ -1448,12 +1474,15 @@ impl MappingData {
 /// Returns a list of equivalence classes of mappings which all lead to the same
 /// set of nets when used as starting positions. These classes should cover all
 /// possible mappings between the input cuboids.
-pub fn equivalence_classes(cuboids: [Cuboid; 2]) -> Vec<HashSet<MappingData>> {
+pub fn equivalence_classes(cuboids: &[Cuboid]) -> Vec<HashSet<MappingData>> {
     let mut result: Vec<HashSet<MappingData>> = Vec::new();
 
-    for cursor in cuboids[1].unique_cursors() {
-        let mapping = MappingData::new(CursorData::new(cuboids[0]), cursor);
-
+    let cursor_choices: Vec<_> = cuboids
+        .iter()
+        .map(|cuboid| cuboid.unique_cursors())
+        .collect();
+    for combination in Combinations::new(&cursor_choices) {
+        let mapping = MappingData::new(combination);
         if !result.iter().any(|class| class.contains(&mapping)) {
             // We've found a mapping that's in a new equivalence class. Add it to the list.
             result.push(mapping.equivalents())
@@ -1463,31 +1492,32 @@ pub fn equivalence_classes(cuboids: [Cuboid; 2]) -> Vec<HashSet<MappingData>> {
     result
 }
 
+/// The maximum number of cuboids supported by `Mapping` (i.e., the size of its internal `ArrayVec`).
+pub const MAX_CUBOIDS: usize = 3;
+
 /// A mapping between the surfaces of two cuboids, implemented as a pair of
 /// cursors.
 ///
 /// This can also be used to indicate where a spot on the net maps to on each
 /// cuboid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-// Aligning this to two bytes lets the compiler bitwise-encode it as a `u16`, making things faster.
-#[repr(align(2))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Mapping {
-    cursors: [Cursor; 2],
+    cursors: ArrayVec<[Cursor; MAX_CUBOIDS]>,
 }
 
 impl Mapping {
     /// Creates a `Mapping` between two `Cursor`s.
-    fn new(cursor1: Cursor, cursor2: Cursor) -> Self {
-        Self {
-            cursors: [cursor1, cursor2],
-        }
+    fn new(cursors: ArrayVec<[Cursor; MAX_CUBOIDS]>) -> Self {
+        Self { cursors }
     }
 
     /// Creates a `Mapping` from a `MappingData`, given the square caches for
-    /// the two cursors in order.
-    fn from_data(caches: &[SquareCache; 2], data: &MappingData) -> Self {
+    /// all the cursors in order.
+    fn from_data(caches: &[SquareCache], data: &MappingData) -> Self {
         Self {
-            cursors: array::from_fn(|i| Cursor::from_data(&caches[i], &data.cursors[i])),
+            cursors: zip(caches, &data.cursors)
+                .map(|(cache, data)| Cursor::from_data(cache, data))
+                .collect(),
         }
     }
 }
@@ -1600,1038 +1630,1038 @@ mod tests {
             ])
         );
 
-        let mapping1 = MappingData::new(cursor1, cursor2);
+        let mapping1 = MappingData::new(vec![cursor1, cursor2]);
         let expected_equivalents = hash_set([
             // First, there are all the direction combinations of equivalents of `cursor1` and
             // `cursor2`.
-            MappingData::new(
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 1, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 0, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 1, 2, 3),
-            ),
+            ]),
             // Then, by performing a vertical flip you get a slightly different version of each of
             // those combinations.
-            MappingData::new(
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 0, 2, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 1, 0, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 0, 2, 3),
-            ),
+            ]),
             // And _then_ there are the versions of all of those that you get by rotating both
             // cuboids at once.
-            MappingData::new(
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 0, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 1, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 1, 0, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 0, 2, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 0, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 1, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 1, 0, 3),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 0, 2, 1),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 0, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 1, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, West, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 3),
                 cursor(cuboid2, East, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, West, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 0),
                 cursor(cuboid2, East, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, West, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 1),
                 cursor(cuboid2, East, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, West, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Bottom, 0, 0, 2),
                 cursor(cuboid2, East, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, West, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 3),
                 cursor(cuboid2, East, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, West, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 0),
                 cursor(cuboid2, East, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, West, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 1),
                 cursor(cuboid2, East, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, West, 0, 2, 2),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 1, 0, 0),
-            ),
-            MappingData::new(
+            ]),
+            MappingData::new(vec![
                 cursor(cuboid1, Top, 0, 0, 2),
                 cursor(cuboid2, East, 0, 2, 2),
-            ),
+            ]),
         ]);
         assert_eq!(mapping1.equivalents(), expected_equivalents)
     }
