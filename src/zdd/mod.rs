@@ -402,7 +402,7 @@ fn net_from_edges(
     };
     let face_pos = CursorData::new(cuboid);
 
-    net.set(pos, true);
+    net[pos] = true;
     let mut area = 1;
 
     // Create a queue of places to try extruding squares.
@@ -415,7 +415,7 @@ fn net_from_edges(
         let new_pos = pos
             .moved_in(direction, net.size())
             .expect("this should have already been filtered out before adding to queue");
-        if net.filled(new_pos) {
+        if net[new_pos] {
             continue;
         }
         let new_face_pos = face_pos.moved_in(direction);
@@ -482,7 +482,7 @@ fn net_from_edges(
             continue;
         }
 
-        net.set(new_pos, true);
+        net[new_pos] = true;
         area += 1;
         if area > cuboid.surface_area() {
             panic!("Invalid edge set found: {edges:?}");
@@ -491,7 +491,7 @@ fn net_from_edges(
         // Then add the new spots we could extrude squares to the queue.
         for direction in [Left, Up, Right, Down] {
             if let Some(newer_pos) = new_pos.moved_in(direction, net.size()) {
-                if !net.filled(newer_pos) {
+                if !net[newer_pos] {
                     queue.push_back((new_pos, new_face_pos, direction));
                 }
             }
