@@ -279,7 +279,7 @@ impl NetFinder {
                             };
                             // We only consider it a real followup instruction if none of the
                             // squares it sets are already filled.
-                            if zip(&self.surfaces, &instruction.mapping.cursors)
+                            if zip(&self.surfaces, instruction.mapping.cursors())
                                 .all(|(surface, cursor)| !surface.filled(cursor.square()))
                             {
                                 followup = true;
@@ -341,7 +341,7 @@ impl NetFinder {
 
     /// Returns whether an instruction is valid to run.
     fn valid(&self, instruction: &Instruction) -> bool {
-        !zip(&self.surfaces, &instruction.mapping.cursors)
+        !zip(&self.surfaces, instruction.mapping.cursors())
             .any(|(surface, cursor)| surface.filled(cursor.square()))
             && !self.skip.contains(instruction.mapping)
             && matches!(
@@ -359,7 +359,7 @@ impl NetFinder {
     ) -> Option<Instruction> {
         let net_pos = instruction.net_pos.moved_in(direction, &self.net);
         let mut mapping = instruction.mapping.clone();
-        zip(&self.square_caches, &mut mapping.cursors)
+        zip(&self.square_caches, mapping.cursors_mut())
             .for_each(|(cache, cursor)| *cursor = cursor.moved_in(cache, direction));
         Some(Instruction {
             net_pos,
@@ -383,7 +383,7 @@ impl NetFinder {
             _ => {}
         }
         self.net[net_pos] = value;
-        for (surface, cursor) in zip(&mut self.surfaces, &mapping.cursors) {
+        for (surface, cursor) in zip(&mut self.surfaces, mapping.cursors()) {
             surface.set_filled(cursor.square(), value)
         }
     }
@@ -406,7 +406,7 @@ impl NetFinder {
         let mut surfaces = self.surfaces.clone();
         for instruction in self.potential.iter().map(|&index| &self.queue[index]) {
             if self.valid(instruction) {
-                for (surface, cursor) in zip(&mut surfaces, &instruction.mapping.cursors) {
+                for (surface, cursor) in zip(&mut surfaces, instruction.mapping.cursors()) {
                     surface.set_filled(cursor.square(), true);
                 }
             }
@@ -449,7 +449,7 @@ impl NetFinder {
                     // square that fills it.
                     found.clear();
                     for (i, instruction) in potential_squares.iter().enumerate() {
-                        if instruction.mapping.cursors[cuboid].square() == square {
+                        if instruction.mapping.cursors()[cuboid].square() == square {
                             // Note down the conflicts between this instruction and the rest in
                             // `found` so far, then add it to `found`.
                             conflicts[i].extend(found.iter().copied());

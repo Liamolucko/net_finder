@@ -12,7 +12,7 @@ struct Options {
 
 fn main() -> anyhow::Result<()> {
     let options = Options::parse();
-    assert!(options.cuboids.len() <= MAX_CUBOIDS);
+    assert!(options.cuboids.len() <= MAX_CUBOIDS.into());
 
     let mut count = 0;
     let start = Instant::now();

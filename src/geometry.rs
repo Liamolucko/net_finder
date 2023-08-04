@@ -10,7 +10,6 @@ use std::str::FromStr;
 use anyhow::{bail, Context};
 use arbitrary::Arbitrary;
 use serde::{Deserialize, Serialize};
-use tinyvec::ArrayVec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Cuboid {
@@ -1457,7 +1456,8 @@ impl MappingData {
             let face_size = cursor.cuboid().face_size(cursor.square.face);
             if cursor.orientation % 2 == 0 {
                 // If the cursor is pointing vertically relative to its face, that means that it
-                // agrees with what the face thinks is vertical, and we can just flip the y coordinate around.
+                // agrees with what the face thinks is vertical, and we can just flip the y
+                // coordinate around.
                 cursor.square.pos.y = face_size.height - cursor.square.pos.y - 1;
             } else {
                 // Otherwise, vertical relative to the cursor is horizontal relative to the
@@ -1544,32 +1544,49 @@ impl MappingData {
 
 /// The maximum number of cuboids supported by `Mapping` (i.e., the size of its
 /// internal `ArrayVec`).
-pub const MAX_CUBOIDS: usize = 3;
+pub const MAX_CUBOIDS: u8 = 3;
 
-/// A mapping between the surfaces of two cuboids, implemented as a pair of
+/// A mapping between the surfaces of multiple cuboids, implemented as a list of
 /// cursors.
 ///
 /// This can also be used to indicate where a spot on the net maps to on each
 /// cuboid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+// Aligning this to 4 bytes lets the compiler pack it into a 32-bit integer.
+#[repr(align(4))]
 pub struct Mapping {
-    pub cursors: ArrayVec<[Cursor; MAX_CUBOIDS]>,
+    cursors: [Cursor; MAX_CUBOIDS as usize],
+    len: u8,
 }
 
 impl Mapping {
-    /// Creates a `Mapping` between two `Cursor`s.
-    pub fn new(cursors: ArrayVec<[Cursor; MAX_CUBOIDS]>) -> Self {
-        Self { cursors }
+    /// Creates a `Mapping` between a slice of cursors. Panics if the slice's
+    /// length is greater than `MAX_CUBOIDS`.
+    pub fn new(cursors: &[Cursor]) -> Self {
+        let len = u8::try_from(cursors.len())
+            .ok()
+            .filter(|&len| len <= MAX_CUBOIDS)
+            .expect("too many cuboids");
+        let mut array = [Cursor(0); MAX_CUBOIDS as usize];
+        array[..len as usize].copy_from_slice(cursors);
+        Self {
+            cursors: array,
+            len,
+        }
     }
 
     /// Creates a `Mapping` from a `MappingData`, given the square caches for
     /// all the cursors in order.
     pub fn from_data(caches: &[SquareCache], data: &MappingData) -> Self {
-        Self {
-            cursors: zip(caches, &data.cursors)
-                .map(|(cache, data)| Cursor::from_data(cache, data))
-                .collect(),
+        let len = u8::try_from(data.cursors.len())
+            .ok()
+            .filter(|&len| len <= MAX_CUBOIDS)
+            .expect("too many cuboids");
+        let mut cursors = [Cursor(0); MAX_CUBOIDS as usize];
+        for (i, (cache, data)) in zip(caches, &data.cursors).enumerate() {
+            cursors[i] = Cursor::from_data(cache, data);
         }
+        Self { cursors, len }
     }
 
     pub fn to_data(&self, square_caches: &[SquareCache]) -> MappingData {
@@ -1578,6 +1595,14 @@ impl Mapping {
                 .map(|(cache, cursor)| cursor.to_data(cache))
                 .collect(),
         }
+    }
+
+    pub fn cursors(&self) -> &[Cursor] {
+        &self.cursors[..self.len as usize]
+    }
+
+    pub fn cursors_mut(&mut self) -> &mut [Cursor] {
+        &mut self.cursors[..self.len as usize]
     }
 }
 

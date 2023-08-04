@@ -19,7 +19,8 @@ pub use zdd::*;
 /// Returns a list of equivalence classes of mappings which all lead to the same
 /// set of nets when used as starting positions.
 ///
-/// All mappings between these cuboids can be categorised into one of these classes.
+/// All mappings between these cuboids can be categorised into one of these
+/// classes.
 pub fn equivalence_classes(cuboids: &[Cuboid], square_caches: &[SquareCache]) -> Vec<SkipSet> {
     let mut result: Vec<SkipSet> = Vec::new();
 
@@ -102,7 +103,7 @@ impl SkipSet {
     /// Returns whether `mapping` is contained within this set.
     pub fn contains(&self, mut mapping: Mapping) -> bool {
         // Replace all the mapping's cursors with their canonical versions.
-        for (lookup, cursor) in zip(&self.canon_lookups, &mut mapping.cursors) {
+        for (lookup, cursor) in zip(&self.canon_lookups, mapping.cursors_mut()) {
             *cursor = lookup[usize::from(cursor.0)];
         }
         // Then check if our inner set contains that canonicalised mapping.
@@ -113,7 +114,7 @@ impl SkipSet {
     /// this set.
     pub fn insert(&mut self, mut mapping: Mapping) {
         // Replace all the mapping's cursors with their canonical versions.
-        for (lookup, cursor) in zip(&self.canon_lookups, &mut mapping.cursors) {
+        for (lookup, cursor) in zip(&self.canon_lookups, mapping.cursors_mut()) {
             *cursor = lookup[usize::from(cursor.0)];
         }
         // Then insert it into the inner set.
@@ -128,7 +129,6 @@ impl SkipSet {
 
 #[cfg(test)]
 mod tests {
-
     use crate::{Cuboid, Mapping, SquareCache};
 
     #[test]
