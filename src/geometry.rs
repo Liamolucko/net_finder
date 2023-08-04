@@ -1111,6 +1111,64 @@ impl CursorData {
 
         result
     }
+
+    /// Returns the 'canonical' version of a cursor: that is, the equivalent of
+    /// it which gets returned by `Cuboid::unique_cursors`.
+    pub fn canon(mut self) -> Self {
+        // First move the cursor onto either the bottom, west or north face.
+        if matches!(self.square.face, East | South | Top) {
+            // As I mentioned in `equivalents`, simply reusing the same coordinates on the
+            // opposite face happens to work for rotating this cursor around onto the
+            // opposite face.
+            self.square.face = self.square.face.opposite();
+        }
+
+        // Then, move it onto the north face if it's the same size as the current face,
+        // or failing that the west face.
+        let new_face = if matches!(self.square.face, Bottom | West)
+            && (self.cuboid().face_size(self.square.face) == self.cuboid().face_size(North)
+                || self.cuboid().face_size(self.square.face)
+                    == self.cuboid().face_size(North).rotated(1))
+        {
+            Some(North)
+        } else if matches!(self.square.face, Bottom)
+            && (self.cuboid().face_size(self.square.face) == self.cuboid().face_size(West)
+                || self.cuboid().face_size(self.square.face)
+                    == self.cuboid().face_size(West).rotated(1))
+        {
+            Some(West)
+        } else {
+            None
+        };
+        if let Some(new_face) = new_face {
+            // Rotate the cursor's position to be correct on the new face.
+            let (_, turns) = self.square.face.direction_of(new_face).unwrap();
+            self.square
+                .pos
+                .rotate(turns, self.cuboid().face_size(self.square.face));
+            self.orientation = (self.orientation + turns) & 0b11;
+            // Then actually put it onto that face.
+            self.square.face = new_face;
+        }
+
+        // Finally, rotate the cursor around the face until it has the minimum possible
+        // orientation.
+        if self.cuboid().face_size(self.square.face).is_square() {
+            // The face is square, so we can rotate all the way around to orientation 0.
+            self.square
+                .pos
+                .rotate(-self.orientation, self.cuboid().face_size(self.square.face));
+            self.orientation = 0;
+        } else if self.orientation > 1 {
+            // Otherwise we can only rotate by 180 degrees.
+            self.square
+                .pos
+                .rotate(-2, self.cuboid().face_size(self.square.face));
+            self.orientation -= 2;
+        }
+
+        self
+    }
 }
 
 /// A cache of all the squares on the surface of a cuboid, along with a lookup
@@ -1356,6 +1414,60 @@ impl MappingData {
         Self { cursors }
     }
 
+    /// 'Flips' this mapping horizontally around its cursors on each cuboid.
+    ///
+    /// If you have all the cuboids positioned such that all the cursors are
+    /// touching, pointing upwards on the net, what this method does is flip
+    /// everything horizontally, then replace the cuboids with their unflipped
+    /// versions in the same position and take the positions of the cursors on
+    /// those cuboids.
+    ///
+    /// In terms of actually computing this, it amounts to setting each cursor's
+    /// x to `face.width - x - 1` (or the same for y if the cursor isn't
+    /// pointing up relative to its face).
+    pub fn horizontal_flip(&mut self) {
+        for cursor in self.cursors.iter_mut() {
+            let face_size = cursor.cuboid().face_size(cursor.square.face);
+            if cursor.orientation % 2 == 0 {
+                // If the cursor is pointing vertically relative to its face, that means that it
+                // agrees with what the face thinks is horizontal, and we can just flip the x
+                // coordinate around.
+                cursor.square.pos.x = face_size.width - cursor.square.pos.x - 1;
+            } else {
+                // Otherwise, horizontal relative to the cursor is vertical relative to the
+                // face, so we need to flip the y coordinate instead.
+                cursor.square.pos.y = face_size.height - cursor.square.pos.y - 1;
+            }
+        }
+    }
+
+    /// 'Flips' this mapping vertically around its cursors on each cuboid.
+    ///
+    /// If you have all the cuboids positioned such that all the cursors are
+    /// touching, pointing upwards on the net, what this method does is flip
+    /// everything vertically, then replace the cuboids with their unflipped
+    /// versions in the same position and take the positions of the cursors on
+    /// those cuboids.
+    ///
+    /// In terms of actually computing this, it amounts to setting each cursor's
+    /// y to `face.height - y - 1` (or the same for x if the cursor isn't
+    /// pointing up relative to its face), then flipping its orientation.
+    pub fn vertical_flip(&mut self) {
+        for cursor in self.cursors.iter_mut() {
+            let face_size = cursor.cuboid().face_size(cursor.square.face);
+            if cursor.orientation % 2 == 0 {
+                // If the cursor is pointing vertically relative to its face, that means that it
+                // agrees with what the face thinks is vertical, and we can just flip the y coordinate around.
+                cursor.square.pos.y = face_size.height - cursor.square.pos.y - 1;
+            } else {
+                // Otherwise, vertical relative to the cursor is horizontal relative to the
+                // face, so we need to flip the x coordinate instead.
+                cursor.square.pos.x = face_size.width - cursor.square.pos.x - 1;
+            }
+            cursor.orientation = (cursor.orientation + 2) & 0b11;
+        }
+    }
+
     /// Returns the list of mappings that are 'equivalent' to this one.
     ///
     /// In effect, a mapping that's equivalent to this one is any mapping which
@@ -1397,19 +1509,7 @@ impl MappingData {
         // First try doing a horizontal flip around the cursors.
         for mapping in result.iter() {
             let mut mapping = mapping.clone();
-            for cursor in mapping.cursors.iter_mut() {
-                let face_size = cursor.cuboid().face_size(cursor.square.face);
-                if cursor.orientation % 2 == 0 {
-                    // If the cursor is pointing vertically relative to its face, that means that it
-                    // agrees with what the face thinks is horizontal, and we can just flip the x
-                    // coordinate around.
-                    cursor.square.pos.x = face_size.width - cursor.square.pos.x - 1;
-                } else {
-                    // Otherwise, horizontal relative to the cursor is vertical relative to the
-                    // face, so we need to flip the y coordinate instead.
-                    cursor.square.pos.y = face_size.height - cursor.square.pos.y - 1;
-                }
-            }
+            mapping.horizontal_flip();
             batch.push(mapping);
         }
         result.extend(batch.drain(..));
@@ -1417,15 +1517,7 @@ impl MappingData {
         // Then a vertical flip.
         for mapping in result.iter() {
             let mut mapping = mapping.clone();
-            for cursor in mapping.cursors.iter_mut() {
-                let face_size = cursor.cuboid().face_size(cursor.square.face);
-                // This logic is the same as for horizontal flips but in reverse.
-                if cursor.orientation % 2 == 0 {
-                    cursor.square.pos.y = face_size.height - cursor.square.pos.y - 1;
-                } else {
-                    cursor.square.pos.x = face_size.width - cursor.square.pos.x - 1;
-                }
-            }
+            mapping.vertical_flip();
             batch.push(mapping);
         }
         result.extend(batch.drain(..));
@@ -1459,7 +1551,7 @@ pub const MAX_CUBOIDS: usize = 3;
 ///
 /// This can also be used to indicate where a spot on the net maps to on each
 /// cuboid.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Mapping {
     pub cursors: ArrayVec<[Cursor; MAX_CUBOIDS]>,
 }
@@ -1476,6 +1568,14 @@ impl Mapping {
         Self {
             cursors: zip(caches, &data.cursors)
                 .map(|(cache, data)| Cursor::from_data(cache, data))
+                .collect(),
+        }
+    }
+
+    pub fn to_data(&self, square_caches: &[SquareCache]) -> MappingData {
+        MappingData {
+            cursors: zip(square_caches, self.cursors)
+                .map(|(cache, cursor)| cursor.to_data(cache))
                 .collect(),
         }
     }
@@ -1579,6 +1679,23 @@ mod tests {
                         cursor.moved_in(&cache, direction),
                         Cursor::from_data(&cache, &cursor_data.moved_in(direction))
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canon() {
+        let cuboids = [
+            Cuboid::new(1, 2, 7),
+            Cuboid::new(1, 1, 7),
+            Cuboid::new(1, 3, 3),
+        ];
+        for cuboid in cuboids {
+            for canon in cuboid.unique_cursors() {
+                assert_eq!(canon.canon(), canon);
+                for cursor in canon.equivalents() {
+                    assert_eq!(cursor.canon(), canon);
                 }
             }
         }

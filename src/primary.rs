@@ -19,11 +19,11 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    equivalence_classes, Cuboid, Direction, Mapping, Net, NetPos, Pos, SquareCache, Surface,
+    equivalence_classes, Cuboid, Direction, Mapping, Net, NetPos, Pos, SkipSet, SquareCache,
+    Surface,
 };
 
 use Direction::*;
@@ -36,7 +36,7 @@ pub struct NetFinder {
     square_caches: Vec<SquareCache>,
     /// Mappings that we should skip over because they're the responsibility of
     /// another `NetFinder`.
-    skip: FxHashSet<Mapping>,
+    skip: SkipSet,
 
     queue: Vec<Instruction>,
     /// The indices of all the 'potential' instructions that we're saving until
@@ -150,20 +150,12 @@ impl NetFinder {
 
         // Divide all of the possible starting mappings up several equivalence classes
         // of mappings that will result in the same set of nets.
-        let equivalence_classes: Vec<FxHashSet<Mapping>> = equivalence_classes(&cuboids)
-            .into_iter()
-            .map(|class| {
-                class
-                    .into_iter()
-                    .map(|data| Mapping::from_data(&square_caches, &data))
-                    .collect()
-            })
-            .collect();
+        let equivalence_classes: Vec<SkipSet> = equivalence_classes(&cuboids, &square_caches);
 
         // Then create one `NetFinder` per equivalence class.
         let finders = equivalence_classes
             .iter()
-            .map(|class| class.iter().next().unwrap())
+            .map(|class| class.canon_mappings().next().unwrap())
             .enumerate()
             .map(|(i, start_mapping)| {
                 // The first instruction is to add the first square.
@@ -178,10 +170,13 @@ impl NetFinder {
                     mapping: queue[0].mapping.clone(),
                 };
                 // Skip all of the equivalence classes prior to this one.
-                let skip = equivalence_classes[..i]
-                    .iter()
-                    .flat_map(|class| class.iter().cloned())
-                    .collect();
+                let mut skip = SkipSet::new(&square_caches);
+                for class in &equivalence_classes[..i] {
+                    for mapping in class.canon_mappings() {
+                        skip.insert(mapping.clone());
+                    }
+                }
+
                 Self {
                     cuboids: cuboids.clone(),
                     square_caches: square_caches.clone(),
@@ -348,7 +343,7 @@ impl NetFinder {
     fn valid(&self, instruction: &Instruction) -> bool {
         !zip(&self.surfaces, &instruction.mapping.cursors)
             .any(|(surface, cursor)| surface.filled(cursor.square()))
-            && !self.skip.contains(&instruction.mapping)
+            && !self.skip.contains(instruction.mapping)
             && matches!(
                 self.pos_states[instruction.net_pos],
                 PosState::Queued { .. }
@@ -862,14 +857,11 @@ fn run(
                     let net_tx = net_tx;
                     let channel_tx = channel_tx;
                     for (finder, finder_tx) in zip(finders, finder_senders) {
-                        run_finder(
-                            finder,
-                            net_tx.clone(),
-                            finder_tx,
-                            channel_tx.clone(),
-                            s,
-                            &current_finders,
-                        )
+                        let net_tx = net_tx.clone();
+                        let channel_tx = channel_tx.clone();
+                        s.spawn(|s| {
+                            run_finder(finder, net_tx, finder_tx, channel_tx, s, &current_finders)
+                        })
                     }
                 });
             }

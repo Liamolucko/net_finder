@@ -1,5 +1,5 @@
 use clap::Parser;
-use net_finder::{equivalence_classes, Cuboid, Zdd};
+use net_finder::{equivalence_classes, Cuboid, SquareCache, Zdd};
 
 #[derive(Parser)]
 struct Options {
@@ -19,9 +19,17 @@ fn main() {
         println!();
     }
 
-    let equivalence_classes = equivalence_classes(&cuboids);
+    let square_caches: Vec<_> = cuboids
+        .iter()
+        .map(|&cuboid| SquareCache::new(cuboid))
+        .collect();
+    let equivalence_classes = equivalence_classes(&cuboids, &square_caches);
     println!("Equivalence classes:");
     for (i, class) in equivalence_classes.iter().enumerate() {
-        println!("Class {}: {} members", i + 1, class.len());
+        println!(
+            "Class {}: {} canon members",
+            i + 1,
+            class.canon_mappings().count()
+        );
     }
 }
