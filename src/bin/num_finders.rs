@@ -3,11 +3,16 @@
 use std::{fs::File, io::BufReader, path::PathBuf};
 
 use clap::Parser;
-use net_finder::State;
+use serde::{de::IgnoredAny, Deserialize};
 
 #[derive(Parser)]
 struct Args {
     path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct State {
+    finders: Vec<IgnoredAny>,
 }
 
 fn main() -> anyhow::Result<()> {

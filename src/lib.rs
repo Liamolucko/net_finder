@@ -128,7 +128,6 @@ impl SkipSet {
 
 #[cfg(test)]
 mod tests {
-    use std::iter::zip;
 
     use crate::{Cuboid, Mapping, SquareCache};
 
