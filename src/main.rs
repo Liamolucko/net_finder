@@ -1,8 +1,8 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use clap::Parser;
-use net_finder::{find_nets, resume, Cuboid, Solution, MAX_CUBOIDS};
+use net_finder::{find_nets, read_state, resume, Cuboid, Solution, MAX_CUBOIDS};
 
 #[derive(Parser)]
 struct Options {
@@ -26,11 +26,18 @@ fn main() -> anyhow::Result<()> {
         );
         println!("{solution}");
     };
-    if options.resume {
-        resume(&options.cuboids)?.for_each(callback);
+    let prior_search_time = if options.resume {
+        let state = read_state(&options.cuboids)?;
+        let prior_search_tiem = state.prior_search_time;
+        resume(state).for_each(callback);
+        prior_search_tiem
     } else {
         find_nets(&options.cuboids)?.for_each(callback);
-    }
-    println!("Number of nets: {count} (took {:?})", start.elapsed());
+        Duration::ZERO
+    };
+    println!(
+        "Number of nets: {count} (took {:?})",
+        prior_search_time + start.elapsed()
+    );
     Ok(())
 }

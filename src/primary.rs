@@ -838,15 +838,19 @@ fn update_and_write_state(
     fs::rename(tmp_path, path).unwrap();
 }
 
-pub fn resume(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Solution> + '_> {
+pub fn read_state(cuboids: &[Cuboid]) -> anyhow::Result<State> {
     let file = File::open(state_path(&cuboids)).context("no state to resume from")?;
-    let state: State = serde_json::from_reader(BufReader::new(file))?;
-    Ok(run(
-        cuboids,
+    let state = serde_json::from_reader(BufReader::new(file))?;
+    Ok(state)
+}
+
+pub fn resume(state: State) -> impl Iterator<Item = Solution> {
+    run(
+        state.finders[0].cuboids.clone().leak(),
         state.finders,
         state.solutions,
         state.prior_search_time,
-    ))
+    )
 }
 
 /// Runs a `NetFinder` to completion, sending its results and state updates
