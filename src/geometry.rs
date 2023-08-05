@@ -78,6 +78,17 @@ impl Cuboid {
     /// can be transformed into one another by rotating the cuboid, since then
     /// you just end up with the exact same solution net but with squares
     /// corresponding to different face positions.
+    ///
+    /// Flipping isn't allowed because... something to do with chirality, I
+    /// think? Yeah, because the way I visualise cursors is as a symmetric
+    /// arrow, I didn't realise that the cursor on the net was no longer
+    /// actually lined up with the one on the net after flipping - its chirality
+    /// was the other way around, which defines what left and right means, and
+    /// so moving left on the net meant moving right on the cuboid despite the
+    /// arrow pointing the same way. That's normally only supposed to happen if
+    /// they're pointing the opposite direction. So I wasn't actually doing the
+    /// 'snap the two cursors together' step properly; doing that would require
+    /// flipping the cuboid back around.
     pub fn unique_cursors(&self) -> Vec<CursorData> {
         let mut result = Vec::new();
 
