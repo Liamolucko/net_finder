@@ -20,14 +20,15 @@ fn main() -> anyhow::Result<()> {
     let state: State = serde_json::from_reader(BufReader::new(file))?;
 
     let mut serialized_nets = state
-        .yielded_nets
+        .solutions
         .into_iter()
-        .map(|net| {
+        .map(|solution| {
             // Convert the nets into a slightly nicer array-of-rows format instead of the
             // width + flat array format.
             // We also canonicalise and later sort all the nets so that everything's nice
             // and deterministic.
-            net.canon()
+            solution
+                .net
                 .rows()
                 .map(|row| row.to_owned())
                 .collect::<Vec<_>>()

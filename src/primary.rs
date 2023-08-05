@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashSet,
-    fmt::Write,
+    fmt::{self, Display, Formatter, Write},
     fs::{self, File},
     hash::{Hash, Hasher},
     io::{BufReader, BufWriter},
@@ -15,15 +15,15 @@ use std::{
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    equivalence_classes, Cuboid, Direction, Mapping, Net, NetPos, Pos, SkipSet, SquareCache,
-    Surface,
+    equivalence_classes, ColoredNet, Cuboid, Direction, Mapping, Net, NetPos, Pos, SkipSet,
+    SquareCache, Surface,
 };
 
 use Direction::*;
@@ -392,7 +392,10 @@ impl NetFinder {
     /// reached, goes through all of the unrun instructions to find which ones
     /// are valid, and figures out which combinations of them result in a valid
     /// net.
-    fn finalize(&self) -> Finalize {
+    ///
+    /// It also takes a `search_time` to be inserted into any `Solution`s it
+    /// yields.
+    fn finalize(&self, search_time: Duration) -> Finalize {
         if self.area + self.potential.len() < self.target_area {
             // If there aren't at least as many potential instructions as the number of
             // squares left to fill, there's no way that this could produce a valid net.
@@ -512,7 +515,15 @@ impl NetFinder {
             }
         }
 
-        // Make a net with all the included instructions filled in.
+        // Make a list of all the instructions that have been completed, including
+        // `included`.
+        let completed: Vec<_> = self
+            .queue
+            .iter()
+            .filter(|instruction| matches!(instruction.state, InstructionState::Completed { .. }))
+            .chain(included.iter().map(|&index| &potential_squares[index]))
+            .cloned()
+            .collect();
         let mut net = self.net.clone();
         for instruction in included.iter().map(|&index| &potential_squares[index]) {
             net[instruction.net_pos] = true;
@@ -522,7 +533,11 @@ impl NetFinder {
         let remaining_area = self.target_area - self.area - included.len();
         if remaining_area == 0 {
             // If we've already filled all the surface squares, we're done!
-            return Finalize::Known(Some(net));
+            return Finalize::Known(Some(Solution::new(
+                &self.square_caches,
+                completed.iter(),
+                search_time,
+            )));
         }
 
         if remaining.len() < remaining_area {
@@ -533,7 +548,10 @@ impl NetFinder {
         // Finally, we return an iterator which will just brute-force try all the
         // combinations of remaining squares.
         Finalize::Solve(FinishIter {
-            net,
+            square_caches: &self.square_caches,
+            completed,
+            search_time,
+
             potential_squares,
             remaining,
             conflicts,
@@ -586,18 +604,64 @@ impl NetFinder {
     }
 }
 
-/// The iterator returned by `NetFinder::finalize`.
-#[derive(Clone)]
-enum Finalize {
-    /// There's a single known solution, or no solution.
-    Known(Option<Net<bool>>),
-    /// There might be multiple solutions, and it's the inner `FinishIter`'s job
-    /// to find them.
-    Solve(FinishIter),
+/// A solution yielded from `NetFinder`: contains the actual net, as well as the
+/// colored versions for each cuboid and the time it was yielded.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Solution {
+    /// The solution (canonicalised).
+    pub net: Net,
+    /// The (canonicalised) colorings of the solution for each cuboid, as
+    /// `NetFinder` originally found them.
+    pub colored: Vec<ColoredNet>,
+    /// The time at which the solution was found.
+    pub time: SystemTime,
+    /// How long the program had been running for when this solution was found
+    /// (including previous runs of the program if the `NetFinder` had been
+    /// resumed, not including the time when the program wasn't running).
+    pub search_time: Duration,
 }
 
-impl Iterator for Finalize {
-    type Item = Net<bool>;
+impl Solution {
+    fn new<'a>(
+        square_caches: &[SquareCache],
+        instructions: impl Iterator<Item = &'a Instruction>,
+        search_time: Duration,
+    ) -> Self {
+        let cuboids: Vec<_> = square_caches.iter().map(|cache| cache.cuboid()).collect();
+        let mut net = Net::for_cuboids(&cuboids);
+        let mut colored = vec![Net::for_cuboids(&cuboids); cuboids.len()];
+        for instruction in instructions {
+            net[instruction.net_pos] = true;
+            for ((cache, colored_net), cursor) in square_caches
+                .iter()
+                .zip(&mut colored)
+                .zip(instruction.mapping.cursors())
+            {
+                colored_net[instruction.net_pos] = Some(cursor.square().to_data(cache).face);
+            }
+        }
+
+        Solution {
+            net: net.canon(),
+            colored: colored.iter().map(Net::canon).collect(),
+            time: SystemTime::now(),
+            search_time,
+        }
+    }
+}
+
+/// The iterator returned by `NetFinder::finalize`.
+#[derive(Clone)]
+enum Finalize<'a> {
+    /// There's a single known solution, or no solution.
+    Known(Option<Solution>),
+    /// There might be multiple solutions, and it's the inner `FinishIter`'s job
+    /// to find them.
+    Solve(FinishIter<'a>),
+}
+
+impl Iterator for Finalize<'_> {
+    type Item = Solution;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -610,8 +674,11 @@ impl Iterator for Finalize {
 /// An iterator which tries all the combinations of the remaining valid
 /// potential squares and yields nets of the ones which work.
 #[derive(Clone)]
-struct FinishIter {
-    net: Net<bool>,
+struct FinishIter<'a> {
+    square_caches: &'a [SquareCache],
+    completed: Vec<Instruction>,
+    search_time: Duration,
+
     potential_squares: Vec<Instruction>,
     conflicts: Vec<HashSet<usize>>,
     remaining: Vec<usize>,
@@ -619,7 +686,7 @@ struct FinishIter {
     next: Vec<usize>,
 }
 
-impl FinishIter {
+impl FinishIter<'_> {
     /// Returns whether the current combination we're trying has conflicts, or
     /// `None` if we've run out of combinations.
     fn has_conflicts(&self) -> Option<bool> {
@@ -661,27 +728,29 @@ impl FinishIter {
     }
 }
 
-impl Iterator for FinishIter {
-    type Item = Net<bool>;
+impl Iterator for FinishIter<'_> {
+    type Item = Solution;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.has_conflicts()? {
             self.advance();
         }
+
         // If we got here, we've found a set of instructions which don't conflict.
-        // Fill in their squares on the net and yield it.
-        let mut net = self.net.clone();
-        for instruction in self
-            .next
-            .iter()
-            .map(|&index| &self.potential_squares[self.remaining[index]])
-        {
-            net[instruction.net_pos] = true;
-        }
+        // Yield the solution they produce.
+        let solution = Solution::new(
+            &self.square_caches,
+            self.completed.iter().chain(
+                self.next
+                    .iter()
+                    .map(|&index| &self.potential_squares[self.remaining[index]]),
+            ),
+            self.search_time,
+        );
 
         self.advance();
 
-        Some(net)
+        Some(solution)
     }
 }
 
@@ -697,16 +766,17 @@ fn state_path(cuboids: &[Cuboid]) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
 }
 
-pub fn find_nets(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net> + '_> {
+pub fn find_nets(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Solution> + '_> {
     let finders = NetFinder::new(cuboids.to_vec())?;
 
-    Ok(run(&cuboids, finders, HashSet::new()))
+    Ok(run(&cuboids, finders, Vec::new(), Duration::ZERO))
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct State {
     pub finders: Vec<NetFinder>,
-    pub yielded_nets: HashSet<Net>,
+    pub solutions: Vec<Solution>,
+    pub prior_search_time: Duration,
 }
 
 /// Updates the passed `state` with the most recently sent `NetFinder`s, then
@@ -716,7 +786,9 @@ fn update_and_write_state(
     cuboids: &[Cuboid],
     finder_receivers: &mut Vec<Receiver<NetFinder>>,
     channel_rx: &mut Receiver<Receiver<NetFinder>>,
+    search_time: Duration,
 ) {
+    state.prior_search_time = search_time;
     // Check if there are any neW `NetFinder`s we need to add to our list.
     loop {
         match channel_rx.try_recv() {
@@ -766,10 +838,15 @@ fn update_and_write_state(
     fs::rename(tmp_path, path).unwrap();
 }
 
-pub fn resume(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net> + '_> {
+pub fn resume(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Solution> + '_> {
     let file = File::open(state_path(&cuboids)).context("no state to resume from")?;
     let state: State = serde_json::from_reader(BufReader::new(file))?;
-    Ok(run(cuboids, state.finders, state.yielded_nets))
+    Ok(run(
+        cuboids,
+        state.finders,
+        state.solutions,
+        state.prior_search_time,
+    ))
 }
 
 /// Runs a `NetFinder` to completion, sending its results and state updates
@@ -777,11 +854,13 @@ pub fn resume(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Net> + 
 /// too low.
 fn run_finder<'scope>(
     mut finder: NetFinder,
-    net_tx: Sender<Net>,
+    net_tx: Sender<Solution>,
     finder_tx: SyncSender<NetFinder>,
     channel_tx: Sender<Receiver<NetFinder>>,
     scope: &rayon::Scope<'scope>,
     current_finders: &'scope AtomicUsize,
+    prior_search_time: Duration,
+    start: Instant,
 ) {
     let mut send_counter: u16 = 0;
     loop {
@@ -805,8 +884,17 @@ fn run_finder<'scope>(
 
                         let net_tx = net_tx.clone();
                         let channel_tx = channel_tx.clone();
-                        scope.spawn(|s| {
-                            run_finder(finder, net_tx, finder_tx, channel_tx, s, current_finders)
+                        scope.spawn(move |s| {
+                            run_finder(
+                                finder,
+                                net_tx,
+                                finder_tx,
+                                channel_tx,
+                                s,
+                                current_finders,
+                                prior_search_time,
+                                start,
+                            )
                         });
                     }
                 }
@@ -816,8 +904,8 @@ fn run_finder<'scope>(
         // We broke out of the loop, which means we've reached the end of the queue or
         // the target area. So, finalize the current net to find solutions and send them
         // off.
-        for net in finder.finalize() {
-            net_tx.send(net.shrink()).unwrap();
+        for solution in finder.finalize(prior_search_time + start.elapsed()) {
+            net_tx.send(solution).unwrap();
         }
 
         // Now backtrack and look for more solutions.
@@ -832,10 +920,11 @@ fn run_finder<'scope>(
 fn run(
     cuboids: &[Cuboid],
     finders: Vec<NetFinder>,
-    yielded_nets: HashSet<Net>,
-) -> impl Iterator<Item = Net> + '_ {
+    solutions: Vec<Solution>,
+    prior_search_time: Duration,
+) -> impl Iterator<Item = Solution> + '_ {
     // Create a channel for sending yielded nets to the main thread.
-    let (net_tx, net_rx) = mpsc::channel::<Net>();
+    let (net_tx, net_rx) = mpsc::channel::<Solution>();
     // Create a channel for each `NetFinder` to periodically send its state through.
     let (finder_senders, mut finder_receivers) = finders
         .iter()
@@ -846,6 +935,7 @@ fn run(
     let (channel_tx, mut channel_rx) = mpsc::channel();
 
     let current_finders = Arc::new(AtomicUsize::new(finders.len()));
+    let start = Instant::now();
     thread::Builder::new()
         .name("scope thread".to_owned())
         .spawn({
@@ -860,7 +950,16 @@ fn run(
                         let net_tx = net_tx.clone();
                         let channel_tx = channel_tx.clone();
                         s.spawn(|s| {
-                            run_finder(finder, net_tx, finder_tx, channel_tx, s, &current_finders)
+                            run_finder(
+                                finder,
+                                net_tx,
+                                finder_tx,
+                                channel_tx,
+                                s,
+                                &current_finders,
+                                prior_search_time,
+                                start,
+                            )
                         })
                     }
                 });
@@ -873,18 +972,27 @@ fn run(
 
     let mut state = State {
         finders,
-        yielded_nets: yielded_nets.clone(),
+        solutions: solutions.clone(),
+        prior_search_time: prior_search_time + start.elapsed(),
     };
 
-    // Yield all our previous yielded nets before starting the new ones.
-    yielded_nets
+    // Make a set of all the nets (not solutions! we don't care about the colorings
+    // and stuff) we've already yielded so that we don't yielded duplicates.
+    let mut yielded_nets: HashSet<Net> = solutions
+        .iter()
+        .map(|solution| solution.net.clone())
+        .collect();
+
+    // Yield all our previous solutions before starting the new ones.
+    solutions
         .into_iter()
         .chain(std::iter::from_fn(move || loop {
             match net_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(net) => {
-                    let new = state.yielded_nets.insert(net.clone());
+                Ok(solution) => {
+                    let new = yielded_nets.insert(solution.net.clone());
                     if new {
-                        return Some(net);
+                        state.solutions.push(solution.clone());
+                        return Some(solution);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => update_and_write_state(
@@ -892,6 +1000,7 @@ fn run(
                     cuboids,
                     &mut finder_receivers,
                     &mut channel_rx,
+                    prior_search_time + start.elapsed(),
                 ),
                 Err(RecvTimeoutError::Disconnected) => {
                     // Update the state with the final value of `yielded_nets`, since it serves as
@@ -901,9 +1010,38 @@ fn run(
                         cuboids,
                         &mut finder_receivers,
                         &mut channel_rx,
+                        prior_search_time + start.elapsed(),
                     );
                     return None;
                 }
             }
         }))
+}
+
+impl Display for Solution {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut nets = vec![self.net.to_string()];
+        for colored_net in self.colored.iter() {
+            nets.push(colored_net.to_string());
+        }
+        write!(f, "{}", join_horizontal(nets))
+    }
+}
+
+fn join_horizontal(strings: Vec<String>) -> String {
+    let mut lines: Vec<_> = strings.iter().map(|s| s.lines()).collect();
+    let mut out = String::new();
+    loop {
+        for (i, iter) in lines.iter_mut().enumerate() {
+            if i != 0 {
+                out += " ";
+            }
+            if let Some(line) = iter.next() {
+                out += line;
+            } else {
+                return out;
+            }
+        }
+        out += "\n";
+    }
 }

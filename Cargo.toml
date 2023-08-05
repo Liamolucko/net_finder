@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.66"
 arbitrary = "1.2.0"
+chrono = { version = "0.4.26", features = ["std", "clock"], default-features = false }
 clap = { version = "4.0.29", features = ["derive"] }
 indicatif = { version = "0.17.3", features = ["rayon"] }
 postcard = { version = "1.0.2", features = ["use-std"] }

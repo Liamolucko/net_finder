@@ -190,7 +190,7 @@ impl<T: Clone + Default> Iterator for Rotations<T> {
     }
 }
 
-impl PartialEq for Net<bool> {
+impl<T: Clone + Default + Filled + PartialEq> PartialEq for Net<T> {
     fn eq(&self, other: &Self) -> bool {
         let a = self.shrink();
         let b = other.shrink();
@@ -199,9 +199,9 @@ impl PartialEq for Net<bool> {
     }
 }
 
-impl Eq for Net<bool> {}
+impl<T: Clone + Default + Filled + Eq> Eq for Net<T> {}
 
-impl Hash for Net<bool> {
+impl<T: Clone + Default + Filled + Hash> Hash for Net<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Create the 'canonical' version of this net by finding the rotation which
         // results in the lexicographically 'largest' value of `squares`.
@@ -378,19 +378,38 @@ impl<T: Clone + Default> Net<T> {
     }
 }
 
-impl Net<bool> {
+/// A type which can represent either an empty spot or a filled-in square on a
+/// `Net`.
+pub trait Filled {
+    /// Whether `self` represents a filled-in square.
+    fn filled(&self) -> bool;
+}
+
+impl Filled for bool {
+    fn filled(&self) -> bool {
+        *self
+    }
+}
+
+impl<T> Filled for Option<T> {
+    fn filled(&self) -> bool {
+        self.is_some()
+    }
+}
+
+impl<T: Filled + Clone + Default> Net<T> {
     /// Return a copy of this net with the empty space removed from around it.
     pub fn shrink(&self) -> Self {
         let start_y = self
             .rows()
-            .position(|row| row.iter().map(|&square| square as usize).sum::<usize>() != 0);
+            .position(|row| row.iter().filter(|square| square.filled()).count() != 0);
         let Some(start_y) = start_y else {
             // The net contains no squares. Just return an empty net.
             return Net::new(0, 0);
         };
         let end_y = self
             .rows()
-            .rposition(|row| row.iter().map(|&square| square as usize).sum::<usize>() != 0)
+            .rposition(|row| row.iter().filter(|square| square.filled()).count() != 0)
             .unwrap()
             + 1;
 
@@ -400,7 +419,7 @@ impl Net<bool> {
             .skip(start_y)
             .map(|row| {
                 row.iter()
-                    .position(|&square| square)
+                    .position(|square| square.filled())
                     .unwrap_or(self.width().into())
             })
             .min()
@@ -409,7 +428,7 @@ impl Net<bool> {
             .rows()
             .take(end_y)
             .skip(start_y)
-            .map(|row| row.iter().rposition(|&square| square).unwrap_or(0) + 1)
+            .map(|row| row.iter().rposition(|square| square.filled()).unwrap_or(0) + 1)
             .max()
             .unwrap();
 
@@ -419,7 +438,7 @@ impl Net<bool> {
         );
 
         for (src, dst) in zip(self.rows().take(end_y).skip(start_y), result.rows_mut()) {
-            dst.copy_from_slice(&src[start_x..end_x])
+            dst.clone_from_slice(&src[start_x..end_x])
         }
 
         result
@@ -427,10 +446,21 @@ impl Net<bool> {
 
     pub fn canon(&self) -> Self {
         Rotations::new(self.shrink())
-            .max_by(|a, b| a.squares.as_slice().cmp(b.squares.as_slice()))
+            .max_by(|a, b| {
+                a.squares
+                    .iter()
+                    .map(Filled::filled)
+                    .cmp(b.squares.iter().map(Filled::filled))
+            })
             .unwrap()
     }
 
+    pub fn area(&self) -> usize {
+        self.squares.iter().filter(|square| square.filled()).count()
+    }
+}
+
+impl Net<bool> {
     /// Return a version of this net with its squares 'colored' with which faces
     /// they're on.
     pub fn color(&self, cuboid: Cuboid) -> Option<ColoredNet> {
@@ -557,10 +587,6 @@ impl Net<bool> {
             pos_map,
         ) && surface.num_filled() == u32::try_from(cuboid.surface_area()).unwrap()
     }
-
-    pub fn area(&self) -> usize {
-        self.squares.iter().filter(|&&square| square).count()
-    }
 }
 
 /// A version of `Net` which stores which face each of its squares are on.
@@ -568,7 +594,8 @@ pub type ColoredNet = Net<Option<Face>>;
 
 impl Display for ColoredNet {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for (i, row) in self.rows().rev().enumerate() {
+        let shrunk = self.shrink();
+        for (i, row) in shrunk.rows().rev().enumerate() {
             if i != 0 {
                 f.write_char('\n')?;
             }
@@ -1209,6 +1236,7 @@ impl SquareCache {
             cuboid.surface_area() <= 64,
             "`SquareCache` only supports up to 64 squares"
         );
+        assert!(cuboid.surface_area() > 0);
 
         let mut squares = Vec::new();
         for face in [Bottom, West, North, East, South, Top] {
@@ -1263,6 +1291,11 @@ impl SquareCache {
             .filter(|&squares| squares < 64)
             .expect("`SquareCache` contained more than 64 squares");
         (0..num_squares).map(Square)
+    }
+
+    /// Returns the cuboid this `SquareCache` is for.
+    pub fn cuboid(&self) -> Cuboid {
+        self.squares[0].cuboid
     }
 }
 
