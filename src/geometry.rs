@@ -738,7 +738,7 @@ impl NetPos {
     }
 
     /// Moves this position in `direction` on a given net.
-    pub fn moved_in(self, direction: Direction, net: &Net) -> Self {
+    pub fn moved_in<T>(self, direction: Direction, net: &Net<T>) -> Self {
         let new_index = match direction {
             Left => self.0 - 1,
             Up => self.0 + usize::from(net.width()),

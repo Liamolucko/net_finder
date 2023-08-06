@@ -45,7 +45,6 @@ pub struct NetFinder {
     /// Note that some of these may now be invalid.
     potential: Vec<usize>,
 
-    pub net: Net<bool>,
     /// Information about the state of each position in the net.
     pos_states: Net<PosState>,
     /// Buffers storing which squares we've filled on the surface of each cuboid
@@ -143,9 +142,6 @@ impl NetFinder {
             bail!("all passed cuboids must have the same surface area")
         }
 
-        let net = Net::for_cuboids(&cuboids);
-        let middle = Pos::new(net.width() / 2, net.height() / 2);
-
         let square_caches: Vec<_> = cuboids.iter().copied().map(SquareCache::new).collect();
 
         // Divide all of the possible starting mappings up several equivalence classes
@@ -158,17 +154,21 @@ impl NetFinder {
             .map(|class| class.canon_mappings().next().unwrap())
             .enumerate()
             .map(|(i, start_mapping)| {
+                let mut pos_states = Net::for_cuboids(&cuboids);
+                let middle = Pos::new(pos_states.width() / 2, pos_states.height() / 2);
+                let start_pos = NetPos::from_pos(&pos_states, middle);
+
                 // The first instruction is to add the first square.
-                let start_pos = NetPos::from_pos(&net, middle);
                 let queue = vec![Instruction {
                     net_pos: start_pos,
                     mapping: start_mapping.clone(),
                     state: InstructionState::NotRun,
                 }];
-                let mut pos_states = Net::new(net.width(), net.height());
+
                 pos_states[start_pos] = PosState::Queued {
                     mapping: queue[0].mapping.clone(),
                 };
+
                 // Skip all of the equivalence classes prior to this one.
                 let mut skip = SkipSet::new(&square_caches);
                 for class in &equivalence_classes[..i] {
@@ -185,7 +185,6 @@ impl NetFinder {
                     queue,
                     potential: Vec::new(),
 
-                    net: net.clone(),
                     pos_states,
                     surfaces: vec![Surface::new(); cuboids.len()],
 
@@ -225,7 +224,10 @@ impl NetFinder {
             mapping: instruction.mapping.clone(),
         };
         // Remove the square it added.
-        self.set_square(last_success_index, false);
+        for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
+            surface.set_filled(cursor.square(), false)
+        }
+        self.area -= 1;
         // Then remove all the instructions added as a result of this square.
         for instruction in self.queue.drain(followup_index..) {
             // Update the state of the net position the instruction wanted to set.
@@ -317,7 +319,10 @@ impl NetFinder {
                     followup_index: next_index,
                 };
                 self.pos_states[instruction.net_pos] = PosState::Filled;
-                self.set_square(self.index, true);
+                for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
+                    surface.set_filled(cursor.square(), true);
+                }
+                self.area += 1;
             } else {
                 // Remove any marker instructions that we added.
                 for instruction in self.queue.drain(next_index..) {
@@ -357,7 +362,7 @@ impl NetFinder {
         instruction: &Instruction,
         direction: Direction,
     ) -> Option<Instruction> {
-        let net_pos = instruction.net_pos.moved_in(direction, &self.net);
+        let net_pos = instruction.net_pos.moved_in(direction, &self.pos_states);
         let mut mapping = instruction.mapping.clone();
         zip(&self.square_caches, mapping.cursors_mut())
             .for_each(|(cache, cursor)| *cursor = cursor.moved_in(cache, direction));
@@ -366,26 +371,6 @@ impl NetFinder {
             mapping,
             state: InstructionState::NotRun,
         })
-    }
-
-    /// Set a square on the net and surfaces of the cuboids simultaneously,
-    /// specifying the square by the index of an instruction which sets it.
-    #[inline]
-    fn set_square(&mut self, instruction_index: usize, value: bool) {
-        let Instruction {
-            net_pos,
-            ref mapping,
-            ..
-        } = self.queue[instruction_index];
-        match (self.net[net_pos], value) {
-            (false, true) => self.area += 1,
-            (true, false) => self.area -= 1,
-            _ => {}
-        }
-        self.net[net_pos] = value;
-        for (surface, cursor) in zip(&mut self.surfaces, mapping.cursors()) {
-            surface.set_filled(cursor.square(), value)
-        }
     }
 
     /// This method, which should be called when the end of the queue is
@@ -524,10 +509,6 @@ impl NetFinder {
             .chain(included.iter().map(|&index| &potential_squares[index]))
             .cloned()
             .collect();
-        let mut net = self.net.clone();
-        for instruction in included.iter().map(|&index| &potential_squares[index]) {
-            net[instruction.net_pos] = true;
-        }
 
         // Calculate how many more squares we still need to fill.
         let remaining_area = self.target_area - self.area - included.len();
