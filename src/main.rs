@@ -1,7 +1,8 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Local};
 use clap::Parser;
+use indicatif::ProgressBar;
 use net_finder::{find_nets, read_state, resume, Cuboid, Solution, MAX_CUBOIDS};
 
 #[derive(Parser)]
@@ -15,29 +16,37 @@ fn main() -> anyhow::Result<()> {
     let options = Options::parse();
     assert!(options.cuboids.len() <= MAX_CUBOIDS.into());
 
-    let mut count = 0;
-    let start = Instant::now();
-    let callback = |solution: Solution| {
-        count += 1;
-        println!(
-            "#{count} after {:.3?} ({}):",
-            solution.search_time,
-            DateTime::<Local>::from(solution.time).format("at %r on %e %b")
-        );
-        println!("{solution}");
-    };
-    let prior_search_time = if options.resume {
-        let state = read_state(&options.cuboids)?;
-        let prior_search_tiem = state.prior_search_time;
-        resume(state).for_each(callback);
-        prior_search_tiem
+    let state = if options.resume {
+        Some(read_state(&options.cuboids)?)
     } else {
-        find_nets(&options.cuboids)?.for_each(callback);
-        Duration::ZERO
+        None
     };
-    println!(
-        "Number of nets: {count} (took {:?})",
-        prior_search_time + start.elapsed()
-    );
+
+    let prior_search_time = state
+        .as_ref()
+        .map_or(Duration::ZERO, |state| state.prior_search_time);
+    // Make a progress bar for `find_nets` to do with as it will.
+    let progress = ProgressBar::hidden().with_elapsed(prior_search_time);
+
+    let mut count = 0;
+    let callback = |solution: Solution| {
+        progress.suspend(|| {
+            count += 1;
+            println!(
+                "#{count} after {:.3?} ({}):",
+                solution.search_time,
+                DateTime::<Local>::from(solution.time).format("at %r on %e %b")
+            );
+            println!("{solution}");
+        });
+    };
+    if let Some(state) = state {
+        resume(state, progress.clone()).for_each(callback);
+    } else {
+        find_nets(&options.cuboids, progress.clone())?.for_each(callback);
+    }
+
+    progress.finish_and_clear();
+    println!("Number of nets: {count} (took {:?})", progress.elapsed());
     Ok(())
 }

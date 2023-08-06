@@ -20,6 +20,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -748,10 +749,13 @@ fn state_path(cuboids: &[Cuboid]) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(name)
 }
 
-pub fn find_nets(cuboids: &[Cuboid]) -> anyhow::Result<impl Iterator<Item = Solution> + '_> {
+pub fn find_nets(
+    cuboids: &[Cuboid],
+    progress: ProgressBar,
+) -> anyhow::Result<impl Iterator<Item = Solution> + '_> {
     let finders = NetFinder::new(cuboids.to_vec())?;
 
-    Ok(run(&cuboids, finders, Vec::new(), Duration::ZERO))
+    Ok(run(&cuboids, finders, Vec::new(), Duration::ZERO, progress))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -767,10 +771,11 @@ fn update_state(
     state: &mut State,
     finder_receivers: &mut Vec<Receiver<NetFinder>>,
     channel_rx: &mut Receiver<Receiver<NetFinder>>,
-    search_time: Duration,
+    progress: &ProgressBar,
 ) {
-    state.prior_search_time = search_time;
-    // Check if there are any neW `NetFinder`s we need to add to our list.
+    state.prior_search_time = progress.elapsed();
+
+    // Check if there are any new `NetFinder`s we need to add to our list.
     loop {
         match channel_rx.try_recv() {
             Err(TryRecvError::Empty) => break,
@@ -780,6 +785,7 @@ fn update_state(
                 let finder = rx.try_recv().unwrap();
                 state.finders.push(finder);
                 finder_receivers.push(rx);
+                progress.inc_length(1);
             }
             Err(TryRecvError::Disconnected) => {
                 // If this was disconnected, the iterator must have been dropped. In that case
@@ -801,6 +807,7 @@ fn update_state(
                 // That `NetFinder` has finished; remove it from our lists.
                 state.finders.remove(i);
                 finder_receivers.remove(i);
+                progress.inc(1);
                 // Skip over incrementing `i`, since `i` corresponds to the next
                 // `NetFinder` in the list now that we're removed one.
                 continue;
@@ -827,12 +834,13 @@ pub fn read_state(cuboids: &[Cuboid]) -> anyhow::Result<State> {
     Ok(state)
 }
 
-pub fn resume(state: State) -> impl Iterator<Item = Solution> {
+pub fn resume(state: State, progress: ProgressBar) -> impl Iterator<Item = Solution> {
     run(
         state.finders[0].cuboids.clone().leak(),
         state.finders,
         state.solutions,
         state.prior_search_time,
+        progress,
     )
 }
 
@@ -909,6 +917,7 @@ fn run(
     finders: Vec<NetFinder>,
     solutions: Vec<Solution>,
     prior_search_time: Duration,
+    progress: ProgressBar,
 ) -> impl Iterator<Item = Solution> + '_ {
     // Create a channel for sending yielded nets to the main thread.
     let (net_tx, net_rx) = mpsc::channel::<Solution>();
@@ -957,6 +966,13 @@ fn run(
     // Create the folder where we're going to store our state.
     fs::create_dir_all(Path::new(env!("CARGO_MANIFEST_DIR")).join("state")).unwrap();
 
+    progress.set_style(
+        ProgressStyle::with_template("{elapsed} {wide_bar} {pos} / {len} finders completed")
+            .unwrap(),
+    );
+    progress.set_length(finders.len().try_into().unwrap());
+    progress.set_draw_target(ProgressDrawTarget::stderr());
+
     // Put the state in a mutex so we can share it with the ctrl+c handler
     let state = Arc::new(Mutex::new(State {
         finders,
@@ -967,9 +983,12 @@ fn run(
     ctrlc::set_handler({
         let cuboids = cuboids.to_vec();
         let state = Arc::clone(&state);
+        let progress = progress.clone();
         move || {
-            eprintln!("Saving state...");
+            // Lock this first so that the main thread doesn't try to keep updating the progress bar.
             let state = state.lock().unwrap();
+            progress.finish_and_clear();
+            eprintln!("Saving state...");
             write_state(&state, &cuboids);
             exit(0);
         }
@@ -991,7 +1010,7 @@ fn run(
                 &mut state.lock().unwrap(),
                 &mut finder_receivers,
                 &mut channel_rx,
-                prior_search_time + start.elapsed(),
+                &progress,
             );
             // Stop waiting every 50ms to update `state` in case we get Ctrl+C'd.
             match net_rx.recv_timeout(Duration::from_millis(50)) {
