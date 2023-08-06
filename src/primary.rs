@@ -395,7 +395,7 @@ impl NetFinder {
     ///
     /// It also takes a `search_time` to be inserted into any `Solution`s it
     /// yields.
-    fn finalize(&self, search_time: Duration) -> Finalize {
+    fn finalize(&self, prior_search_time: Duration, start: Instant) -> Finalize {
         if self.area + self.potential.len() < self.target_area {
             // If there aren't at least as many potential instructions as the number of
             // squares left to fill, there's no way that this could produce a valid net.
@@ -536,7 +536,7 @@ impl NetFinder {
             return Finalize::Known(Some(Solution::new(
                 &self.square_caches,
                 completed.iter(),
-                search_time,
+                prior_search_time + start.elapsed(),
             )));
         }
 
@@ -550,7 +550,7 @@ impl NetFinder {
         Finalize::Solve(FinishIter {
             square_caches: &self.square_caches,
             completed,
-            search_time,
+            search_time: prior_search_time + start.elapsed(),
 
             potential_squares,
             remaining,
@@ -908,7 +908,7 @@ fn run_finder<'scope>(
         // We broke out of the loop, which means we've reached the end of the queue or
         // the target area. So, finalize the current net to find solutions and send them
         // off.
-        for solution in finder.finalize(prior_search_time + start.elapsed()) {
+        for solution in finder.finalize(prior_search_time, start) {
             net_tx.send(solution).unwrap();
         }
 
