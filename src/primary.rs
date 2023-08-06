@@ -9,10 +9,11 @@ use std::{
     iter::zip,
     mem,
     path::{Path, PathBuf},
+    process::exit,
     sync::{
         atomic::{AtomicUsize, Ordering::Relaxed},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError},
-        Arc,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant, SystemTime},
@@ -762,9 +763,8 @@ pub struct State {
 
 /// Updates the passed `state` with the most recently sent `NetFinder`s, then
 /// writes it out to a file.
-fn update_and_write_state(
+fn update_state(
     state: &mut State,
-    cuboids: &[Cuboid],
     finder_receivers: &mut Vec<Receiver<NetFinder>>,
     channel_rx: &mut Receiver<Receiver<NetFinder>>,
     search_time: Duration,
@@ -808,7 +808,9 @@ fn update_and_write_state(
         }
         i += 1;
     }
+}
 
+fn write_state(state: &State, cuboids: &[Cuboid]) {
     let path = state_path(&cuboids);
     // Initially write to a temporary file so that the previous version is still
     // there if we get Ctrl+C'd while writing or something like that.
@@ -955,14 +957,27 @@ fn run(
     // Create the folder where we're going to store our state.
     fs::create_dir_all(Path::new(env!("CARGO_MANIFEST_DIR")).join("state")).unwrap();
 
-    let mut state = State {
+    // Put the state in a mutex so we can share it with the ctrl+c handler
+    let state = Arc::new(Mutex::new(State {
         finders,
         solutions: solutions.clone(),
         prior_search_time: prior_search_time + start.elapsed(),
-    };
+    }));
+
+    ctrlc::set_handler({
+        let cuboids = cuboids.to_vec();
+        let state = Arc::clone(&state);
+        move || {
+            eprintln!("Saving state...");
+            let state = state.lock().unwrap();
+            write_state(&state, &cuboids);
+            exit(0);
+        }
+    })
+    .unwrap();
 
     // Make a set of all the nets (not solutions! we don't care about the colorings
-    // and stuff) we've already yielded so that we don't yielded duplicates.
+    // and stuff) we've already yielded so that we don't yield duplicates.
     let mut yielded_nets: HashSet<Net> = solutions
         .iter()
         .map(|solution| solution.net.clone())
@@ -972,31 +987,25 @@ fn run(
     solutions
         .into_iter()
         .chain(std::iter::from_fn(move || loop {
+            update_state(
+                &mut state.lock().unwrap(),
+                &mut finder_receivers,
+                &mut channel_rx,
+                prior_search_time + start.elapsed(),
+            );
+            // Stop waiting every 50ms to update `state` in case we get Ctrl+C'd.
             match net_rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(solution) => {
                     let new = yielded_nets.insert(solution.net.clone());
                     if new {
-                        state.solutions.push(solution.clone());
+                        state.lock().unwrap().solutions.push(solution.clone());
                         return Some(solution);
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => update_and_write_state(
-                    &mut state,
-                    cuboids,
-                    &mut finder_receivers,
-                    &mut channel_rx,
-                    prior_search_time + start.elapsed(),
-                ),
+                Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    // Update the state with the final value of `yielded_nets`, since it serves as
-                    // our way of retrieving results afterwards.
-                    update_and_write_state(
-                        &mut state,
-                        cuboids,
-                        &mut finder_receivers,
-                        &mut channel_rx,
-                        prior_search_time + start.elapsed(),
-                    );
+                    // Write out our final state, since it serves as our way of retrieving results afterwards.
+                    write_state(&state.lock().unwrap(), cuboids);
                     return None;
                 }
             }
