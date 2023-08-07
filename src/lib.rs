@@ -2,7 +2,7 @@
 
 // This file contains infrastructure shared between `primary.rs` and `alt.rs`.
 
-use std::iter::zip;
+use std::{array, iter::zip};
 
 mod geometry;
 mod primary;
@@ -21,8 +21,11 @@ pub use zdd::*;
 ///
 /// All mappings between these cuboids can be categorised into one of these
 /// classes.
-pub fn equivalence_classes(cuboids: &[Cuboid], square_caches: &[SquareCache]) -> Vec<SkipSet> {
-    let mut result: Vec<SkipSet> = Vec::new();
+pub fn equivalence_classes<const CUBOIDS: usize>(
+    cuboids: [Cuboid; CUBOIDS],
+    square_caches: &[SquareCache; CUBOIDS],
+) -> Vec<SkipSet<CUBOIDS>> {
+    let mut result: Vec<SkipSet<CUBOIDS>> = Vec::new();
 
     let cursor_choices: Vec<_> = cuboids
         .iter()
@@ -71,37 +74,35 @@ pub fn equivalence_classes(cuboids: &[Cuboid], square_caches: &[SquareCache]) ->
 /// the canon versions of the mapping's cursors and then checks if the mapping
 /// with those cursors is in the set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkipSet {
+pub struct SkipSet<const CUBOIDS: usize> {
     /// For each cuboid, a lookup table containing the canon version of every
     /// cursor on that cuboid.
-    canon_lookups: Vec<Vec<Cursor>>,
+    #[serde(with = "crate::utils::arrays")]
+    canon_lookups: [Vec<Cursor>; CUBOIDS],
     /// The set of mappings with canonical cursors.
-    inner: FxHashSet<Mapping>,
+    inner: FxHashSet<Mapping<CUBOIDS>>,
 }
 
-impl SkipSet {
+impl<const CUBOIDS: usize> SkipSet<CUBOIDS> {
     /// Creates a new `SkipSet` for mappings based on the given list of square
     /// caches.
-    pub fn new(square_caches: &[SquareCache]) -> Self {
+    pub fn new(square_caches: &[SquareCache; CUBOIDS]) -> Self {
+        let canon_lookups = array::from_fn(|i| {
+            let cache = &square_caches[i];
+            cache
+                .squares()
+                .flat_map(|square| (0..4).map(move |orientation| Cursor::new(square, orientation)))
+                .map(|cursor| Cursor::from_data(cache, &cursor.to_data(cache).canon()))
+                .collect()
+        });
         Self {
-            canon_lookups: square_caches
-                .iter()
-                .map(|cache| {
-                    cache
-                        .squares()
-                        .flat_map(|square| {
-                            (0..4).map(move |orientation| Cursor::new(square, orientation))
-                        })
-                        .map(|cursor| Cursor::from_data(cache, &cursor.to_data(cache).canon()))
-                        .collect()
-                })
-                .collect(),
+            canon_lookups,
             inner: FxHashSet::default(),
         }
     }
 
     /// Returns whether `mapping` is contained within this set.
-    pub fn contains(&self, mut mapping: Mapping) -> bool {
+    pub fn contains(&self, mut mapping: Mapping<CUBOIDS>) -> bool {
         // Replace all the mapping's cursors with their canonical versions.
         for (lookup, cursor) in zip(&self.canon_lookups, mapping.cursors_mut()) {
             *cursor = lookup[usize::from(cursor.0)];
@@ -112,7 +113,7 @@ impl SkipSet {
 
     /// Inserts a mapping and all of the mappings with equivalent cursors into
     /// this set.
-    pub fn insert(&mut self, mut mapping: Mapping) {
+    pub fn insert(&mut self, mut mapping: Mapping<CUBOIDS>) {
         // Replace all the mapping's cursors with their canonical versions.
         for (lookup, cursor) in zip(&self.canon_lookups, mapping.cursors_mut()) {
             *cursor = lookup[usize::from(cursor.0)];
@@ -122,7 +123,7 @@ impl SkipSet {
     }
 
     /// Returns an iterator over the inner list of canon mappings.
-    pub fn canon_mappings(&self) -> impl Iterator<Item = &Mapping> {
+    pub fn canon_mappings(&self) -> impl Iterator<Item = &Mapping<CUBOIDS>> {
         self.inner.iter()
     }
 }
@@ -134,11 +135,8 @@ mod tests {
     #[test]
     fn equivalence_classes() {
         let cuboids = [Cuboid::new(1, 1, 7), Cuboid::new(1, 3, 3)];
-        let square_caches: Vec<_> = cuboids
-            .iter()
-            .map(|&cuboid| SquareCache::new(cuboid))
-            .collect();
-        let equivalence_classes = super::equivalence_classes(&cuboids, &square_caches);
+        let square_caches = cuboids.map(SquareCache::new);
+        let equivalence_classes = super::equivalence_classes(cuboids, &square_caches);
         for class in equivalence_classes {
             for mapping in class.canon_mappings() {
                 let mapping_data = mapping.to_data(&square_caches);

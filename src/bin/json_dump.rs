@@ -7,11 +7,18 @@ use std::{
 };
 
 use clap::Parser;
-use net_finder::State;
+use net_finder::Solution;
+use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
 struct Args {
     path: PathBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+struct State {
+    // We only need this field, not the whole thing.
+    solutions: Vec<Solution>,
 }
 
 fn main() -> anyhow::Result<()> {

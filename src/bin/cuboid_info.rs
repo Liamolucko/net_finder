@@ -19,11 +19,18 @@ fn main() {
         println!();
     }
 
-    let square_caches: Vec<_> = cuboids
-        .iter()
-        .map(|&cuboid| SquareCache::new(cuboid))
-        .collect();
-    let equivalence_classes = equivalence_classes(&cuboids, &square_caches);
+    match cuboids.as_slice() {
+        &[] => run([]),
+        &[a] => run([a]),
+        &[a, b] => run([a, b]),
+        &[a, b, c] => run([a, b, c]),
+        _ => panic!("only up to 3 cuboids supported"),
+    }
+}
+
+fn run<const CUBOIDS: usize>(cuboids: [Cuboid; CUBOIDS]) {
+    let square_caches = cuboids.map(SquareCache::new);
+    let equivalence_classes = equivalence_classes(cuboids, &square_caches);
     println!("Equivalence classes:");
     for (i, class) in equivalence_classes.iter().enumerate() {
         println!(

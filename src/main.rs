@@ -1,9 +1,10 @@
 use std::time::Duration;
 
+use anyhow::bail;
 use chrono::{DateTime, Local};
 use clap::Parser;
 use indicatif::ProgressBar;
-use net_finder::{find_nets, read_state, resume, Cuboid, Solution, MAX_CUBOIDS};
+use net_finder::{read_state, Cuboid, Solution};
 
 #[derive(Parser)]
 struct Options {
@@ -14,10 +15,18 @@ struct Options {
 
 fn main() -> anyhow::Result<()> {
     let options = Options::parse();
-    assert!(options.cuboids.len() <= MAX_CUBOIDS.into());
+    match options.cuboids.as_slice() {
+        &[] => bail!("must specify at least 1 cuboid"),
+        &[a] => run([a], options.resume),
+        &[a, b] => run([a, b], options.resume),
+        &[a, b, c] => run([a, b, c], options.resume),
+        _ => bail!("only up to 3 cuboids are currently supported"),
+    }
+}
 
-    let state = if options.resume {
-        Some(read_state(&options.cuboids)?)
+fn run<const CUBOIDS: usize>(cuboids: [Cuboid; CUBOIDS], resume: bool) -> anyhow::Result<()> {
+    let state = if resume {
+        Some(read_state(cuboids)?)
     } else {
         None
     };
@@ -41,9 +50,9 @@ fn main() -> anyhow::Result<()> {
         });
     };
     if let Some(state) = state {
-        resume(state, progress.clone()).for_each(callback);
+        net_finder::resume(state, progress.clone()).for_each(callback);
     } else {
-        find_nets(&options.cuboids, progress.clone())?.for_each(callback);
+        net_finder::find_nets(cuboids, progress.clone())?.for_each(callback);
     }
 
     progress.finish_and_clear();

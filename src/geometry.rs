@@ -1,5 +1,6 @@
 //! Types for dealing with the geometry of cuboids.
 
+use std::array;
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
@@ -1586,10 +1587,6 @@ impl MappingData {
     }
 }
 
-/// The maximum number of cuboids supported by `Mapping` (i.e., the size of its
-/// internal `ArrayVec`).
-pub const MAX_CUBOIDS: u8 = 3;
-
 /// A mapping between the surfaces of multiple cuboids, implemented as a list of
 /// cursors.
 ///
@@ -1598,39 +1595,23 @@ pub const MAX_CUBOIDS: u8 = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 // Aligning this to 4 bytes lets the compiler pack it into a 32-bit integer.
 #[repr(align(4))]
-pub struct Mapping {
-    cursors: [Cursor; MAX_CUBOIDS as usize],
-    len: u8,
+pub struct Mapping<const CUBOIDS: usize> {
+    #[serde(with = "crate::utils::arrays")]
+    cursors: [Cursor; CUBOIDS],
 }
 
-impl Mapping {
-    /// Creates a `Mapping` between a slice of cursors. Panics if the slice's
-    /// length is greater than `MAX_CUBOIDS`.
-    pub fn new(cursors: &[Cursor]) -> Self {
-        let len = u8::try_from(cursors.len())
-            .ok()
-            .filter(|&len| len <= MAX_CUBOIDS)
-            .expect("too many cuboids");
-        let mut array = [Cursor(0); MAX_CUBOIDS as usize];
-        array[..len as usize].copy_from_slice(cursors);
-        Self {
-            cursors: array,
-            len,
-        }
+impl<const CUBOIDS: usize> Mapping<CUBOIDS> {
+    /// Creates a `Mapping` between an array of cursors.
+    pub fn new(cursors: [Cursor; CUBOIDS]) -> Self {
+        Self { cursors }
     }
 
     /// Creates a `Mapping` from a `MappingData`, given the square caches for
     /// all the cursors in order.
-    pub fn from_data(caches: &[SquareCache], data: &MappingData) -> Self {
-        let len = u8::try_from(data.cursors.len())
-            .ok()
-            .filter(|&len| len <= MAX_CUBOIDS)
-            .expect("too many cuboids");
-        let mut cursors = [Cursor(0); MAX_CUBOIDS as usize];
-        for (i, (cache, data)) in zip(caches, &data.cursors).enumerate() {
-            cursors[i] = Cursor::from_data(cache, data);
-        }
-        Self { cursors, len }
+    pub fn from_data(caches: &[SquareCache; CUBOIDS], data: &MappingData) -> Self {
+        assert_eq!(data.cursors.len(), CUBOIDS);
+        let cursors = array::from_fn(|i| Cursor::from_data(&caches[i], &data.cursors[i]));
+        Self { cursors }
     }
 
     pub fn to_data(&self, square_caches: &[SquareCache]) -> MappingData {
@@ -1642,11 +1623,11 @@ impl Mapping {
     }
 
     pub fn cursors(&self) -> &[Cursor] {
-        &self.cursors[..self.len as usize]
+        &self.cursors
     }
 
     pub fn cursors_mut(&mut self) -> &mut [Cursor] {
-        &mut self.cursors[..self.len as usize]
+        &mut self.cursors
     }
 }
 
