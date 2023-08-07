@@ -815,6 +815,8 @@ fn update_state(
         }
         i += 1;
     }
+
+    progress.tick();
 }
 
 fn write_state(state: &State, cuboids: &[Cuboid]) {
@@ -967,8 +969,10 @@ fn run(
     fs::create_dir_all(Path::new(env!("CARGO_MANIFEST_DIR")).join("state")).unwrap();
 
     progress.set_style(
-        ProgressStyle::with_template("{elapsed} {wide_bar} {pos} / {len} finders completed")
-            .unwrap(),
+        ProgressStyle::with_template(
+            "{elapsed_precise} {wide_bar} {pos} / {len} finders completed",
+        )
+        .unwrap(),
     );
     progress.set_length(finders.len().try_into().unwrap());
     progress.set_draw_target(ProgressDrawTarget::stderr());
