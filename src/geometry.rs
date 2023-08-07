@@ -792,6 +792,7 @@ use Direction::*;
 
 impl Direction {
     /// Returns `self` rotated by a given number of clockwise turns.
+    #[inline]
     pub fn turned(self, turns: i8) -> Self {
         match i8::wrapping_add(self as i8, turns) & 0b11 {
             0 => Left,
@@ -1374,22 +1375,26 @@ pub struct Cursor(pub(crate) u8);
 
 impl Cursor {
     /// Builds a cursor from a square and an orientation.
+    #[inline]
     pub fn new(square: Square, orientation: i8) -> Self {
         assert!(square.0 < 64);
         Self(square.0 << 2 | (orientation & 0b11) as u8)
     }
 
     /// Returns the square where this position is.
+    #[inline]
     pub fn square(self) -> Square {
         Square(self.0 >> 2)
     }
 
     /// Returns the orientation of this position.
+    #[inline]
     pub fn orientation(self) -> i8 {
         (self.0 & 0b11) as i8
     }
 
     /// Returns this cursor moved over by one in `direction`.
+    #[inline]
     pub fn moved_in(self, cache: &SquareCache, direction: Direction) -> Self {
         let cursor = cache.neighbour_lookup
             [usize::from(self.0 & 0b11111100) | direction.turned(self.orientation()) as usize];
@@ -1421,22 +1426,26 @@ pub struct Surface(u64);
 
 impl Surface {
     /// Creates a new `Surface` with no squares filled.
+    #[inline]
     pub fn new() -> Self {
         Self(0)
     }
 
     /// Returns whether a square on this surface is filled.
+    #[inline]
     pub fn filled(&self, square: Square) -> bool {
         self.0 & (1 << square.0) != 0
     }
 
     /// Sets whether a square on this surface is filled.
+    #[inline]
     pub fn set_filled(&mut self, square: Square, value: bool) {
         self.0 &= !(1 << square.0);
         self.0 |= (value as u64) << square.0;
     }
 
     /// Returns the number of squares on this surface which are filled.
+    #[inline]
     pub fn num_filled(&self) -> u32 {
         self.0.count_ones()
     }
