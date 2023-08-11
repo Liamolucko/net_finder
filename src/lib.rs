@@ -2,7 +2,7 @@
 
 // This file contains infrastructure shared between `primary.rs` and `alt.rs`.
 
-use std::{array, iter::zip};
+use std::{array, cmp::Reverse, iter::zip};
 
 mod geometry;
 mod primary;
@@ -87,7 +87,7 @@ pub fn equivalence_classes<const CUBOIDS: usize>(
     // Go through all the possible mappings we could fix and find the one which
     // results in the equivalence classes having the largest average size, since
     // this leads to the most mappings getting skipped.
-    (0..cuboids.len())
+    let mut result = (0..cuboids.len())
         .flat_map(|cuboid| {
             cuboids[cuboid]
                 .unique_cursors()
@@ -104,7 +104,11 @@ pub fn equivalence_classes<const CUBOIDS: usize>(
                 // one.
                 .then(b.len().cmp(&a.len()))
         })
-        .unwrap()
+        .unwrap();
+    // Then sort the equivalence classes in descending order of size, so that more
+    // mappings get skipped earlier on.
+    result.sort_by_key(|class| Reverse(class.canon_mappings().len()));
+    result
 }
 
 /// A set of mappings for a `NetFinder` to skip.
