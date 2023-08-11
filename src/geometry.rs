@@ -815,6 +815,19 @@ pub enum Face {
     Top,
 }
 
+impl Display for Face {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Bottom => "bottom",
+            West => "west",
+            North => "north",
+            East => "east",
+            South => "south",
+            Top => "top",
+        })
+    }
+}
+
 impl Face {
     /// Returns the face adjacent to this face in the given direction, as well
     /// as the amount of times you'll need to turn a position on the current
@@ -987,6 +1000,12 @@ impl SquareData {
     pub fn moved_in(mut self, direction: Direction) -> Self {
         self.move_in(direction);
         self
+    }
+}
+
+impl Display for SquareData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "({}, {}) on {}", self.pos.x, self.pos.y, self.face)
     }
 }
 
@@ -1207,6 +1226,12 @@ impl CursorData {
         }
 
         self
+    }
+}
+
+impl Display for CursorData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{} or. {}", self.square, self.orientation)
     }
 }
 
@@ -1593,6 +1618,27 @@ impl MappingData {
         result.extend(batch.drain(..));
 
         result
+    }
+
+    /// Returns the canonical orientation of `self` - the version of `self` with all its mapping rotated in tandem so that the first one has an orientation of 0.
+    pub fn canon_orientation(mut self) -> Self {
+        let turns = -self.cursors[0].orientation;
+        for cursor in self.cursors.iter_mut() {
+            cursor.orientation = (cursor.orientation - turns) & 0b11;
+        }
+        self
+    }
+}
+
+impl Display for MappingData {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for (i, cursor) in self.cursors.iter().enumerate() {
+            if i != 0 {
+                write!(f, " -> ")?;
+            }
+            write!(f, "{cursor}")?;
+        }
+        Ok(())
     }
 }
 
