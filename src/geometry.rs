@@ -1620,11 +1620,13 @@ impl MappingData {
         result
     }
 
-    /// Returns the canonical orientation of `self` - the version of `self` with all its mapping rotated in tandem so that the first one has an orientation of 0.
+    /// Returns the canonical orientation of `self` - the version of `self` with
+    /// all its mapping rotated in tandem so that the first one has an
+    /// orientation of 0.
     pub fn canon_orientation(mut self) -> Self {
         let turns = -self.cursors[0].orientation;
         for cursor in self.cursors.iter_mut() {
-            cursor.orientation = (cursor.orientation - turns) & 0b11;
+            cursor.orientation = (cursor.orientation + turns) & 0b11;
         }
         self
     }
