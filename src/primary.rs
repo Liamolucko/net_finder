@@ -997,7 +997,8 @@ fn run<const CUBOIDS: usize>(
         let state = Arc::clone(&state);
         let progress = progress.clone();
         move || {
-            // Lock this first so that the main thread doesn't try to keep updating the progress bar.
+            // Lock this first so that the main thread doesn't try to keep updating the
+            // progress bar.
             let state = state.lock().unwrap();
             progress.finish_and_clear();
             eprintln!("Saving state...");
@@ -1035,7 +1036,8 @@ fn run<const CUBOIDS: usize>(
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    // Write out our final state, since it serves as our way of retrieving results afterwards.
+                    // Write out our final state, since it serves as our way of retrieving results
+                    // afterwards.
                     write_state(&state.lock().unwrap(), cuboids);
                     return None;
                 }

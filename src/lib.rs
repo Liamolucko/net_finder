@@ -16,21 +16,22 @@ use serde::{Deserialize, Serialize};
 use utils::Combinations;
 pub use zdd::*;
 
-/// Returns a list of equivalence classes of mappings which all lead to the same
-/// set of nets when used as starting positions.
-///
-/// All mappings between these cuboids can be categorised into one of these
-/// classes.
-pub fn equivalence_classes<const CUBOIDS: usize>(
+/// Generates a list of equivalence classes out of all possible cursors on the
+/// given cuboids, except for the one specified by `fixed_cuboid`, which alweys
+/// uses `fixed_cursor` instead.
+pub fn equivalence_classes_inner<const CUBOIDS: usize>(
     cuboids: [Cuboid; CUBOIDS],
     square_caches: &[SquareCache; CUBOIDS],
+    fixed_cuboid: usize,
+    fixed_cursor: CursorData,
 ) -> Vec<SkipSet<CUBOIDS>> {
     let mut result: Vec<SkipSet<CUBOIDS>> = Vec::new();
 
-    let cursor_choices: Vec<_> = cuboids
+    let mut cursor_choices: Vec<_> = cuboids
         .iter()
         .map(|cuboid| cuboid.unique_cursors())
         .collect();
+    cursor_choices[fixed_cuboid] = vec![fixed_cursor];
     for combination in Combinations::new(&cursor_choices) {
         let mapping_data = MappingData::new(combination);
         let mapping = Mapping::from_data(square_caches, &mapping_data);
@@ -64,6 +65,48 @@ pub fn equivalence_classes<const CUBOIDS: usize>(
     result
 }
 
+/// Returns the average size of an equivalence class in a list of equivalence
+/// classes.
+pub fn avg_size<const CUBOIDS: usize>(classes: &[SkipSet<CUBOIDS>]) -> f64 {
+    let total_size = classes
+        .iter()
+        .map(|class| class.canon_mappings().len())
+        .sum::<usize>();
+    total_size as f64 / classes.len() as f64
+}
+
+/// Returns a list of equivalence classes of mappings which all lead to the same
+/// set of nets when used as starting positions.
+///
+/// This does not cover all possible mappings, just enough to make sure that we
+/// get all the solutions.
+pub fn equivalence_classes<const CUBOIDS: usize>(
+    cuboids: [Cuboid; CUBOIDS],
+    square_caches: &[SquareCache; CUBOIDS],
+) -> Vec<SkipSet<CUBOIDS>> {
+    // Go through all the possible mappings we could fix and find the one which
+    // results in the equivalence classes having the largest average size, since
+    // this leads to the most mappings getting skipped.
+    (0..cuboids.len())
+        .flat_map(|cuboid| {
+            cuboids[cuboid]
+                .unique_cursors()
+                .into_iter()
+                .map(move |cursor| {
+                    equivalence_classes_inner(cuboids, square_caches, cuboid, cursor)
+                })
+        })
+        .max_by(|a, b| {
+            avg_size(a)
+                .partial_cmp(&avg_size(b))
+                .unwrap()
+                // If two lists of equivalence classes have the same average size pick the shorter
+                // one.
+                .then(b.len().cmp(&a.len()))
+        })
+        .unwrap()
+}
+
 /// A set of mappings for a `NetFinder` to skip.
 ///
 /// This is better than storing a set of mappings directly because it only
@@ -73,6 +116,22 @@ pub fn equivalence_classes<const CUBOIDS: usize>(
 /// Internally, when checking if the set contains a mapping, this first looks up
 /// the canon versions of the mapping's cursors and then checks if the mapping
 /// with those cursors is in the set.
+///
+/// A potential future optimisation would be to do an additional
+/// canonicalisation step of rotating the cursors in tandem until the first one
+/// is orientation 0. However this would make equivalence class optimisation
+/// annoying because `canon_mappings().len()` would no longer correspond
+/// directly to the number of actual cursors represented by the mapping.
+///
+/// It does so currently because the number of equivalent cursors for any cursor
+/// is constant across a cuboid: if all the dimensions are different, each
+/// cursor has 4 equivalents; if two of the dimensions are the same, they have
+/// 8; and if all of them are the same, they have 24.
+///
+/// On the other hand, while discarding different orientations can collapse *up
+/// to* 4 mappings into 1, it can be less if cursors are equivalent to rotations
+/// of themselves (which I believe can only happen if they're in the middle of a
+/// face).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkipSet<const CUBOIDS: usize> {
     /// For each cuboid, a lookup table containing the canon version of every
@@ -123,7 +182,7 @@ impl<const CUBOIDS: usize> SkipSet<CUBOIDS> {
     }
 
     /// Returns an iterator over the inner list of canon mappings.
-    pub fn canon_mappings(&self) -> impl Iterator<Item = &Mapping<CUBOIDS>> {
+    pub fn canon_mappings(&self) -> impl Iterator<Item = &Mapping<CUBOIDS>> + ExactSizeIterator {
         self.inner.iter()
     }
 }
