@@ -19,7 +19,7 @@ pub use zdd::*;
 /// Generates a list of equivalence classes out of all possible cursors on the
 /// given cuboids, except for the one specified by `fixed_cuboid`, which alweys
 /// uses `fixed_cursor` instead.
-pub fn equivalence_classes_inner<const CUBOIDS: usize>(
+fn equivalence_classes_inner<const CUBOIDS: usize>(
     cuboids: [Cuboid; CUBOIDS],
     square_caches: &[SquareCache; CUBOIDS],
     fixed_cuboid: usize,
@@ -67,7 +67,7 @@ pub fn equivalence_classes_inner<const CUBOIDS: usize>(
 
 /// Returns the average size of an equivalence class in a list of equivalence
 /// classes.
-pub fn avg_size<const CUBOIDS: usize>(classes: &[SkipSet<CUBOIDS>]) -> f64 {
+fn avg_size<const CUBOIDS: usize>(classes: &[SkipSet<CUBOIDS>]) -> f64 {
     let total_size = classes
         .iter()
         .map(|class| class.canon_mappings().len())
