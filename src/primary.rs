@@ -8,7 +8,6 @@ use std::{
     hash::{Hash, Hasher},
     io::{BufReader, BufWriter},
     iter::zip,
-    mem,
     path::{Path, PathBuf},
     process::exit,
     sync::{
@@ -83,7 +82,7 @@ struct Instruction<const CUBOIDS: usize> {
     state: InstructionState,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum InstructionState {
     /// An instruction which has not been run, either because:
     /// - We haven't gotten to it yet.
@@ -117,24 +116,44 @@ impl<const CUBOIDS: usize> Hash for Instruction<CUBOIDS> {
 }
 
 /// The status of a position on the net.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 enum PosState<const CUBOIDS: usize> {
-    /// There's nothing referencing this position in the queue.
+    /// This position could still map to anything.
     #[default]
-    Untouched,
-    /// There's an instruction in the queue that wants to map this position to
-    /// `cursors`.
-    Queued { mapping: Mapping<CUBOIDS> },
-    /// There are two instructions in the queue that want to map this position
-    /// to different positions. Any further instructions will see this and not
-    /// be added.
-    ///
-    /// `cursors` is the what the first instruction wants this net position to
-    /// map to, so that this can be restored to `Queued` if/when the second
-    /// instruction gets backtracked.
-    Invalid { mapping: Mapping<CUBOIDS> },
+    Unknown,
+    /// If this position gets set, it has to map to the given mapping.
+    Known {
+        /// The mapping this position is known to map to.
+        mapping: Mapping<CUBOIDS>,
+        /// The index of the first instruction to require that this position
+        /// maps to `mapping`.
+        ///
+        /// This is *not* the index of the instruction that actually attempts to
+        /// map this position to `mapping`; this is the index of its
+        /// parent. This is because that instruction might not have been valid,
+        /// and so didn't get added to the queue; but we still need to properly
+        /// record this `PosState` anyway, and so we instead keep track of the
+        /// parent and set this back to `Unknown` once it gets backtracked.
+        setter: usize,
+    },
+    /// This position can't be set because it's required to map to two different
+    /// mappings by different neighbouring positions.
+    Invalid {
+        /// The mapping that `setter` thinks this position should map to.
+        mapping: Mapping<CUBOIDS>,
+        /// The index of the earliest neighbouring instruction to this position.
+        setter: usize,
+        /// The index of the first instruction which tried to map this position
+        /// to something different from `setter`.
+        conflict: usize,
+    },
     /// This position is filled.
-    Filled,
+    Filled {
+        /// The mapping that this position maps to.
+        mapping: Mapping<CUBOIDS>,
+        /// The index of the earliest neighbouring instruction to this position.
+        setter: usize,
+    },
 }
 
 impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
@@ -171,8 +190,10 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
                     state: InstructionState::NotRun,
                 }];
 
-                pos_states[start_pos] = PosState::Queued {
+                pos_states[start_pos] = PosState::Known {
                     mapping: queue[0].mapping.clone(),
+                    // this is incorrect but it should be fine
+                    setter: 0,
                 };
 
                 // Skip all of the equivalence classes prior to this one.
@@ -221,32 +242,43 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
         if last_success_index < self.base_index {
             return false;
         }
-        let InstructionState::Completed { followup_index } = instruction.state else {
+        let (InstructionState::Completed { followup_index }, PosState::Filled { mapping, setter }) =
+            (instruction.state, self.pos_states[instruction.net_pos])
+        else {
             unreachable!()
         };
         // Mark it as reverted.
         instruction.state = InstructionState::NotRun;
-        self.pos_states[instruction.net_pos] = PosState::Queued {
-            mapping: instruction.mapping.clone(),
-        };
+        self.pos_states[instruction.net_pos] = PosState::Known { mapping, setter };
         // Remove the square it added.
         for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
             surface.set_filled(cursor.square(), false)
         }
         self.area -= 1;
+        let net_pos = instruction.net_pos;
         // Then remove all the instructions added as a result of this square.
-        for instruction in self.queue.drain(followup_index..) {
+        self.queue.drain(followup_index..);
+        // Update the `pos_states` of all the neighbouring positions.
+        for direction in [Left, Up, Right, Down] {
+            let neighbour = net_pos.moved_in(direction, &self.pos_states);
+
             // Update the state of the net position the instruction wanted to set.
-            self.pos_states[instruction.net_pos] =
-                match mem::take(&mut self.pos_states[instruction.net_pos]) {
-                    // We've literally just found an instruction that wants to set this position;
-                    // this is impossible.
-                    PosState::Untouched => unreachable!(),
-                    PosState::Queued { .. } => PosState::Untouched,
-                    PosState::Invalid { mapping } => PosState::Queued { mapping },
-                    // This is an instruction that hasn't been run, so this should be impossible.
-                    PosState::Filled => unreachable!(),
+            match self.pos_states[neighbour] {
+                // We've literally just found an instruction next to this position; this is
+                // impossible.
+                PosState::Unknown => unreachable!(),
+                PosState::Known { setter, .. } if setter == last_success_index => {
+                    self.pos_states[neighbour] = PosState::Unknown;
                 }
+                PosState::Invalid {
+                    setter,
+                    conflict,
+                    mapping,
+                } if conflict == last_success_index => {
+                    self.pos_states[neighbour] = PosState::Known { mapping, setter };
+                }
+                _ => {}
+            }
         }
 
         // Also un-mark any instructions that come after this instruction as potential,
@@ -265,51 +297,28 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
     #[inline]
     fn handle_instruction(&mut self) {
         let next_index = self.queue.len();
-        // Clear `InstructionState::Backtracked` from this instruction if present.
-        self.queue[self.index].state = InstructionState::NotRun;
         let instruction = &self.queue[self.index];
-        if self.valid(instruction) {
+        // We don't need to check if it's in `self.skip` because we wouldn't have added
+        // it to the queue in the first place if that was the case.
+        if !zip(&self.surfaces, instruction.mapping.cursors())
+            .any(|(surface, cursor)| surface.filled(cursor.square()))
+            && !matches!(
+                self.pos_states[instruction.net_pos],
+                PosState::Invalid { .. }
+            )
+        {
             // Add the new things we can do from here to the queue.
-            // Keep track of whether any valid follow-up instructions actually get added.
+            // Keep track of whether any follow-up instructions actually get added.
             let mut followup = false;
             for direction in [Left, Up, Right, Down] {
-                let instruction = &self.queue[self.index];
-                if let Some(instruction) = self.instruction_in(instruction, direction) {
-                    // Look at the status of the spot on the net we're trying to fill.
-                    match self.pos_states[instruction.net_pos] {
-                        // If it's invalid or already filled, don't add this instruction to the
-                        // queue.
-                        PosState::Invalid { .. } | PosState::Filled => {}
-                        // If it's untouched, queue this instruction and mark it as queued.
-                        PosState::Untouched => {
-                            self.pos_states[instruction.net_pos] = PosState::Queued {
-                                mapping: instruction.mapping.clone(),
-                            };
-                            // We only consider it a real followup instruction if none of the
-                            // squares it sets are already filled.
-                            if zip(&self.surfaces, instruction.mapping.cursors())
-                                .all(|(surface, cursor)| !surface.filled(cursor.square()))
-                            {
-                                followup = true;
-                            }
-                            self.queue.push(instruction);
-                        }
-                        // If it's already queued to do the same thing as this instruction, this
-                        // instruction is redundant. Don't add it to the queue.
-                        PosState::Queued { ref mapping } if *mapping == instruction.mapping => {}
-                        // If it's queued to do something different, mark it as invalid and queue
-                        // this instruction so that it'll become valid again if/when the instruction
-                        // is unqueued.
-                        PosState::Queued { .. } => {
-                            let PosState::Queued { mapping } =
-                                mem::take(&mut self.pos_states[instruction.net_pos])
-                            else {
-                                unreachable!()
-                            };
-                            self.pos_states[instruction.net_pos] = PosState::Invalid { mapping };
-                            self.queue.push(instruction);
-                        }
-                    }
+                let instruction = self.instruction_in(&self.queue[self.index], direction);
+                if matches!(self.pos_states[instruction.net_pos], PosState::Unknown)
+                    && !zip(&self.surfaces, instruction.mapping.cursors())
+                        .any(|(surface, cursor)| surface.filled(cursor.square()))
+                    && !self.skip.contains(instruction.mapping)
+                {
+                    followup = true;
+                    self.queue.push(instruction);
                 }
             }
 
@@ -324,25 +333,41 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
                 instruction.state = InstructionState::Completed {
                     followup_index: next_index,
                 };
-                self.pos_states[instruction.net_pos] = PosState::Filled;
+                let PosState::Known { setter, mapping } = self.pos_states[instruction.net_pos]
+                else {
+                    unreachable!()
+                };
+                self.pos_states[instruction.net_pos] = PosState::Filled { setter, mapping };
                 for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
                     surface.set_filled(cursor.square(), true);
                 }
                 self.area += 1;
-            } else {
-                // Remove any marker instructions that we added.
-                for instruction in self.queue.drain(next_index..) {
-                    // Update the state of the net position the instruction wanted to set.
-                    self.pos_states[instruction.net_pos] = match std::mem::replace(
-                        &mut self.pos_states[instruction.net_pos],
-                        PosState::Untouched,
-                    ) {
-                        PosState::Untouched => unreachable!(),
-                        PosState::Queued { .. } => PosState::Untouched,
-                        PosState::Invalid { mapping } => PosState::Queued { mapping },
-                        PosState::Filled => unreachable!(),
+
+                // Now that this instruction's properly been run, we update the `pos_states` of
+                // its neighbours.
+                for direction in [Left, Right, Up, Down] {
+                    let instruction = self.instruction_in(&self.queue[self.index], direction);
+                    match self.pos_states[instruction.net_pos] {
+                        // Neighbouring instructions with unknown mappings now have a known mapping.
+                        PosState::Unknown => {
+                            self.pos_states[instruction.net_pos] = PosState::Known {
+                                mapping: instruction.mapping.clone(),
+                                setter: self.index,
+                            };
+                        }
+                        // If any of this position's neighbours have known mappings that disagree
+                        // with what we think they should map to, they're now invalid.
+                        PosState::Known { mapping, setter } if mapping != instruction.mapping => {
+                            self.pos_states[instruction.net_pos] = PosState::Invalid {
+                                mapping,
+                                setter,
+                                conflict: self.index,
+                            }
+                        }
+                        _ => {}
                     }
                 }
+            } else {
                 // Add this to the list of potential instructions.
                 self.potential.push(self.index);
             }
@@ -355,9 +380,9 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
         !zip(&self.surfaces, instruction.mapping.cursors())
             .any(|(surface, cursor)| surface.filled(cursor.square()))
             && !self.skip.contains(instruction.mapping)
-            && matches!(
+            && !matches!(
                 self.pos_states[instruction.net_pos],
-                PosState::Queued { .. }
+                PosState::Invalid { .. }
             )
     }
 
@@ -367,16 +392,16 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
         &self,
         instruction: &Instruction<CUBOIDS>,
         direction: Direction,
-    ) -> Option<Instruction<CUBOIDS>> {
+    ) -> Instruction<CUBOIDS> {
         let net_pos = instruction.net_pos.moved_in(direction, &self.pos_states);
         let mut mapping = instruction.mapping.clone();
         zip(&self.square_caches, mapping.cursors_mut())
             .for_each(|(cache, cursor)| *cursor = cursor.moved_in(cache, direction));
-        Some(Instruction {
+        Instruction {
             net_pos,
             mapping,
             state: InstructionState::NotRun,
-        })
+        }
     }
 
     /// This method, which should be called when the end of the queue is
@@ -476,13 +501,12 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
         // don't, it's a conflict.
         for (i, instruction) in potential_squares.iter().enumerate() {
             for direction in [Left, Up, Down, Right] {
-                if let Some(moved_instruction) = self.instruction_in(instruction, direction) {
-                    for (j, other_instruction) in potential_squares.iter().enumerate() {
-                        if other_instruction.net_pos == moved_instruction.net_pos
-                            && other_instruction.mapping != moved_instruction.mapping
-                        {
-                            conflicts[i].insert(j);
-                        }
+                let moved_instruction = self.instruction_in(instruction, direction);
+                for (j, other_instruction) in potential_squares.iter().enumerate() {
+                    if other_instruction.net_pos == moved_instruction.net_pos
+                        && other_instruction.mapping != moved_instruction.mapping
+                    {
+                        conflicts[i].insert(j);
                     }
                 }
             }
