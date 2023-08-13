@@ -12,7 +12,9 @@ use anyhow::{bail, Context};
 use arbitrary::Arbitrary;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Arbitrary,
+)]
 pub struct Cuboid {
     pub width: u8,
     pub depth: u8,
@@ -1395,8 +1397,8 @@ impl Square {
 ///   position is an implicit cursor onto the net pointing upwards, and then
 ///   each cursor on the cuboids is the position that the cursor on the net
 ///   moves to when you fold the net up into each cuboid.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Cursor(pub(crate) u8);
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Arbitrary)]
+pub struct Cursor(pub u8);
 
 impl Cursor {
     /// Builds a cursor from a square and an orientation.
@@ -1649,7 +1651,7 @@ impl Display for MappingData {
 ///
 /// This can also be used to indicate where a spot on the net maps to on each
 /// cuboid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Arbitrary)]
 // Aligning this to 4 bytes lets the compiler pack it into a 32-bit integer.
 #[repr(align(4))]
 pub struct Mapping<const CUBOIDS: usize> {

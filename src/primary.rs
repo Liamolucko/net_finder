@@ -176,7 +176,7 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
         // Then create one `NetFinder` per equivalence class.
         let finders = equivalence_classes
             .iter()
-            .map(|class| class.canon_mappings().next().unwrap())
+            .map(|class| class.into_iter().next().unwrap())
             .enumerate()
             .map(|(i, start_mapping)| {
                 let mut pos_states = Net::for_cuboids(&cuboids);
@@ -197,10 +197,10 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
                 };
 
                 // Skip all of the equivalence classes prior to this one.
-                let mut skip = SkipSet::new(&square_caches);
+                let mut skip = SkipSet::new(cuboids);
                 for class in &equivalence_classes[..i] {
-                    for mapping in class.canon_mappings() {
-                        skip.insert(mapping.clone());
+                    for mapping in class {
+                        skip.insert(&square_caches, mapping);
                     }
                 }
 

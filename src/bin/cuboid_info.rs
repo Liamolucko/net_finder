@@ -38,17 +38,19 @@ fn run<const CUBOIDS: usize>(cuboids: [Cuboid; CUBOIDS], verbose: bool) {
     let equivalence_classes = equivalence_classes(cuboids, &square_caches);
     println!("Equivalence classes:");
     for (i, class) in equivalence_classes.iter().enumerate() {
-        print!(
-            "Class {}: {} canon members",
-            i + 1,
-            class.canon_mappings().count(),
-        );
+        print!("Class {}: {} members", i + 1, class.into_iter().count());
         if verbose {
             let canon_mappings: HashSet<_> = class
-                .canon_mappings()
-                .map(|mapping| mapping.to_data(&square_caches).canon_orientation())
+                .into_iter()
+                .map(|mapping| {
+                    let mut mapping = mapping.to_data(&square_caches);
+                    for cursor in &mut mapping.cursors {
+                        *cursor = cursor.canon();
+                    }
+                    mapping.canon_orientation()
+                })
                 .collect();
-            println!(" ({} rotated): ", canon_mappings.len());
+            println!(" ({} canon): ", canon_mappings.len());
             for mapping in canon_mappings {
                 println!("  {mapping}");
             }
