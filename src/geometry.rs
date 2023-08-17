@@ -723,7 +723,7 @@ impl Display for Pos {
 /// TODO: Check if this results in any actual performance improvement, and if
 /// not get rid of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NetPos(usize);
+pub struct NetPos(pub(crate) usize);
 
 impl NetPos {
     /// Creates a `NetPos` that represents `pos` on the given net.
@@ -741,12 +741,12 @@ impl NetPos {
     }
 
     /// Moves this position in `direction` on a given net.
-    pub fn moved_in<T>(self, direction: Direction, net: &Net<T>) -> Self {
+    pub fn moved_in(self, direction: Direction, net_width: usize) -> Self {
         let new_index = match direction {
             Left => self.0 - 1,
-            Up => self.0 + usize::from(net.width()),
+            Up => self.0 + net_width,
             Right => self.0 + 1,
-            Down => self.0 - usize::from(net.width()),
+            Down => self.0 - net_width,
         };
         Self(new_index)
     }
@@ -1255,7 +1255,7 @@ pub struct SquareCache {
     /// If `index` is the index of a square in `squares` and `direction` is the
     /// direction you want to find a face position adjacent in, the index you
     /// need in this array is `index << 2 | (direction as usize)`.
-    neighbour_lookup: Vec<Cursor>,
+    pub(crate) neighbour_lookup: Vec<Cursor>,
 }
 
 impl SquareCache {
@@ -1448,8 +1448,8 @@ impl Cursor {
 }
 
 /// A buffer for storing which squares on the surface of a cuboid are filled.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Surface(u64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Surface(pub(crate) u64);
 
 impl Surface {
     /// Creates a new `Surface` with no squares filled.
@@ -1656,7 +1656,7 @@ impl Display for MappingData {
 #[repr(align(4))]
 pub struct Mapping<const CUBOIDS: usize> {
     #[serde(with = "crate::utils::arrays")]
-    cursors: [Cursor; CUBOIDS],
+    pub cursors: [Cursor; CUBOIDS],
 }
 
 impl<const CUBOIDS: usize> Mapping<CUBOIDS> {

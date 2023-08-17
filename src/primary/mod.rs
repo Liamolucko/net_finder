@@ -8,14 +8,10 @@ use std::{
     hash::{Hash, Hasher},
     io::{BufReader, BufWriter},
     iter::zip,
+    mem,
     path::{Path, PathBuf},
     process::exit,
-    sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError},
-        Arc, Mutex,
-    },
-    thread,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -28,7 +24,11 @@ use crate::{
     SquareCache, Surface,
 };
 
+mod gpu;
+
 use Direction::*;
+
+use self::gpu::Pipeline;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NetFinder<const CUBOIDS: usize> {
@@ -80,6 +80,25 @@ struct Instruction<const CUBOIDS: usize> {
     /// The cursors on each of the cuboids that that square folds up into.
     mapping: Mapping<CUBOIDS>,
     state: InstructionState,
+}
+
+impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
+    fn moved_in(
+        &self,
+        square_caches: &[SquareCache; CUBOIDS],
+        direction: Direction,
+        net_width: usize,
+    ) -> Instruction<CUBOIDS> {
+        let net_pos = self.net_pos.moved_in(direction, net_width);
+        let mut mapping = self.mapping.clone();
+        zip(square_caches, mapping.cursors_mut())
+            .for_each(|(cache, cursor)| *cursor = cursor.moved_in(cache, direction));
+        Instruction {
+            net_pos,
+            mapping,
+            state: InstructionState::NotRun,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -260,7 +279,7 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
         self.queue.drain(followup_index..);
         // Update the `pos_states` of all the neighbouring positions.
         for direction in [Left, Up, Right, Down] {
-            let neighbour = net_pos.moved_in(direction, &self.pos_states);
+            let neighbour = net_pos.moved_in(direction, self.pos_states.width().into());
 
             // Update the state of the net position the instruction wanted to set.
             match self.pos_states[neighbour] {
@@ -393,7 +412,9 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
         instruction: &Instruction<CUBOIDS>,
         direction: Direction,
     ) -> Instruction<CUBOIDS> {
-        let net_pos = instruction.net_pos.moved_in(direction, &self.pos_states);
+        let net_pos = instruction
+            .net_pos
+            .moved_in(direction, self.pos_states.width().into());
         let mut mapping = instruction.mapping.clone();
         zip(&self.square_caches, mapping.cursors_mut())
             .for_each(|(cache, cursor)| *cursor = cursor.moved_in(cache, direction));
@@ -452,129 +473,28 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
             })
             .collect();
 
-        // A list of the instructions we know we have to include.
-        let mut included = HashSet::new();
-        // For each instruction, the list of instructions it conflicts with.
-        let mut conflicts: Vec<HashSet<usize>> = vec![HashSet::new(); potential_squares.len()];
-        // Go through all the squares on the surfaces of the cuboids to find which
-        // instructions we have to include, because they're the only ones that can set a
-        // square, as well as which instructions conflict with one another because they
-        // set the same surface squares.
-        let mut found: Vec<usize> = Vec::new();
-        for (cuboid, (cache, surface)) in zip(&self.square_caches, &self.surfaces).enumerate() {
-            for square in cache.squares() {
-                if !surface.filled(square) {
-                    // If the square's not already filled, there has to be at least one potential
-                    // square that fills it.
-                    found.clear();
-                    for (i, instruction) in potential_squares.iter().enumerate() {
-                        if instruction.mapping.cursors()[cuboid].square() == square {
-                            // Note down the conflicts between this instruction and the rest in
-                            // `found` so far, then add it to `found`.
-                            conflicts[i].extend(found.iter().copied());
-                            for j in found.iter().copied() {
-                                conflicts[j].insert(i);
-                            }
-                            found.push(i);
-                        }
-                    }
-                    match found.as_slice() {
-                        // We already made sure earlier that every unfilled square has at least one
-                        // instruction that sets it, so this is impossible.
-                        &[] => unreachable!(),
-                        // If there's only one instruction that fills this square, we have to
-                        // include it so that the square gets filled.
-                        &[instruction] => {
-                            included.insert(instruction);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        // Two instructions also conflict if they're neighbours on the net, but
-        // they disagree on what each other's positions should map to on the
-        // surface. To work out when that happens, we go through the neighbours
-        // of each instruction's net position and make sure that any instructions that
-        // set those positions agree on the face positions they should map to. If they
-        // don't, it's a conflict.
-        for (i, instruction) in potential_squares.iter().enumerate() {
-            for direction in [Left, Up, Down, Right] {
-                let moved_instruction = self.instruction_in(instruction, direction);
-                for (j, other_instruction) in potential_squares.iter().enumerate() {
-                    if other_instruction.net_pos == moved_instruction.net_pos
-                        && other_instruction.mapping != moved_instruction.mapping
-                    {
-                        conflicts[i].insert(j);
-                    }
-                }
-            }
-        }
-
-        // Now that we've got all the conflicts, make sure that none of the included
-        // squares conflict with each other. At the same time, we construct a
-        // list of the remaining instructions which aren't guaranteed-included and don't
-        // conflict with the included instructions.
-        let mut remaining: Vec<_> = (0..potential_squares.len())
-            .filter(|instruction| !included.contains(instruction))
-            .collect();
-        for &instruction in included.iter() {
-            for &conflicting in conflicts[instruction].iter() {
-                if included.contains(&conflicting) {
-                    return Finalize::Known(None);
-                }
-                if let Ok(index) = remaining.binary_search(&conflicting) {
-                    remaining.remove(index);
-                }
-            }
-        }
-
-        // Make a list of all the instructions that have been completed, including
-        // `included`.
-        let completed: Vec<_> = self
-            .queue
-            .iter()
-            .filter(|instruction| matches!(instruction.state, InstructionState::Completed { .. }))
-            .chain(included.iter().map(|&index| &potential_squares[index]))
-            .cloned()
-            .collect();
-
-        // Calculate how many more squares we still need to fill.
-        let remaining_area = self.target_area - self.area - included.len();
-        if remaining_area == 0 {
-            // If we've already filled all the surface squares, we're done!
-            return Finalize::Known(Some(Solution::new(
-                &self.square_caches,
-                completed.iter(),
-                prior_search_time + start.elapsed(),
-            )));
-        }
-
-        if remaining.len() < remaining_area {
-            // There aren't enough instructions left to possibly fill the surface.
-            return Finalize::Known(None);
-        }
-
-        // Finally, we return an iterator which will just brute-force try all the
-        // combinations of remaining squares.
-        Finalize::Solve(FinishIter {
-            square_caches: &self.square_caches,
-            completed,
-            search_time: prior_search_time + start.elapsed(),
-
+        finalize_inner(
+            self.pos_states.width().into(),
+            &self.square_caches,
+            &self.queue,
             potential_squares,
-            remaining,
-            conflicts,
-            next: (0..remaining_area).collect(),
-        })
+            prior_search_time,
+            start,
+        )
     }
 
     /// Splits this `NetFinder` in place, so that its work is now split between
     /// `self` and the returned `NetFinder`.
     ///
-    /// Returns `None` if this can't be done, in which case `self` is unchanged.
+    /// Returns `None` if this can't be done. However, this only happens if
+    /// `self` is finished.
     fn split(&mut self) -> Option<Self> {
+        // Advance `self` to the end of its queue so that every instruction that can be
+        // completed is completed, and we can try to split on them.
+        while self.index < self.queue.len() {
+            self.handle_instruction();
+        }
+
         let mut new_base_index = self.base_index + 1;
         // Find the first instruction that this `NetFinder` controls which has been run,
         // since that's what gets tried first and so that means that the other
@@ -613,6 +533,147 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
             Some(new_finder)
         }
     }
+}
+
+/// A version of `NetFinder::finalize` which:
+/// - Does not need an entire `NetFinder` to be used, just a list of
+///   instructions.
+/// - Doesn't have the impossible-to-fill-the-surface fast path.
+///
+/// This is what `NetFinder::finalize` it calls internally after checking for
+/// that aforementioned fast path, and what's used to process results from the
+/// GPU.
+fn finalize_inner<'a, const CUBOIDS: usize>(
+    net_width: usize,
+    square_caches: &'a [SquareCache; CUBOIDS],
+    completed: &[Instruction<CUBOIDS>],
+    potential: Vec<Instruction<CUBOIDS>>,
+    prior_search_time: Duration,
+    start: Instant,
+) -> Finalize<'a, CUBOIDS> {
+    // First figure out what squares on the surface are already filled by the completed instructions.
+    let mut surfaces = [Surface::new(); CUBOIDS];
+    for instruction in completed {
+        for (surface, cursor) in zip(&mut surfaces, instruction.mapping.cursors()) {
+            surface.set_filled(cursor.square(), true);
+        }
+    }
+
+    // A list of the instructions we know we have to include.
+    let mut included = HashSet::new();
+    // For each instruction, the list of instructions it conflicts with.
+    let mut conflicts: Vec<HashSet<usize>> = vec![HashSet::new(); potential.len()];
+    // Go through all the squares on the surfaces of the cuboids to find which
+    // instructions we have to include, because they're the only ones that can set a
+    // square, as well as which instructions conflict with one another because they
+    // set the same surface squares.
+    let mut found: Vec<usize> = Vec::new();
+    for (cuboid, (cache, surface)) in zip(square_caches, &surfaces).enumerate() {
+        for square in cache.squares() {
+            if !surface.filled(square) {
+                // If the square's not already filled, there has to be at least one potential
+                // square that fills it.
+                found.clear();
+                for (i, instruction) in potential.iter().enumerate() {
+                    if instruction.mapping.cursors()[cuboid].square() == square {
+                        // Note down the conflicts between this instruction and the rest in
+                        // `found` so far, then add it to `found`.
+                        conflicts[i].extend(found.iter().copied());
+                        for j in found.iter().copied() {
+                            conflicts[j].insert(i);
+                        }
+                        found.push(i);
+                    }
+                }
+                match found.as_slice() {
+                    &[] => return Finalize::Known(None),
+                    // If there's only one instruction that fills this square, we have to
+                    // include it so that the square gets filled.
+                    &[instruction] => {
+                        included.insert(instruction);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Two instructions also conflict if they're neighbours on the net, but
+    // they disagree on what each other's positions should map to on the
+    // surface. To work out when that happens, we go through the neighbours
+    // of each instruction's net position and make sure that any instructions that
+    // set those positions agree on the face positions they should map to. If they
+    // don't, it's a conflict.
+    for (i, instruction) in potential.iter().enumerate() {
+        for direction in [Left, Up, Down, Right] {
+            let moved_instruction = instruction.moved_in(square_caches, direction, net_width);
+            for (j, other_instruction) in potential.iter().enumerate() {
+                if other_instruction.net_pos == moved_instruction.net_pos
+                    && other_instruction.mapping != moved_instruction.mapping
+                {
+                    conflicts[i].insert(j);
+                }
+            }
+        }
+    }
+
+    // Now that we've got all the conflicts, make sure that none of the included
+    // squares conflict with each other. At the same time, we construct a
+    // list of the remaining instructions which aren't guaranteed-included and don't
+    // conflict with the included instructions.
+    let mut remaining: Vec<_> = (0..potential.len())
+        .filter(|instruction| !included.contains(instruction))
+        .collect();
+    for &instruction in included.iter() {
+        for &conflicting in conflicts[instruction].iter() {
+            if included.contains(&conflicting) {
+                return Finalize::Known(None);
+            }
+            if let Ok(index) = remaining.binary_search(&conflicting) {
+                remaining.remove(index);
+            }
+        }
+    }
+
+    // Make a list of all the instructions that have been completed, including
+    // `included`.
+    let completed: Vec<_> = completed
+        .iter()
+        .filter(|instruction| matches!(instruction.state, InstructionState::Completed { .. }))
+        .chain(included.iter().map(|&index| &potential[index]))
+        .cloned()
+        .collect();
+
+    // Calculate how many more squares we still need to fill.
+    let target_area = square_caches[0].squares().len();
+    let area: usize = surfaces[0].num_filled().try_into().unwrap();
+    let remaining_area = target_area - area - included.len();
+    if remaining_area == 0 {
+        // If we've already filled all the surface squares, we're done!
+        return Finalize::Known(Some(Solution::new(
+            square_caches,
+            completed.iter(),
+            prior_search_time + start.elapsed(),
+        )));
+    }
+
+    if remaining.len() < remaining_area {
+        // There aren't enough instructions left to possibly fill the surface.
+        return Finalize::Known(None);
+    }
+
+    // Finally, we return an iterator which will just brute-force try all the
+    // combinations of remaining squares.
+    Finalize::Solve(FinishIter {
+        square_caches,
+        completed,
+        search_time: prior_search_time + start.elapsed(),
+
+        potential,
+        remaining,
+        conflicts,
+        next: (0..remaining_area).collect(),
+    })
 }
 
 /// A solution yielded from `NetFinder`: contains the actual net, as well as the
@@ -690,7 +751,7 @@ struct FinishIter<'a, const CUBOIDS: usize> {
     completed: Vec<Instruction<CUBOIDS>>,
     search_time: Duration,
 
-    potential_squares: Vec<Instruction<CUBOIDS>>,
+    potential: Vec<Instruction<CUBOIDS>>,
     conflicts: Vec<HashSet<usize>>,
     remaining: Vec<usize>,
     /// The next combination to try.
@@ -754,7 +815,7 @@ impl<const CUBOIDS: usize> Iterator for FinishIter<'_, CUBOIDS> {
             self.completed.iter().chain(
                 self.next
                     .iter()
-                    .map(|&index| &self.potential_squares[self.remaining[index]]),
+                    .map(|&index| &self.potential[self.remaining[index]]),
             ),
             self.search_time,
         );
@@ -793,60 +854,6 @@ pub struct State<const CUBOIDS: usize> {
     pub prior_search_time: Duration,
 }
 
-/// Updates the passed `state` with the most recently sent `NetFinder`s, then
-/// writes it out to a file.
-fn update_state<const CUBOIDS: usize>(
-    state: &mut State<CUBOIDS>,
-    finder_receivers: &mut Vec<Receiver<NetFinder<CUBOIDS>>>,
-    channel_rx: &mut Receiver<Receiver<NetFinder<CUBOIDS>>>,
-    progress: &ProgressBar,
-) {
-    state.prior_search_time = progress.elapsed();
-
-    // Check if there are any new `NetFinder`s we need to add to our list.
-    loop {
-        match channel_rx.try_recv() {
-            Err(TryRecvError::Empty) => break,
-            Ok(rx) => {
-                // There should always be an initial state for the `NetFinder` sent
-                // immediately after creating the channel.
-                let finder = rx.try_recv().unwrap();
-                state.finders.push(finder);
-                finder_receivers.push(rx);
-                progress.inc_length(1);
-            }
-            Err(TryRecvError::Disconnected) => {
-                // If this was disconnected, the iterator must have been dropped. In that case
-                // break from the loop, since we want to write the final state with all the
-                // yielded nets.
-                break;
-            }
-        }
-    }
-
-    let mut i = 0;
-    while i < state.finders.len() {
-        match finder_receivers[i].try_recv() {
-            Ok(finder) => {
-                state.finders[i] = finder;
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                // That `NetFinder` has finished; remove it from our lists.
-                state.finders.remove(i);
-                finder_receivers.remove(i);
-                progress.inc(1);
-                // Skip over incrementing `i`, since `i` corresponds to the next
-                // `NetFinder` in the list now that we're removed one.
-                continue;
-            }
-        }
-        i += 1;
-    }
-
-    progress.tick();
-}
-
 fn write_state<const CUBOIDS: usize>(state: &State<CUBOIDS>, cuboids: [Cuboid; CUBOIDS]) {
     let path = state_path(&cuboids);
     // Initially write to a temporary file so that the previous version is still
@@ -879,124 +886,14 @@ pub fn resume<const CUBOIDS: usize>(
     )
 }
 
-/// Runs a `NetFinder` to completion, sending its results and state updates
-/// through the provided channels and splitting itself if `current_finders` gets
-/// too low.
-fn run_finder<'scope, const CUBOIDS: usize>(
-    mut finder: NetFinder<CUBOIDS>,
-    net_tx: Sender<Solution>,
-    finder_tx: SyncSender<NetFinder<CUBOIDS>>,
-    channel_tx: Sender<Receiver<NetFinder<CUBOIDS>>>,
-    scope: &rayon::Scope<'scope>,
-    current_finders: &'scope AtomicUsize,
-    prior_search_time: Duration,
-    start: Instant,
-) {
-    let mut send_counter: u16 = 0;
-    loop {
-        while finder.area < finder.target_area && finder.index < finder.queue.len() {
-            // Evaluate the next instruction in the queue.
-            finder.handle_instruction();
-
-            send_counter = send_counter.wrapping_add(1);
-            if send_counter == 0 {
-                let _ = finder_tx.try_send(finder.clone());
-                if current_finders.load(Relaxed) < rayon::current_num_threads() + 1 {
-                    // Split this `NetFinder` if there aren't currently enough of them to give all
-                    // our threads something to do.
-                    if let Some(finder) = finder.split() {
-                        current_finders.fetch_add(1, Relaxed);
-
-                        // Make a `finder_tx` for the new `NetFinder` to use.
-                        let (finder_tx, finder_rx) = mpsc::sync_channel(1);
-                        finder_tx.send(finder.clone()).unwrap();
-                        channel_tx.send(finder_rx).unwrap();
-
-                        let net_tx = net_tx.clone();
-                        let channel_tx = channel_tx.clone();
-                        scope.spawn(move |s| {
-                            run_finder(
-                                finder,
-                                net_tx,
-                                finder_tx,
-                                channel_tx,
-                                s,
-                                current_finders,
-                                prior_search_time,
-                                start,
-                            )
-                        });
-                    }
-                }
-            }
-        }
-
-        // We broke out of the loop, which means we've reached the end of the queue or
-        // the target area. So, finalize the current net to find solutions and send them
-        // off.
-        for solution in finder.finalize(prior_search_time, start) {
-            net_tx.send(solution).unwrap();
-        }
-
-        // Now backtrack and look for more solutions.
-        if !finder.backtrack() {
-            // Backtracking failed which means there are no solutions left and we're done.
-            current_finders.fetch_sub(1, Relaxed);
-            return;
-        }
-    }
-}
-
 fn run<const CUBOIDS: usize>(
     cuboids: [Cuboid; CUBOIDS],
-    finders: Vec<NetFinder<CUBOIDS>>,
+    mut finders: Vec<NetFinder<CUBOIDS>>,
     solutions: Vec<Solution>,
     prior_search_time: Duration,
     progress: ProgressBar,
 ) -> impl Iterator<Item = Solution> {
-    // Create a channel for sending yielded nets to the main thread.
-    let (net_tx, net_rx) = mpsc::channel::<Solution>();
-    // Create a channel for each `NetFinder` to periodically send its state through.
-    let (finder_senders, mut finder_receivers) = finders
-        .iter()
-        .map(|_| mpsc::sync_channel(1))
-        .unzip::<_, _, Vec<_>, Vec<_>>();
-    // Then create a channel through which we send the receiving ends of new such
-    // channels.
-    let (channel_tx, mut channel_rx) = mpsc::channel();
-
-    let current_finders = Arc::new(AtomicUsize::new(finders.len()));
     let start = Instant::now();
-    thread::Builder::new()
-        .name("scope thread".to_owned())
-        .spawn({
-            let finders = finders.clone();
-            move || {
-                rayon::scope(|s| {
-                    // Force these to get moved into the closure without moving `current_finders`
-                    // into it as well (since then it gets dropped before the scope ends).
-                    let net_tx = net_tx;
-                    let channel_tx = channel_tx;
-                    for (finder, finder_tx) in zip(finders, finder_senders) {
-                        let net_tx = net_tx.clone();
-                        let channel_tx = channel_tx.clone();
-                        s.spawn(|s| {
-                            run_finder(
-                                finder,
-                                net_tx,
-                                finder_tx,
-                                channel_tx,
-                                s,
-                                &current_finders,
-                                prior_search_time,
-                                start,
-                            )
-                        })
-                    }
-                });
-            }
-        })
-        .unwrap();
 
     // Create the folder where we're going to store our state.
     fs::create_dir_all(Path::new(env!("CARGO_MANIFEST_DIR")).join("state")).unwrap();
@@ -1012,7 +909,7 @@ fn run<const CUBOIDS: usize>(
 
     // Put the state in a mutex so we can share it with the ctrl+c handler
     let state = Arc::new(Mutex::new(State {
-        finders,
+        finders: finders.clone(),
         solutions: solutions.clone(),
         prior_search_time: prior_search_time + start.elapsed(),
     }));
@@ -1039,34 +936,30 @@ fn run<const CUBOIDS: usize>(
         .map(|solution| solution.net.clone())
         .collect();
 
+    let mut pipeline = pollster::block_on(Pipeline::new(&finders)).unwrap();
+    let mut new_solutions = Vec::new();
+
     // Yield all our previous solutions before starting the new ones.
-    solutions
-        .into_iter()
-        .chain(std::iter::from_fn(move || loop {
-            update_state(
-                &mut state.lock().unwrap(),
-                &mut finder_receivers,
-                &mut channel_rx,
-                &progress,
-            );
-            // Stop waiting every 50ms to update `state` in case we get Ctrl+C'd.
-            match net_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(solution) => {
-                    let new = yielded_nets.insert(solution.net.clone());
-                    if new {
-                        state.lock().unwrap().solutions.push(solution.clone());
-                        return Some(solution);
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => {
-                    // Write out our final state, since it serves as our way of retrieving results
-                    // afterwards.
-                    write_state(&state.lock().unwrap(), cuboids);
-                    return None;
-                }
-            }
-        }))
+    solutions.into_iter().chain(std::iter::from_fn(move || {
+        while !finders.is_empty() && new_solutions.is_empty() {
+            (new_solutions, finders) =
+                pipeline.run_finders(mem::take(&mut finders), prior_search_time, start);
+            new_solutions.retain(|solution| {
+                let new = yielded_nets.insert(solution.net.clone());
+                new
+            });
+            let mut state = state.lock().unwrap();
+            state.finders = finders.clone();
+            state.solutions.extend(new_solutions.iter().cloned());
+            state.prior_search_time = prior_search_time + start.elapsed();
+        }
+        if let Some(solution) = new_solutions.pop() {
+            Some(solution)
+        } else {
+            // We must be out of finders if we broke out of that loop, so we're done.
+            None
+        }
+    }))
 }
 
 impl Display for Solution {

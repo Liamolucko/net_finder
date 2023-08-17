@@ -139,8 +139,8 @@ pub struct SkipSet<const CUBOIDS: usize> {
     ///
     /// This is with the exception of the last cursor in the mapping, where each
     /// entry is 1 bit for whether or not this set contains the given mapping.
-    /// This means that the page consists of `ceil(page_size / usize::BITS)`
-    /// array entries rather than the usual `page_size` entries.
+    /// This means that the page consists of `ceil(page_size / 32)` array
+    /// entries rather than the usual `page_size` entries.
     ///
     /// The page starting at index 0 is special, because it's where all mappings
     /// that are known to not be in the set prior to the last cursor get sent.
@@ -155,13 +155,13 @@ pub struct SkipSet<const CUBOIDS: usize> {
     /// slightly easier to construct by having all equivalent cursors map to the
     /// same page, since otherwise we'd need to do some kind of manual
     /// compression pass afterwards to avoid it being huge.
-    data: Vec<usize>,
+    data: Vec<u32>,
     /// The size of a page in the trie, aka the number of cursors on the cuboids
     /// this set is for, aka 4 * the surface area of those cuboids.
     ///
     /// Note that we only deal with mappings where all the cuboids are the same
     /// size.
-    page_size: usize,
+    page_size: u32,
 }
 
 impl<const CUBOIDS: usize> SkipSet<CUBOIDS> {
@@ -172,7 +172,7 @@ impl<const CUBOIDS: usize> SkipSet<CUBOIDS> {
         }
         let page_size = 4 * cuboids[0].surface_area();
         Self {
-            page_size,
+            page_size: page_size.try_into().unwrap(),
             // We start off with just page 0 and the starting page, with all of the starting page's
             // entries pointing to page 0.
             data: vec![0; 2 * page_size],
@@ -185,12 +185,12 @@ impl<const CUBOIDS: usize> SkipSet<CUBOIDS> {
         let mut page = self.page_size;
         // Go through all the normal levels of the trie.
         for cursor in mapping.cursors().iter().take(mapping.cursors().len() - 1) {
-            page = self.data[page + usize::from(cursor.0)];
+            page = self.data[usize::try_from(page).unwrap() + usize::from(cursor.0)];
         }
         // Then look up whether the trie actually contains `mapping` in the final
         // bitfield level of the trie.
         let index = usize::from(mapping.cursors().last().unwrap().0);
-        (self.data[page + index / usize::BITS as usize] >> (index % usize::BITS as usize)) & 1 != 0
+        (self.data[usize::try_from(page).unwrap() + index / 32] >> (index % 32)) & 1 != 0
     }
 
     /// Inserts a mapping and all of the mappings with equivalent cursors into
@@ -206,21 +206,25 @@ impl<const CUBOIDS: usize> SkipSet<CUBOIDS> {
             .take(mapping.cursors().len() - 1)
             .enumerate()
         {
-            let mut next_page = self.data[page + usize::from(cursor.0)];
+            let mut next_page = self.data[usize::try_from(page).unwrap() + usize::from(cursor.0)];
             if next_page == 0 {
                 // There's no page for this prefix of mappings yet; make one.
-                next_page = self.data.len();
-                self.data
-                    .extend(iter::repeat(0).take(if i + 1 == CUBOIDS - 1 {
-                        (self.page_size + usize::BITS as usize - 1) / usize::BITS as usize
-                    } else {
-                        self.page_size
-                    }));
+                next_page = self.data.len().try_into().unwrap();
+                self.data.extend(
+                    iter::repeat(0).take(
+                        usize::try_from(if i + 1 == CUBOIDS - 1 {
+                            (self.page_size + 31) / 32
+                        } else {
+                            self.page_size
+                        })
+                        .unwrap(),
+                    ),
+                );
                 // Update the entries for this cursor and all its equivalents in the current
                 // page to point to the new page.
                 for cursor in cursor.to_data(&square_caches[i]).equivalents() {
                     let cursor = Cursor::from_data(&square_caches[i], &cursor);
-                    self.data[page + usize::from(cursor.0)] = next_page;
+                    self.data[usize::try_from(page).unwrap() + usize::from(cursor.0)] = next_page;
                 }
             }
             page = next_page;
@@ -235,46 +239,43 @@ impl<const CUBOIDS: usize> SkipSet<CUBOIDS> {
             .equivalents()
         {
             let index = usize::from(Cursor::from_data(square_caches.last().unwrap(), &cursor).0);
-            self.data[page + index / usize::BITS as usize] |= 1 << (index % usize::BITS as usize);
+            self.data[usize::try_from(page).unwrap() + index / 32] |= 1 << (index % 32);
         }
     }
 
     /// Returns the first included cursor whose value is within the given range
     /// on the given page.
-    fn first_cursor(&self, level: usize, page: usize, range: RangeFrom<u8>) -> Option<Cursor> {
-        let start = usize::from(range.start);
+    fn first_cursor(&self, level: usize, page: u32, range: RangeFrom<u8>) -> Option<Cursor> {
+        let start = u32::from(range.start);
         if start >= self.page_size {
             return None;
         }
-        let usize_bits = usize::BITS as usize;
         if level < CUBOIDS - 1 {
-            self.data[page + start..page + self.page_size]
+            self.data[usize::try_from(page + start).unwrap()
+                ..usize::try_from(page + self.page_size).unwrap()]
                 .iter()
                 .position(|&next_page| next_page != 0)
-                .map(|index| u8::try_from(start + index).unwrap())
+                .map(|index| u8::try_from(start + u32::try_from(index).unwrap()).unwrap())
         } else {
             // The first word in the page needs to be treated specially so we can exclude
             // bits prior to the start.
             let first_word =
-                self.data[page + start / usize_bits] & !((1 << (start % usize_bits)) - 1);
+                self.data[usize::try_from(page + start / 32).unwrap()] & !((1 << (start % 32)) - 1);
             if first_word != 0 {
-                let prev_words = start / usize_bits;
-                Some(
-                    u8::try_from(prev_words * usize_bits + first_word.trailing_zeros() as usize)
-                        .unwrap(),
-                )
+                let prev_words = start / 32;
+                Some(u8::try_from(prev_words * 32 + first_word.trailing_zeros()).unwrap())
             } else {
-                let prev_words = start / usize_bits + 1;
-                let word_index = self.data
-                    [page + start / usize_bits + 1..=page + (self.page_size - 1) / usize_bits]
+                let prev_words = start / 32 + 1;
+                let word_index = self.data[usize::try_from(page + start / 32 + 1).unwrap()
+                    ..=usize::try_from(page + (self.page_size - 1) / 32).unwrap()]
                     .iter()
                     .position(|&word| word != 0);
                 word_index.map(|index| {
-                    let word = self.data[page + start / usize_bits + 1 + index];
+                    let word = self.data[usize::try_from(page + start / 32 + 1).unwrap() + index];
                     u8::try_from(
-                        prev_words * usize_bits
-                            + index * usize_bits
-                            + word.trailing_zeros() as usize,
+                        prev_words * 32
+                            + u32::try_from(index * 32).unwrap()
+                            + word.trailing_zeros(),
                     )
                     .unwrap()
                 })
@@ -299,7 +300,7 @@ impl<'a, const CUBOIDS: usize> IntoIterator for &'a SkipSet<CUBOIDS> {
 pub struct SkipSetIter<'a, const CUBOIDS: usize> {
     set: &'a SkipSet<CUBOIDS>,
     // The path through the trie's pages we took last time, as well as the cursors we yielded.
-    prev_path: Option<[(usize, Cursor); CUBOIDS]>,
+    prev_path: Option<[(u32, Cursor); CUBOIDS]>,
 }
 
 impl<const CUBOIDS: usize> Iterator for SkipSetIter<'_, CUBOIDS> {
@@ -326,7 +327,8 @@ impl<const CUBOIDS: usize> Iterator for SkipSetIter<'_, CUBOIDS> {
             // Fill in the page for the next level down.
             if first_new_level + 1 < CUBOIDS {
                 let page = path[first_new_level].0;
-                path[first_new_level + 1].0 = self.set.data[page + usize::from(first_new_cursor.0)];
+                path[first_new_level + 1].0 =
+                    self.set.data[usize::try_from(page).unwrap() + usize::from(first_new_cursor.0)];
             }
             first_new_level + 1
         } else {
@@ -342,7 +344,8 @@ impl<const CUBOIDS: usize> Iterator for SkipSetIter<'_, CUBOIDS> {
             path[level].1 = cursor;
             // Fill in the next level's page.
             if level + 1 < CUBOIDS {
-                path[level + 1].0 = self.set.data[page + usize::from(cursor.0)];
+                path[level + 1].0 =
+                    self.set.data[usize::try_from(page).unwrap() + usize::from(cursor.0)];
             }
         }
 
