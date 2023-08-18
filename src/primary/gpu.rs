@@ -20,7 +20,7 @@ use crate::{Cursor, Mapping, NetFinder, NetPos, Solution, SquareCache};
 use super::{finalize_inner, Instruction, InstructionState, PosState};
 
 /// The number of `NetFinder`s we always give to the GPU.
-const NUM_FINDERS: u32 = 1792;
+const NUM_FINDERS: u32 = 64;
 /// The size of the compute shader's workgroups.
 const WORKGROUP_SIZE: u32 = 64;
 /// The capacity of the buffer into which our shader writes the solutions it
@@ -336,8 +336,7 @@ impl Pipeline {
         for finder in finders.iter() {
             finder.to_gpu(self, &mut gpu_finders);
         }
-        self.queue
-            .write_buffer(&self.cpu_finder_buf, 0, &gpu_finders);
+        self.queue.write_buffer(&self.finder_buf, 0, &gpu_finders);
 
         let mut encoder = self
             .device
@@ -371,6 +370,7 @@ impl Pipeline {
         );
 
         let index = self.queue.submit([encoder.finish()]);
+        self.device.stop_capture();
 
         // Wait for the GPU to finish.
         self.device.poll(Maintain::WaitForSubmissionIndex(index));
@@ -384,8 +384,6 @@ impl Pipeline {
             .map_async(MapMode::Read, |result| result.unwrap());
 
         self.device.poll(Maintain::Wait);
-
-        self.device.stop_capture();
 
         // I think our buffers are guaranteed to be mapped once `poll` returns? (not on
         // web but I'm not targeting that rn so I don't care)

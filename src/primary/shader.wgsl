@@ -59,7 +59,7 @@ struct Finder {
     pos_states: array<PosState, net_len>,
     /// Bitfields encoding which squares on the surfaces of each cuboid are
     /// filled.
-    surfaces: array<array<u32, surface_words>, num_squares>,
+    surfaces: array<array<u32, surface_words>, num_cuboids>,
 }
 
 /// A list of instructions.
@@ -191,8 +191,8 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
     let finder_idx = id.x;
     let finder = &finders[finder_idx];
 
-    var iters = 10000000u;
-    while iters < 10000u {
+    var iters = 0u;
+    while iters < 100000u {
         iters += 1u;
         if (*finder).index < (*finder).queue.len {
             handle_instruction(finder_idx);
@@ -275,6 +275,9 @@ fn backtrack(finder_idx: u32) -> bool {
 
     // Find the instruction that was last run.
     var last_run = (*finder).queue.len - 1u;
+    if last_run >= queue_capacity {
+        return false;
+    }
     while (*finder).queue.items[last_run].followup_index == 0u {
         if last_run <= (*finder).base_index {
             // There are no completed instructions left past `base_index`;
@@ -309,6 +312,9 @@ fn backtrack(finder_idx: u32) -> bool {
             (*pos_state).state -= 1u;
         }
     }
+
+    // Now we continue executing from after the instruction we backtracked.
+    (*finder).index = last_run + 1u;
 
     return true;
 }

@@ -515,7 +515,7 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
             None
         } else {
             // Create the new `NetFinder` by backtracking this one until the instruction at
-            // `new_base_index` hasn't been run.
+            // `new_base_index - 1` hasn't been run.
             let mut new_finder = self.clone();
             while matches!(
                 new_finder.queue[new_base_index - 1].state,
