@@ -191,9 +191,7 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
     let finder_idx = id.x;
     let finder = &finders[finder_idx];
 
-    var iters = 0u;
-    while iters < 100000u {
-        iters += 1u;
+    loop {
         if (*finder).index < (*finder).queue.len {
             handle_instruction(finder_idx);
         } else {
@@ -221,7 +219,7 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
 fn handle_instruction(finder_idx: u32) {
     let finder = &finders[finder_idx];
     let instruction = &(*finder).queue.items[(*finder).index];
-    if valid(finder_idx, *instruction) {
+    if (*finder).pos_states[(*instruction).net_pos].state == UNKNOWN && valid(finder_idx, *instruction) {
         let old_len = (*finder).queue.len;
         // Add all this instruction's follow-up instructions to the queue.
         for (var direction = 0u; direction < 4u; direction++) {
