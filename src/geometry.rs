@@ -741,6 +741,7 @@ impl NetPos {
     }
 
     /// Moves this position in `direction` on a given net.
+    #[inline]
     pub fn moved_in(self, direction: Direction, net_width: usize) -> Self {
         let new_index = match direction {
             Left => self.0 - 1,

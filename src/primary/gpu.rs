@@ -1,10 +1,14 @@
 use std::{
-    array, iter,
+    array,
+    collections::HashSet,
+    iter, mem,
     num::NonZeroU64,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context};
+use indicatif::ProgressBar;
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
     Backends, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
@@ -15,7 +19,7 @@ use wgpu::{
     ShaderModuleDescriptor, ShaderSource, ShaderStages,
 };
 
-use crate::{Cursor, Mapping, NetFinder, NetPos, Solution, SquareCache};
+use crate::{Cuboid, Cursor, Mapping, Net, NetFinder, NetPos, Solution, SquareCache, State};
 
 use super::{finalize_inner, Instruction, InstructionState, PosState};
 
@@ -31,7 +35,7 @@ const WORKGROUP_SIZE: u32 = 64;
 const SOLUTION_CAPACITY: u32 = 10000;
 
 /// A GPU pipeline set up for running `NetFinder`s.
-pub struct Pipeline {
+struct Pipeline {
     device: Device,
     queue: Queue,
 
@@ -60,7 +64,7 @@ impl Pipeline {
     ///
     /// All the `NetFinder`s need to be searching for the common nets of the
     /// same list of cuboids.
-    pub async fn new<const CUBOIDS: usize>(finders: &[NetFinder<CUBOIDS>]) -> anyhow::Result<Self> {
+    async fn new<const CUBOIDS: usize>(finders: &[NetFinder<CUBOIDS>]) -> anyhow::Result<Self> {
         if finders.is_empty() {
             bail!("must specify at least one `NetFinder`");
         }
@@ -300,7 +304,7 @@ impl Pipeline {
     ///
     /// Note that the number of finders returned may not be the same as the
     /// number passed in, since some finders may be split or finish.
-    pub fn run_finders<const CUBOIDS: usize>(
+    fn run_finders<const CUBOIDS: usize>(
         &mut self,
         mut finders: Vec<NetFinder<CUBOIDS>>,
         prior_search_time: Duration,
@@ -573,4 +577,41 @@ impl<const CUBOIDS: usize> PosState<CUBOIDS> {
         buffer.extend_from_slice(&u32::to_le_bytes(setter.try_into().unwrap()));
         buffer.extend_from_slice(&u32::to_le_bytes(conflict.try_into().unwrap()));
     }
+}
+
+pub fn run<const CUBOIDS: usize>(
+    _cuboids: [Cuboid; CUBOIDS],
+    state: Arc<Mutex<State<CUBOIDS>>>,
+    mut yielded_nets: HashSet<Net>,
+    _progress: ProgressBar,
+) -> impl Iterator<Item = Solution> {
+    let guard = state.lock().unwrap();
+    let mut finders = guard.finders.clone();
+    let prior_search_time = guard.prior_search_time;
+    drop(guard);
+    let start = Instant::now();
+
+    let mut pipeline = pollster::block_on(Pipeline::new(&finders)).unwrap();
+    let mut new_solutions = Vec::new();
+
+    std::iter::from_fn(move || {
+        while !finders.is_empty() && new_solutions.is_empty() {
+            (new_solutions, finders) =
+                pipeline.run_finders(mem::take(&mut finders), prior_search_time, start);
+            new_solutions.retain(|solution| {
+                let new = yielded_nets.insert(solution.net.clone());
+                new
+            });
+            let mut state = state.lock().unwrap();
+            state.finders = finders.clone();
+            state.solutions.extend(new_solutions.iter().cloned());
+            state.prior_search_time = prior_search_time + start.elapsed();
+        }
+        if let Some(solution) = new_solutions.pop() {
+            Some(solution)
+        } else {
+            // We must be out of finders if we broke out of that loop, so we're done.
+            None
+        }
+    })
 }

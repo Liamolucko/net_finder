@@ -10,6 +10,8 @@ use net_finder::{read_state, Cuboid, Solution};
 struct Options {
     #[arg(long)]
     resume: bool,
+    #[arg(long)]
+    gpu: bool,
     cuboids: Vec<Cuboid>,
 }
 
@@ -17,14 +19,18 @@ fn main() -> anyhow::Result<()> {
     let options = Options::parse();
     match options.cuboids.as_slice() {
         &[] => bail!("must specify at least 1 cuboid"),
-        &[a] => run([a], options.resume),
-        &[a, b] => run([a, b], options.resume),
-        &[a, b, c] => run([a, b, c], options.resume),
+        &[a] => run([a], options.resume, options.gpu),
+        &[a, b] => run([a, b], options.resume, options.gpu),
+        &[a, b, c] => run([a, b, c], options.resume, options.gpu),
         _ => bail!("only up to 3 cuboids are currently supported"),
     }
 }
 
-fn run<const CUBOIDS: usize>(cuboids: [Cuboid; CUBOIDS], resume: bool) -> anyhow::Result<()> {
+fn run<const CUBOIDS: usize>(
+    cuboids: [Cuboid; CUBOIDS],
+    resume: bool,
+    gpu: bool,
+) -> anyhow::Result<()> {
     let state = if resume {
         Some(read_state(cuboids)?)
     } else {
@@ -50,9 +56,9 @@ fn run<const CUBOIDS: usize>(cuboids: [Cuboid; CUBOIDS], resume: bool) -> anyhow
         });
     };
     if let Some(state) = state {
-        net_finder::resume(state, progress.clone()).for_each(callback);
+        net_finder::resume(state, progress.clone(), gpu).for_each(callback);
     } else {
-        net_finder::find_nets(cuboids, progress.clone())?.for_each(callback);
+        net_finder::find_nets(cuboids, progress.clone(), gpu)?.for_each(callback);
     }
 
     progress.finish_and_clear();

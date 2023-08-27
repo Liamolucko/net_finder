@@ -8,7 +8,6 @@ use std::{
     hash::{Hash, Hasher},
     io::{BufReader, BufWriter},
     iter::zip,
-    mem,
     path::{Path, PathBuf},
     process::exit,
     sync::{Arc, Mutex},
@@ -24,11 +23,10 @@ use crate::{
     SquareCache, Surface,
 };
 
+mod cpu;
 mod gpu;
 
 use Direction::*;
-
-use self::gpu::Pipeline;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NetFinder<const CUBOIDS: usize> {
@@ -553,7 +551,10 @@ fn finalize_inner<'a, const CUBOIDS: usize>(
 ) -> Finalize<'a, CUBOIDS> {
     // First figure out what squares on the surface are already filled by the completed instructions.
     let mut surfaces = [Surface::new(); CUBOIDS];
-    for instruction in completed {
+    for instruction in completed
+        .iter()
+        .filter(|instruction| matches!(instruction.state, InstructionState::Completed { .. }))
+    {
         for (surface, cursor) in zip(&mut surfaces, instruction.mapping.cursors()) {
             surface.set_filled(cursor.square(), true);
         }
@@ -646,8 +647,7 @@ fn finalize_inner<'a, const CUBOIDS: usize>(
 
     // Calculate how many more squares we still need to fill.
     let target_area = square_caches[0].squares().len();
-    let area: usize = surfaces[0].num_filled().try_into().unwrap();
-    let remaining_area = target_area - area - included.len();
+    let remaining_area = target_area - completed.len();
     if remaining_area == 0 {
         // If we've already filled all the surface squares, we're done!
         return Finalize::Known(Some(Solution::new(
@@ -841,10 +841,18 @@ fn state_path(cuboids: &[Cuboid]) -> PathBuf {
 pub fn find_nets<const CUBOIDS: usize>(
     cuboids: [Cuboid; CUBOIDS],
     progress: ProgressBar,
+    gpu: bool,
 ) -> anyhow::Result<impl Iterator<Item = Solution>> {
     let finders = NetFinder::new(cuboids)?;
 
-    Ok(run(cuboids, finders, Vec::new(), Duration::ZERO, progress))
+    Ok(run(
+        cuboids,
+        finders,
+        Vec::new(),
+        Duration::ZERO,
+        progress,
+        gpu,
+    ))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -876,6 +884,7 @@ pub fn read_state<const CUBOIDS: usize>(
 pub fn resume<const CUBOIDS: usize>(
     state: State<CUBOIDS>,
     progress: ProgressBar,
+    gpu: bool,
 ) -> impl Iterator<Item = Solution> {
     run(
         state.finders[0].cuboids,
@@ -883,15 +892,17 @@ pub fn resume<const CUBOIDS: usize>(
         state.solutions,
         state.prior_search_time,
         progress,
+        gpu,
     )
 }
 
 fn run<const CUBOIDS: usize>(
     cuboids: [Cuboid; CUBOIDS],
-    mut finders: Vec<NetFinder<CUBOIDS>>,
+    finders: Vec<NetFinder<CUBOIDS>>,
     solutions: Vec<Solution>,
     prior_search_time: Duration,
     progress: ProgressBar,
+    gpu: bool,
 ) -> impl Iterator<Item = Solution> {
     let start = Instant::now();
 
@@ -931,35 +942,19 @@ fn run<const CUBOIDS: usize>(
 
     // Make a set of all the nets (not solutions! we don't care about the colorings
     // and stuff) we've already yielded so that we don't yield duplicates.
-    let mut yielded_nets: HashSet<Net> = solutions
+    let yielded_nets: HashSet<Net> = solutions
         .iter()
         .map(|solution| solution.net.clone())
         .collect();
 
-    let mut pipeline = pollster::block_on(Pipeline::new(&finders)).unwrap();
-    let mut new_solutions = Vec::new();
-
     // Yield all our previous solutions before starting the new ones.
-    solutions.into_iter().chain(std::iter::from_fn(move || {
-        while !finders.is_empty() && new_solutions.is_empty() {
-            (new_solutions, finders) =
-                pipeline.run_finders(mem::take(&mut finders), prior_search_time, start);
-            new_solutions.retain(|solution| {
-                let new = yielded_nets.insert(solution.net.clone());
-                new
-            });
-            let mut state = state.lock().unwrap();
-            state.finders = finders.clone();
-            state.solutions.extend(new_solutions.iter().cloned());
-            state.prior_search_time = prior_search_time + start.elapsed();
-        }
-        if let Some(solution) = new_solutions.pop() {
-            Some(solution)
-        } else {
-            // We must be out of finders if we broke out of that loop, so we're done.
-            None
-        }
-    }))
+    solutions.into_iter().chain(if gpu {
+        Box::new(gpu::run(cuboids, state, yielded_nets, progress))
+            as Box<dyn Iterator<Item = Solution>>
+    } else {
+        Box::new(cpu::run(cuboids, state, yielded_nets, progress))
+            as Box<dyn Iterator<Item = Solution>>
+    })
 }
 
 impl Display for Solution {
