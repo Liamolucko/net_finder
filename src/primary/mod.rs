@@ -311,7 +311,6 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
 
     /// Handle the instruction at the current index in the queue, incrementing
     /// the index afterwards.
-    #[inline]
     fn handle_instruction(&mut self) {
         let next_index = self.queue.len();
         let instruction = &self.queue[self.index];
@@ -324,28 +323,22 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
                 PosState::Invalid { .. }
             )
         {
-            // Add the new things we can do from here to the queue.
-            // Keep track of whether any follow-up instructions actually get added.
-            let mut followup = false;
-            for direction in [Left, Up, Right, Down] {
+            // Check whether this instruction has any valid follow-up instructions.
+            let has_followups = [Left, Up, Right, Down].into_iter().any(|direction| {
                 let instruction = self.instruction_in(&self.queue[self.index], direction);
-                if matches!(self.pos_states[instruction.net_pos], PosState::Unknown)
+                matches!(self.pos_states[instruction.net_pos], PosState::Unknown)
                     && !zip(&self.surfaces, instruction.mapping.cursors())
                         .any(|(surface, cursor)| surface.filled(cursor.square()))
                     && !self.skip.contains(instruction.mapping)
-                {
-                    followup = true;
-                    self.queue.push(instruction);
-                }
-            }
+            });
 
-            // If no follow-up instructions we added, we don't actually fill the square,
-            // since we are now considering this a potentially filled square.
+            // If there are no valid follow-up instructions, we don't actually fill the
+            // square, since we are now considering this a potentially filled square.
             // Since it's possible for it to get invalidated later on, we just mark it as
             // not having been run for now and do a pass through the whole queue to find all
             // the instructions that are still valid, which have to be the ones that we
             // intentionally didn't run here.
-            if followup {
+            if has_followups {
                 let instruction = &mut self.queue[self.index];
                 instruction.state = InstructionState::Completed {
                     followup_index: next_index,
@@ -371,6 +364,12 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
                                 mapping: instruction.mapping.clone(),
                                 setter: self.index,
                             };
+                            if !zip(&self.surfaces, instruction.mapping.cursors())
+                                .any(|(surface, cursor)| surface.filled(cursor.square()))
+                                && !self.skip.contains(instruction.mapping)
+                            {
+                                self.queue.push(instruction);
+                            }
                         }
                         // If any of this position's neighbours have known mappings that disagree
                         // with what we think they should map to, they're now invalid.
@@ -549,7 +548,8 @@ fn finalize_inner<'a, const CUBOIDS: usize>(
     prior_search_time: Duration,
     start: Instant,
 ) -> Finalize<'a, CUBOIDS> {
-    // First figure out what squares on the surface are already filled by the completed instructions.
+    // First figure out what squares on the surface are already filled by the
+    // completed instructions.
     let mut surfaces = [Surface::new(); CUBOIDS];
     for instruction in completed
         .iter()
