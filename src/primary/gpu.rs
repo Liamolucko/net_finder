@@ -24,7 +24,7 @@ use crate::{Cuboid, Cursor, Mapping, Net, NetFinder, NetPos, Solution, SquareCac
 use super::{finalize_inner, Instruction, InstructionState, PosState};
 
 /// The number of `NetFinder`s we always give to the GPU.
-const NUM_FINDERS: u32 = 64;
+const NUM_FINDERS: u32 = 1792;
 /// The size of the compute shader's workgroups.
 const WORKGROUP_SIZE: u32 = 64;
 /// The capacity of the buffer into which our shader writes the solutions it
@@ -423,7 +423,6 @@ impl Pipeline {
         let raw_solutions = self.cpu_solution_buf.slice(..).get_mapped_range();
 
         let num_solutions = u32::from_le_bytes(raw_solutions[0..4].try_into().unwrap());
-        dbg!(num_solutions);
         let solutions = (0..num_solutions.try_into().unwrap())
             .flat_map(|i| {
                 let queue_capacity = usize::try_from(4 * self.area).unwrap();
@@ -446,7 +445,7 @@ impl Pipeline {
 
                 let completed: Vec<_> = (0..usize::try_from(completed_len).unwrap())
                     .map(|i| {
-                        let offset = i * instruction_size;
+                        let offset = completed_offset + i * instruction_size;
                         Instruction::from_gpu(&raw_solutions[offset..offset + instruction_size])
                     })
                     .collect();
@@ -567,7 +566,6 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
             cursors: array::from_fn(|i| {
                 let offset = 4 + 4 * i;
                 let index = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-                dbg!(index);
                 Cursor(index.try_into().unwrap())
             }),
         };
