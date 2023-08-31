@@ -333,6 +333,33 @@ impl Pipeline {
             }
         }
 
+        // sike we're just gonna run the first one on the CPU now for a bit
+        // let finder = &mut finders[0];
+        // let mut i = 1;
+        // loop {
+        //     println!("{i}: {}", finder.queue.len());
+        //     if i == 23 {
+        //         for (i, instruction) in finder.queue.iter().enumerate() {
+        //             println!(
+        //                 "{i}: {} -> {:?}",
+        //                 instruction.net_pos.0,
+        //                 instruction.mapping.cursors.map(|cursor| cursor.0)
+        //             );
+        //         }
+        //     }
+        //     if finder.index < finder.queue.len() {
+        //         println!("{:?}", finder.queue[finder.index]);
+        //         finder.handle_instruction()
+        //     } else {
+        //         if !finder.backtrack() {
+        //             break;
+        //         }
+        //     }
+        //     i += 1;
+        // }
+
+        // panic!();
+
         self.device.start_capture();
 
         // Write the finders into the GPU's buffer.
@@ -401,7 +428,7 @@ impl Pipeline {
             .flat_map(|i| {
                 let queue_capacity = usize::try_from(4 * self.area).unwrap();
                 let instruction_size = 4 * (2 + CUBOIDS);
-                let completed_offset = 2 * (queue_capacity * instruction_size + 1) * i;
+                let completed_offset = 4 + 2 * (queue_capacity * instruction_size + 4) * i;
                 let completed_len_offset = completed_offset + instruction_size * queue_capacity;
                 let potential_offset = completed_len_offset + 4;
                 let potential_len_offset = potential_offset + instruction_size * queue_capacity;
@@ -540,6 +567,7 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
             cursors: array::from_fn(|i| {
                 let offset = 4 + 4 * i;
                 let index = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                dbg!(index);
                 Cursor(index.try_into().unwrap())
             }),
         };

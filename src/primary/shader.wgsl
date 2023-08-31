@@ -29,9 +29,10 @@
 /// Returns the neighbour of a cursor in a given direction on the given cuboid.
 fn cursor_neighbour(cuboid: u32, cursor: u32, direction: u32) -> u32 {
     let square = cursor >> 2u;
-    let unrotated = neighbour_lookups[cuboid][square][direction];
-    let orientation = ((cursor & 3u) + (unrotated & 3u)) & 3u;
-    return (unrotated & 0xfffffffcu) | orientation;
+    let old_orientation = cursor & 3u;
+    let unrotated = neighbour_lookups[cuboid][square][(old_orientation + direction) & 3u];
+    let new_orientation = ((cursor & 3u) + (unrotated & 3u)) & 3u;
+    return (unrotated & 0xfffffffcu) | new_orientation;
 }
 
 /// A single unit of work for trying combinations of net squares.
@@ -138,12 +139,12 @@ fn instruction_neighbour(instruction: Instruction, direction: u32) -> Instructio
 
     // If `direction` is left/right (even), we need to offset the index by 1,
     // otherwise we need to offset it by `net_width`.
-    let magnitude = select(1u, net_width, direction % 2u == 0u);
+    let magnitude = select(net_width, 1u, direction % 2u == 0u);
     // Then, if `direction` is left or down, we need to subtract that offset,
     // otherwise we add it. Left and down are represented as 0 and 3, so
     // subtracting 1 means they become 2^32 - 1 and 2 respectively, and so we
     // can just check if that's >= 2.
-    result.net_pos = select(result.net_pos - magnitude, result.net_pos + magnitude, direction - 1u >= 2u);
+    result.net_pos = select(result.net_pos + magnitude, result.net_pos - magnitude, direction - 1u >= 2u);
 
     for (var i = 0u; i < num_cuboids; i++) {
         result.mapping[i] = cursor_neighbour(i, result.mapping[i], direction);
@@ -191,7 +192,7 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
     let finder_idx = id.x;
     let finder = &finders[finder_idx];
 
-    loop {
+    for (var i = 0u; i < 10000u; i++) {
         if (*finder).index < (*finder).queue.len {
             handle_instruction(finder_idx);
         } else {
@@ -219,12 +220,12 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
 fn handle_instruction(finder_idx: u32) {
     let finder = &finders[finder_idx];
     let instruction = &(*finder).queue.items[(*finder).index];
-    if (*finder).pos_states[(*instruction).net_pos].state == UNKNOWN && valid(finder_idx, *instruction) {
+    if valid(finder_idx, *instruction) {
         let old_len = (*finder).queue.len;
         // Add all this instruction's follow-up instructions to the queue.
         for (var direction = 0u; direction < 4u; direction++) {
             let instruction = instruction_neighbour(*instruction, direction);
-            if valid(finder_idx, instruction) && !skip(finder_idx, instruction) {
+            if (*finder).pos_states[instruction.net_pos].state == UNKNOWN && valid(finder_idx, instruction) && !skip(finder_idx, instruction) {
                 (*finder).queue.items[(*finder).queue.len] = instruction;
                 (*finder).queue.len += 1u;
             }
@@ -251,8 +252,10 @@ fn handle_instruction(finder_idx: u32) {
                 if (*pos_state).state == UNKNOWN {
                     (*pos_state).mapping = instruction.mapping;
                     (*pos_state).state = KNOWN;
+                    (*pos_state).setter = (*finder).index;
                 } else if (*pos_state).state == KNOWN && !mapping_eq(instruction.mapping, (*pos_state).mapping) {
                     (*pos_state).state = INVALID;
+                    (*pos_state).conflict = (*finder).index;
                 }
             }
         } else {
@@ -274,6 +277,7 @@ fn backtrack(finder_idx: u32) -> bool {
     // Find the instruction that was last run.
     var last_run = (*finder).queue.len - 1u;
     if last_run >= queue_capacity {
+        // this should never happen but i've been burned too many times
         return false;
     }
     while (*finder).queue.items[last_run].followup_index == 0u {
@@ -295,7 +299,7 @@ fn backtrack(finder_idx: u32) -> bool {
     (*finder).pos_states[(*instruction).net_pos].state = KNOWN;
     for (var i = 0u; i < num_cuboids; i++) {
         var surface = (*finder).surfaces[i];
-        set_filled(&surface, (*instruction).mapping[i] >> 2u, true);
+        set_filled(&surface, (*instruction).mapping[i] >> 2u, false);
         (*finder).surfaces[i] = surface;
     }
 
@@ -309,6 +313,12 @@ fn backtrack(finder_idx: u32) -> bool {
         if ((*pos_state).state == INVALID && (*pos_state).conflict == last_run) || ((*pos_state).state == KNOWN && (*pos_state).setter == last_run) {
             (*pos_state).state -= 1u;
         }
+    }
+
+    // Also un-mark any instructions that come after this instruction as
+    // potential, since they would otherwise have been backtracked first.
+    while (*finder).potential_len > 0u && (*finder).potential[(*finder).potential_len - 1u] >= last_run {
+        (*finder).potential_len -= 1u;
     }
 
     // Now we continue executing from after the instruction we backtracked.
@@ -328,7 +338,7 @@ fn valid(finder_idx: u32, instruction: Instruction) -> bool {
     var mapping = instruction.mapping;
     for (var i = 0u; i < num_cuboids; i++) {
         var surface = (*finder).surfaces[i];
-        result &= u32(filled(&surface, mapping[i] >> 2u));
+        result &= u32(!filled(&surface, mapping[i] >> 2u));
     }
 
     return bool(result);
