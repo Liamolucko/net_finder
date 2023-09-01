@@ -442,6 +442,45 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             )
     }
 
+    /// Runs the instruction at the given index.
+    ///
+    /// This does more than just filling the squares on the net and the surface that the instruction says to: it also updates the `pos_states` of neighbouring squares.
+    fn run_instruction(&mut self, ctx: &FinderCtx<CUBOIDS>, index: usize) {
+        let instruction = &self.queue[index];
+        let PosState::Known { setter, mapping } = self.pos_states[instruction.net_pos] else {
+            unreachable!()
+        };
+        self.pos_states[instruction.net_pos] = PosState::Filled { setter, mapping };
+        for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
+            surface.set_filled(cursor.square(), true);
+        }
+
+        // Now that this instruction's properly been run, we update the `pos_states` of
+        // its neighbours.
+        for direction in [Left, Right, Up, Down] {
+            let instruction = self.queue[index].moved_in(ctx, direction);
+            match self.pos_states[instruction.net_pos] {
+                // Neighbouring instructions with unknown mappings now have a known mapping.
+                PosState::Unknown => {
+                    self.pos_states[instruction.net_pos] = PosState::Known {
+                        mapping: instruction.mapping.clone(),
+                        setter: index,
+                    };
+                }
+                // If any of this position's neighbours have known mappings that disagree
+                // with what we think they should map to, they're now invalid.
+                PosState::Known { mapping, setter } if mapping != instruction.mapping => {
+                    self.pos_states[instruction.net_pos] = PosState::Invalid {
+                        mapping,
+                        setter,
+                        conflict: index,
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// This method, which should be called when the end of the queue is
     /// reached, goes through all of the unrun instructions to find which ones
     /// are valid, and figures out which combinations of them result in a valid
