@@ -150,7 +150,7 @@ impl Pipeline {
 
         let solution_buf = device.create_buffer(&BufferDescriptor {
             label: Some("solution buffer"),
-            size: u64::from(SOLUTION_CAPACITY * solution_size),
+            size: u64::from(4 + SOLUTION_CAPACITY * solution_size),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -167,7 +167,7 @@ impl Pipeline {
 
         let cpu_solution_buf = device.create_buffer(&BufferDescriptor {
             label: Some("CPU solution buffer"),
-            size: u64::from(SOLUTION_CAPACITY * solution_size),
+            size: u64::from(4 + SOLUTION_CAPACITY * solution_size),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });

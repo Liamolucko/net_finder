@@ -192,7 +192,7 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
     let finder_idx = id.x;
     let finder = &finders[finder_idx];
 
-    for (var i = 0u; i < 10000u; i++) {
+    loop {
         if (*finder).index < (*finder).queue.len {
             handle_instruction(finder_idx);
         } else {
@@ -402,6 +402,8 @@ fn write_solution(finder_idx: u32) -> bool {
 
     let index = atomicAdd(&maybe_solutions.len, 1u);
     if index >= arrayLength(&maybe_solutions.items) {
+        // Oops, there's not actually that much room. Undo.
+        atomicStore(&maybe_solutions.len, arrayLength(&maybe_solutions.items));
         return false;
     }
     let sol = &maybe_solutions.items[index];
