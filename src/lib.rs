@@ -123,7 +123,7 @@ pub fn equivalence_classes<const CUBOIDS: usize>(
     result
 }
 
-/// A set of mappings for a `NetFinder` to skip, implemented as a trie.
+/// A set of mappings for a `Finder` to skip, implemented as a trie.
 ///
 /// When inserting a mapping, all of the mappings with equivalent cursors are
 /// automatically added as well. This is partially a holdover from a previous

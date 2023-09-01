@@ -19,7 +19,7 @@
 // const trie_start = num_cursors;
 //
 // // We need 1 32-bit word per 32 squares, rounded up.
-// const surface_words = (num_squares + 31u) / 32u;∂
+// const surface_words = (num_squares + 31u) / 32u;
 
 // Use a `vec4<Cursor>` rather than just storing 4 cursors directly to satisfy
 // the requirement that arrays in uniform buffers have a stride of at least 16
@@ -192,7 +192,7 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
     let finder_idx = id.x;
     let finder = &finders[finder_idx];
 
-    loop {
+    for (var i = 0u; i < 10000u; i++) {
         if (*finder).index < (*finder).queue.len {
             handle_instruction(finder_idx);
         } else {

@@ -161,9 +161,9 @@ impl Cuboid {
 /// arbitrary value.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Net<T = bool> {
-    width: u8,
+    pub(crate) width: u8,
     /// A vec indicating whether a square is present in each spot.
-    squares: Vec<T>,
+    pub(crate) squares: Vec<T>,
 }
 
 struct Rotations<T> {
@@ -718,7 +718,7 @@ impl Display for Pos {
 /// vertically.
 ///
 /// So, this type should only be used if you're _absolutely certain_ that you'll
-/// never go off the edge of the net, as is the case with `NetFinder`.
+/// never go off the edge of the net, as is the case with `Finder`.
 ///
 /// TODO: Check if this results in any actual performance improvement, and if
 /// not get rid of it.
@@ -1554,7 +1554,7 @@ impl MappingData {
     ///
     /// In effect, a mapping that's equivalent to this one is any mapping which
     /// will lead to the exact same list of common nets when used as a starting
-    /// point from `NetFinder` (possibly rotated/flipped, but still the same
+    /// point from `Finder` (possibly rotated/flipped, but still the same
     /// net).
     ///
     /// The way I imagine this is that you overlay the two cuboids on top of one

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.66"
 arbitrary = { version = "1.2.0", features = ["derive"] }
+bytemuck = { version = "1.13.1", features = ["min_const_generics"] }
 chrono = { version = "0.4.26", features = ["std", "clock"], default-features = false }
 clap = { version = "4.0.29", features = ["derive"] }
 ctrlc = "3.4.0"

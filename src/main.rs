@@ -53,10 +53,13 @@ fn run<const CUBOIDS: usize>(
                 DateTime::<Local>::from(solution.time).format("at %r on %e %b")
             );
             println!("{solution}");
+            assert!(cuboids
+                .into_iter()
+                .all(|cuboid| solution.net.color(cuboid).is_some()));
         });
     };
     if let Some(state) = state {
-        net_finder::resume(state, progress.clone(), gpu).for_each(callback);
+        net_finder::resume(state, progress.clone(), gpu)?.for_each(callback);
     } else {
         net_finder::find_nets(cuboids, progress.clone(), gpu)?.for_each(callback);
     }

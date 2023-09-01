@@ -11,30 +11,30 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use indicatif::ProgressBar;
 
-use crate::{Cuboid, Net, NetFinder, Solution, State};
+use crate::{Finder, Net, Solution, State};
 
-use super::state_path;
-/// Updates the passed `state` with the most recently sent `NetFinder`s, then
+use super::{state_path, FinderCtx};
+/// Updates the passed `state` with the most recently sent `Finder`s, then
 /// writes it out to a file.
 fn update_state<const CUBOIDS: usize>(
     state: &mut State<CUBOIDS>,
-    finder_receivers: &mut Vec<Receiver<NetFinder<CUBOIDS>>>,
-    channel_rx: &mut Receiver<Receiver<NetFinder<CUBOIDS>>>,
+    finder_receivers: &mut Vec<Receiver<Finder<CUBOIDS>>>,
+    channel_rx: &mut Receiver<Receiver<Finder<CUBOIDS>>>,
     progress: &ProgressBar,
 ) {
     state.prior_search_time = progress.elapsed();
 
-    // Check if there are any new `NetFinder`s we need to add to our list.
+    // Check if there are any new `Finder`s we need to add to our list.
     loop {
         match channel_rx.try_recv() {
             Err(TryRecvError::Empty) => break,
             Ok(rx) => {
-                // There should always be an initial state for the `NetFinder` sent
+                // There should always be an initial state for the `Finder` sent
                 // immediately after creating the channel.
                 let finder = rx.try_recv().unwrap();
                 state.finders.push(finder);
@@ -58,12 +58,12 @@ fn update_state<const CUBOIDS: usize>(
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
-                // That `NetFinder` has finished; remove it from our lists.
+                // That `Finder` has finished; remove it from our lists.
                 state.finders.remove(i);
                 finder_receivers.remove(i);
                 progress.inc(1);
                 // Skip over incrementing `i`, since `i` corresponds to the next
-                // `NetFinder` in the list now that we're removed one.
+                // `Finder` in the list now that we're removed one.
                 continue;
             }
         }
@@ -73,8 +73,8 @@ fn update_state<const CUBOIDS: usize>(
     progress.tick();
 }
 
-fn write_state<const CUBOIDS: usize>(state: &State<CUBOIDS>, cuboids: [Cuboid; CUBOIDS]) {
-    let path = state_path(&cuboids);
+fn write_state<const CUBOIDS: usize>(state: &State<CUBOIDS>) {
+    let path = state_path(&state.cuboids);
     // Initially write to a temporary file so that the previous version is still
     // there if we get Ctrl+C'd while writing or something like that.
     let tmp_path = path.with_extension("json.tmp");
@@ -84,91 +84,88 @@ fn write_state<const CUBOIDS: usize>(state: &State<CUBOIDS>, cuboids: [Cuboid; C
     fs::rename(tmp_path, path).unwrap();
 }
 
-/// Runs a `NetFinder` to completion, sending its results and state updates
+/// Runs a `Finder` to completion, sending its results and state updates
 /// through the provided channels and splitting itself if `current_finders` gets
 /// too low.
 fn run_finder<'scope, const CUBOIDS: usize>(
-    mut finder: NetFinder<CUBOIDS>,
+    ctx: &'scope FinderCtx<CUBOIDS>,
+    mut finder: Finder<CUBOIDS>,
     net_tx: Sender<Solution>,
-    finder_tx: SyncSender<NetFinder<CUBOIDS>>,
-    channel_tx: Sender<Receiver<NetFinder<CUBOIDS>>>,
+    finder_tx: SyncSender<Finder<CUBOIDS>>,
+    channel_tx: Sender<Receiver<Finder<CUBOIDS>>>,
     scope: &rayon::Scope<'scope>,
     current_finders: &'scope AtomicUsize,
-    prior_search_time: Duration,
-    start: Instant,
 ) {
     let mut send_counter: u16 = 0;
     loop {
-        while finder.area < finder.target_area && finder.index < finder.queue.len() {
+        if finder.index < finder.queue.len() {
             // Evaluate the next instruction in the queue.
-            finder.handle_instruction();
+            finder.handle_instruction(ctx);
+        } else {
+            // We've reached the end of the queue. So, finalize the current net to find
+            // solutions and send them off.
+            for solution in finder.finalize(ctx) {
+                net_tx.send(solution).unwrap();
+            }
 
-            send_counter = send_counter.wrapping_add(1);
-            if send_counter == 0 {
-                let _ = finder_tx.try_send(finder.clone());
-                if current_finders.load(Relaxed) < rayon::current_num_threads() + 1 {
-                    // Split this `NetFinder` if there aren't currently enough of them to give all
-                    // our threads something to do.
-                    if let Some(finder) = finder.split() {
-                        current_finders.fetch_add(1, Relaxed);
-
-                        // Make a `finder_tx` for the new `NetFinder` to use.
-                        let (finder_tx, finder_rx) = mpsc::sync_channel(1);
-                        finder_tx.send(finder.clone()).unwrap();
-                        channel_tx.send(finder_rx).unwrap();
-
-                        let net_tx = net_tx.clone();
-                        let channel_tx = channel_tx.clone();
-                        scope.spawn(move |s| {
-                            run_finder(
-                                finder,
-                                net_tx,
-                                finder_tx,
-                                channel_tx,
-                                s,
-                                current_finders,
-                                prior_search_time,
-                                start,
-                            )
-                        });
-                    }
-                }
+            // Now backtrack and look for more solutions.
+            if !finder.backtrack() {
+                // Backtracking failed which means there are no solutions left and we're done.
+                current_finders.fetch_sub(1, Relaxed);
+                return;
             }
         }
 
-        // We broke out of the loop, which means we've reached the end of the queue or
-        // the target area. So, finalize the current net to find solutions and send them
-        // off.
-        for solution in finder.finalize(prior_search_time, start) {
-            net_tx.send(solution).unwrap();
-        }
+        send_counter = send_counter.wrapping_add(1);
+        if send_counter == 0 {
+            let _ = finder_tx.try_send(finder.clone());
+            if current_finders.load(Relaxed) < rayon::current_num_threads() + 1 {
+                // Split this `Finder` if there aren't currently enough of them to give all
+                // our threads something to do.
+                if let Some(finder) = finder.split(ctx) {
+                    current_finders.fetch_add(1, Relaxed);
 
-        // Now backtrack and look for more solutions.
-        if !finder.backtrack() {
-            // Backtracking failed which means there are no solutions left and we're done.
-            current_finders.fetch_sub(1, Relaxed);
-            return;
+                    // Make a `finder_tx` for the new `Finder` to use.
+                    let (finder_tx, finder_rx) = mpsc::sync_channel(1);
+                    finder_tx.send(finder.clone()).unwrap();
+                    channel_tx.send(finder_rx).unwrap();
+
+                    let net_tx = net_tx.clone();
+                    let channel_tx = channel_tx.clone();
+                    scope.spawn(move |s| {
+                        run_finder(
+                            ctx,
+                            finder,
+                            net_tx,
+                            finder_tx,
+                            channel_tx,
+                            s,
+                            current_finders,
+                        )
+                    });
+                }
+            }
         }
     }
 }
 
 pub fn run<const CUBOIDS: usize>(
-    cuboids: [Cuboid; CUBOIDS],
     state: Arc<Mutex<State<CUBOIDS>>>,
     mut yielded_nets: HashSet<Net>,
     progress: ProgressBar,
-) -> impl Iterator<Item = Solution> {
+) -> anyhow::Result<impl Iterator<Item = Solution>> {
     let guard = state.lock().unwrap();
     let State {
+        cuboids,
         ref finders,
         prior_search_time,
         ..
     } = *guard;
-    let start = Instant::now();
+    let ctx = FinderCtx::new(cuboids, prior_search_time)?;
 
     // Create a channel for sending yielded nets to the main thread.
     let (net_tx, net_rx) = mpsc::channel::<Solution>();
-    // Create a channel for each `NetFinder` to periodically send its state through.
+    // Create a channel for each `Finder` to periodically send its state through.
     let (finder_senders, mut finder_receivers) = finders
         .iter()
         .map(|_| mpsc::sync_channel(1))
@@ -193,14 +190,13 @@ pub fn run<const CUBOIDS: usize>(
                         let channel_tx = channel_tx.clone();
                         s.spawn(|s| {
                             run_finder(
+                                &ctx,
                                 finder,
                                 net_tx,
                                 finder_tx,
                                 channel_tx,
                                 s,
                                 &current_finders,
-                                prior_search_time,
-                                start,
                             )
                         })
                     }
@@ -211,7 +207,7 @@ pub fn run<const CUBOIDS: usize>(
 
     drop(guard);
 
-    std::iter::from_fn(move || loop {
+    Ok(std::iter::from_fn(move || loop {
         update_state(
             &mut state.lock().unwrap(),
             &mut finder_receivers,
@@ -231,9 +227,9 @@ pub fn run<const CUBOIDS: usize>(
             Err(RecvTimeoutError::Disconnected) => {
                 // Write out our final state, since it serves as our way of retrieving results
                 // afterwards.
-                write_state(&state.lock().unwrap(), cuboids);
+                write_state(&state.lock().unwrap());
                 return None;
             }
         }
-    })
+    }))
 }

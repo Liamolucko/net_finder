@@ -4,7 +4,7 @@ use std::{
     iter, mem,
     num::NonZeroU64,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::{bail, Context};
@@ -19,27 +19,149 @@ use wgpu::{
     ShaderModuleDescriptor, ShaderSource, ShaderStages,
 };
 
-use crate::{Cuboid, Cursor, Mapping, Net, NetFinder, NetPos, Solution, SquareCache, State};
+use crate::{Cursor, Finder, Mapping, Net, NetPos, SkipSet, Solution, SquareCache, State, Surface};
 
-use super::{finalize_inner, Instruction, InstructionState, PosState};
+use super::{FinderCtx, Instruction, InstructionState, PosState};
 
-/// The number of `NetFinder`s we always give to the GPU.
+/// The number of `Finder`s we always give to the GPU.
 const NUM_FINDERS: u32 = 1792;
 /// The size of the compute shader's workgroups.
 const WORKGROUP_SIZE: u32 = 64;
 /// The capacity of the buffer into which our shader writes the solutions it
 /// finds.
-///
-/// I don't think I've seen any sets of cuboids with 100000 or more solutions
-/// yet so this should be a pretty safe upper bound.
 const SOLUTION_CAPACITY: u32 = 10000;
 
-/// A GPU pipeline set up for running `NetFinder`s.
-struct Pipeline {
+/// Various useful constants that are often needed when talking to the GPU.
+///
+/// The first batch of them are the constants that we actually prepend to the
+/// GPU shader; then there's the sizes in bytes of various things.
+#[derive(Debug, Clone, Copy)]
+// even if some fields are unused, I still want to keep them around since they're needed to
+// calculate the rest.
+#[allow(unused)]
+struct Constants {
+    // The three fundamental numbers from which everything else is computed.
+    /// The number of cuboids we're finding common nets for.
+    num_cuboids: u32,
+    /// The shared area of those cuboids.
+    area: u32,
+    /// The capacity of each `Finder`'s trie.
+    trie_capacity: u32,
+
+    /// The width of the net that we've allocated (`2 * area + 1`).
+    net_width: u32,
+    /// The number of squares on the net (`net_width * net_width`).
+    net_len: u32,
+
+    /// The number of squares on the surfaces of the cuboids (`area`).
+    num_squares: u32,
+    /// The number of cursors on the surfaces of the cuboids (`4 *
+    /// num_squares`).
+    num_cursors: u32,
+    /// The capacity of `Finder`'s queue (`4 * num_squares`).
+    ///
+    /// This is `4 * num_squares` because there can be at most 4 instructions
+    /// trying to set each square, one coming from each direction.
+    queue_capacity: u32,
+
+    /// The index of the start of the page where searching should start in the
+    /// trie (`num_cursors`).
+    ///
+    /// This is `num_cursors` because that's the length of each normal page in
+    /// the trie.
+    trie_start: u32,
+
+    /// The number of `u32`s needed to represent the squares filled on the
+    /// surface (`num_squares.div_ceil(32)`).
+    surface_words: u32,
+    /// How many bytes an `Instruction` takes up (`4 * (2 + num_cuboids)`).
+    instruction_size: u32,
+    /// How many bytes a `PosState` takes up (`4 * (3 + num_cuboids)`).
+    pos_state_size: u32,
+
+    /// How many bytes a trie takes up (`4 * trie_capacity`).
+    trie_size: u32,
+    /// How many bytes a `Queue` takes up (`queue_capacity * instruction_size +
+    /// 4`).
+    queue_size: u32,
+    /// How many bytes `Finder::potential` + `Finder::potential_len` takes up
+    /// (`4 * (queue_capacity + 1)`).
+    potential_size: u32,
+    /// How many bytes `Finder::pos_states` takes up (`pos_state_size *
+    /// net_len`).
+    pos_states_size: u32,
+    /// How many bytes `Finder::surfaces` takes up (`4 * surface_words *
+    /// num_cuboids`).
+    surfaces_size: u32,
+
+    /// How many bytes a `Finder` takes up (`trie_size + queue_size +
+    /// potential_size + 8 + pos_states_size + surfaces_size`).
+    finder_size: u32,
+    /// The size of a `MaybeSolution` (`2 * queue_size`).
+    solution_size: u32,
+}
+
+impl Constants {
+    /// Computes a full set of `GpuConstants` from the fundamental three.
+    fn compute(num_cuboids: u32, area: u32, trie_capacity: u32) -> Constants {
+        let net_width = 2 * area + 1;
+        let net_len = net_width * net_width;
+
+        let num_squares = area;
+        let num_cursors = 4 * num_squares;
+        let queue_capacity = 4 * num_squares;
+
+        let trie_start = num_cursors;
+
+        let surface_words = (num_squares + 31) / 32;
+
+        let instruction_size = 4 * (2 + num_cuboids);
+        let pos_state_size = 4 * (3 + num_cuboids);
+
+        let trie_size = 4 * trie_capacity;
+        let queue_size = queue_capacity * instruction_size + 4;
+        let potential_size = 4 * (queue_capacity + 1);
+        let pos_states_size = pos_state_size * net_len;
+        let surfaces_size = 4 * surface_words * num_cuboids;
+
+        let finder_size =
+            trie_size + queue_size + potential_size + 8 + pos_states_size + surfaces_size;
+        let solution_size = 2 * queue_size;
+
+        Constants {
+            num_cuboids,
+            area,
+            trie_capacity,
+            net_width,
+            net_len,
+            num_squares,
+            num_cursors,
+            queue_capacity,
+            trie_start,
+            surface_words,
+            instruction_size,
+            pos_state_size,
+            trie_size,
+            queue_size,
+            potential_size,
+            pos_states_size,
+            surfaces_size,
+            finder_size,
+            solution_size,
+        }
+    }
+}
+
+/// A GPU pipeline set up for running `Finder`s.
+struct Pipeline<const CUBOIDS: usize> {
     device: Device,
     queue: Queue,
 
-    /// The surface area of the cuboids that this pipeline's `NetFinder`s search
+    /// The context that we need on the CPU to finish off the solutions the GPU
+    /// gives us, split `Finder`s, etc.
+    ctx: FinderCtx<CUBOIDS>,
+
+    /// The surface area of the cuboids that this pipeline's `Finder`s search
     /// for.
     area: u32,
     /// The maximum length of a `SkipSet` supported by this pipeline.
@@ -54,29 +176,19 @@ struct Pipeline {
     cpu_solution_buf: Buffer,
 }
 
-impl Pipeline {
+impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
     /// Creates a new GPU pipeline capable of running the given list of
-    /// `NetFinder`s.
+    /// `Finder`s.
     ///
-    /// The reason that the actual `NetFinder`s are needed rather than, say, a
+    /// The reason that the actual `Finder`s are needed rather than, say, a
     /// list of cuboids is to find out what the largest trie we need to allocate
     /// space for is.
     ///
-    /// All the `NetFinder`s need to be searching for the common nets of the
+    /// All the `Finder`s need to be searching for the common nets of the
     /// same list of cuboids.
-    async fn new<const CUBOIDS: usize>(finders: &[NetFinder<CUBOIDS>]) -> anyhow::Result<Self> {
+    async fn new(ctx: FinderCtx<CUBOIDS>, finders: &[Finder<CUBOIDS>]) -> anyhow::Result<Self> {
         if finders.is_empty() {
-            bail!("must specify at least one `NetFinder`");
-        }
-        let cuboids = finders[0].cuboids;
-        if finders[1..].iter().any(|finder| finder.cuboids != cuboids) {
-            bail!("finders are operating on different lists of cuboids");
-        }
-        if cuboids[1..]
-            .iter()
-            .any(|cuboid| cuboid.surface_area() != cuboids[0].surface_area())
-        {
-            bail!("cuboids do not all have the same surface area");
+            bail!("must specify at least one `Finder`");
         }
 
         let instance = Instance::new(InstanceDescriptor {
@@ -99,7 +211,7 @@ impl Pipeline {
 
         // Compute all the constants that we have to prepend to the WGSL module.
         let num_cuboids: u32 = CUBOIDS.try_into()?;
-        let area = cuboids[0].surface_area().try_into()?;
+        let area = ctx.target_area.try_into().unwrap();
         let trie_capacity = finders
             .iter()
             .map(|finder| finder.skip.data.len())
@@ -107,32 +219,21 @@ impl Pipeline {
             .unwrap()
             .try_into()?;
 
-        let net_width = 2 * area + 1;
-        let net_len = net_width * net_width;
-
-        let num_squares = area;
-        let num_cursors = 4 * num_squares;
-        let queue_capacity = num_cursors;
-
-        let trie_start = num_cuboids;
-
-        let surface_words = (num_squares + 31) / 32;
-
-        let instruction_size = 4 * (2 + num_cuboids);
-        let queue_size = instruction_size * queue_capacity + 4;
-        let potential_size = 4 * (queue_capacity + 1);
-        let pos_state_size = 4 * (3 + num_cuboids);
-        let finder_size = 4 * trie_capacity
-            + queue_size
-            + potential_size
-            + 8
-            + pos_state_size * net_len
-            + 4 * surface_words * num_cuboids;
-
-        let solution_size = 2 * queue_size;
+        let Constants {
+            net_width,
+            net_len,
+            num_squares,
+            num_cursors,
+            queue_capacity,
+            trie_start,
+            surface_words,
+            finder_size,
+            solution_size,
+            ..
+        } = Constants::compute(num_cuboids, area, trie_capacity);
 
         let mut lookup_buf_contents = Vec::new();
-        for cache in &finders[0].square_caches {
+        for cache in &ctx.square_caches {
             cache.to_gpu(&mut lookup_buf_contents);
         }
         let lookup_buf = device.create_buffer_init(&BufferInitDescriptor {
@@ -151,7 +252,7 @@ impl Pipeline {
         let solution_buf = device.create_buffer(&BufferDescriptor {
             label: Some("solution buffer"),
             size: u64::from(4 + SOLUTION_CAPACITY * solution_size),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -286,6 +387,8 @@ impl Pipeline {
             device,
             queue,
 
+            ctx,
+
             area,
             trie_capacity,
 
@@ -299,68 +402,45 @@ impl Pipeline {
         })
     }
 
+    fn constants(&self) -> Constants {
+        Constants::compute(CUBOIDS.try_into().unwrap(), self.area, self.trie_capacity)
+    }
+
     /// Runs the given finders for a bit and returns all the solutions they
     /// yield, as well as their state afterwards.
     ///
     /// Note that the number of finders returned may not be the same as the
     /// number passed in, since some finders may be split or finish.
-    fn run_finders<const CUBOIDS: usize>(
+    fn run_finders(
         &mut self,
-        mut finders: Vec<NetFinder<CUBOIDS>>,
-        prior_search_time: Duration,
-        start: Instant,
-    ) -> (Vec<Solution>, Vec<NetFinder<CUBOIDS>>) {
+        mut finders: Vec<Finder<CUBOIDS>>,
+    ) -> (Vec<Solution>, Vec<Finder<CUBOIDS>>, u64, u64) {
         let mut solutions = Vec::new();
 
         let mut i = 0;
+        let mut finders_created = 0;
+        let mut finders_finished = 0;
         while finders.len() < NUM_FINDERS.try_into().unwrap() {
             if finders.is_empty() {
                 // There's nothing for us to do.
-                return (Vec::new(), Vec::new());
+                return (Vec::new(), Vec::new(), finders_created, finders_finished);
             }
 
             if i >= finders.len() {
                 i -= finders.len();
             }
-            if let Some(finder) = finders[i].split() {
+            if let Some(finder) = finders[i].split(&self.ctx) {
                 finders.push(finder);
                 i += 1;
+                finders_created += 1;
             } else {
                 // If we couldn't split it, it's finished.
                 let finder = finders.remove(i);
                 // However, it may be finished *with a solution*, so try and finalise this.
-                solutions.extend(finder.finalize(prior_search_time, start));
+                solutions.extend(finder.finalize(&self.ctx));
+                finders_finished += 1;
             }
         }
-
-        // sike we're just gonna run the first one on the CPU now for a bit
-        // let finder = &mut finders[0];
-        // let mut i = 1;
-        // loop {
-        //     println!("{i}: {}", finder.queue.len());
-        //     if i == 23 {
-        //         for (i, instruction) in finder.queue.iter().enumerate() {
-        //             println!(
-        //                 "{i}: {} -> {:?}",
-        //                 instruction.net_pos.0,
-        //                 instruction.mapping.cursors.map(|cursor| cursor.0)
-        //             );
-        //         }
-        //     }
-        //     if finder.index < finder.queue.len() {
-        //         println!("{:?}", finder.queue[finder.index]);
-        //         finder.handle_instruction()
-        //     } else {
-        //         if !finder.backtrack() {
-        //             break;
-        //         }
-        //     }
-        //     i += 1;
-        // }
-
-        // panic!();
-
-        self.device.start_capture();
 
         // Write the finders into the GPU's buffer.
         let mut gpu_finders = Vec::new();
@@ -373,7 +453,7 @@ impl Pipeline {
             .device
             .create_command_encoder(&CommandEncoderDescriptor { label: None });
         // Clear the `len` field of the solutions to 0.
-        encoder.clear_buffer(&self.cpu_solution_buf, 0, Some(NonZeroU64::new(4).unwrap()));
+        encoder.clear_buffer(&self.solution_buf, 0, Some(NonZeroU64::new(4).unwrap()));
 
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -401,7 +481,6 @@ impl Pipeline {
         );
 
         let index = self.queue.submit([encoder.finish()]);
-        self.device.stop_capture();
 
         // Wait for the GPU to finish.
         self.device.poll(Maintain::WaitForSubmissionIndex(index));
@@ -419,56 +498,73 @@ impl Pipeline {
         // I think our buffers are guaranteed to be mapped once `poll` returns? (not on
         // web but I'm not targeting that rn so I don't care)
         // So now extract our results.
-        let _raw_finders = self.cpu_finder_buf.slice(..).get_mapped_range();
+        let raw_finders = self.cpu_finder_buf.slice(..).get_mapped_range();
         let raw_solutions = self.cpu_solution_buf.slice(..).get_mapped_range();
 
+        let Constants {
+            instruction_size,
+            queue_size,
+            finder_size,
+            solution_size,
+            ..
+        } = self.constants();
+
         let num_solutions = u32::from_le_bytes(raw_solutions[0..4].try_into().unwrap());
-        let solutions = (0..num_solutions.try_into().unwrap())
-            .flat_map(|i| {
-                let queue_capacity = usize::try_from(4 * self.area).unwrap();
-                let instruction_size = 4 * (2 + CUBOIDS);
-                let completed_offset = 4 + 2 * (queue_capacity * instruction_size + 4) * i;
-                let completed_len_offset = completed_offset + instruction_size * queue_capacity;
-                let potential_offset = completed_len_offset + 4;
-                let potential_len_offset = potential_offset + instruction_size * queue_capacity;
+        solutions.extend(
+            raw_solutions[4..]
+                .chunks(solution_size.try_into().unwrap())
+                .take(num_solutions.try_into().unwrap())
+                .flat_map(|bytes| {
+                    let queue_size: usize = queue_size.try_into().unwrap();
 
-                let completed_len = u32::from_le_bytes(
-                    raw_solutions[completed_len_offset..completed_len_offset + 4]
-                        .try_into()
-                        .unwrap(),
-                );
-                let potential_len = u32::from_le_bytes(
-                    raw_solutions[potential_len_offset..potential_len_offset + 4]
-                        .try_into()
-                        .unwrap(),
-                );
+                    let completed_offset = 0;
+                    let potential_offset = queue_size;
+                    let end_offset = 2 * queue_size;
 
-                let completed: Vec<_> = (0..usize::try_from(completed_len).unwrap())
-                    .map(|i| {
-                        let offset = completed_offset + i * instruction_size;
-                        Instruction::from_gpu(&raw_solutions[offset..offset + instruction_size])
-                    })
-                    .collect();
-                let potential: Vec<_> = (0..usize::try_from(potential_len).unwrap())
-                    .map(|i| {
-                        let offset = potential_offset + i * instruction_size;
-                        Instruction::from_gpu(&raw_solutions[offset..offset + instruction_size])
-                    })
-                    .collect();
+                    let completed_len = u32::from_le_bytes(
+                        bytes[potential_offset - 4..potential_offset]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    let potential_len =
+                        u32::from_le_bytes(bytes[end_offset - 4..end_offset].try_into().unwrap());
 
-                finalize_inner(
-                    (2 * self.area + 1).try_into().unwrap(),
-                    &finders[0].square_caches,
-                    &completed,
-                    potential,
-                    prior_search_time,
-                    start,
-                )
-            })
+                    let completed: Vec<_> = bytes[completed_offset..potential_offset - 4]
+                        .chunks(instruction_size.try_into().unwrap())
+                        .take(completed_len.try_into().unwrap())
+                        .map(Instruction::from_gpu)
+                        .collect();
+                    let potential: Vec<_> = bytes[potential_offset..end_offset - 4]
+                        .chunks(instruction_size.try_into().unwrap())
+                        .take(potential_len.try_into().unwrap())
+                        .map(Instruction::from_gpu)
+                        .collect();
+
+                    self.ctx.finalize(&completed, potential)
+                }),
+        );
+
+        let mut finders: Vec<Finder<CUBOIDS>> = raw_finders
+            .chunks(finder_size.try_into().unwrap())
+            .map(|bytes| Finder::from_gpu(self, bytes))
             .collect();
 
-        // TODO: finder deserialisation
-        (solutions, Vec::new())
+        // Get rid of any finders that are finished.
+        let old_len = finders.len();
+        finders.retain_mut(|finder| {
+            !(finder.index >= finder.queue.len()
+                && finder.queue[finder.base_index..]
+                    .iter()
+                    .all(|instruction| matches!(instruction.state, InstructionState::NotRun)))
+        });
+        finders_finished += u64::try_from(old_len - finders.len()).unwrap();
+
+        drop(raw_finders);
+        drop(raw_solutions);
+        self.cpu_finder_buf.unmap();
+        self.cpu_solution_buf.unmap();
+
+        (solutions, finders, finders_created, finders_finished)
     }
 }
 
@@ -480,8 +576,8 @@ impl SquareCache {
     }
 }
 
-impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
-    fn to_gpu(&self, pipeline: &Pipeline, buffer: &mut Vec<u8>) {
+impl<const CUBOIDS: usize> Finder<CUBOIDS> {
+    fn to_gpu(&self, pipeline: &Pipeline<CUBOIDS>, buffer: &mut Vec<u8>) {
         let trie_capacity = pipeline.trie_capacity;
         let queue_capacity = 4 * pipeline.area;
 
@@ -541,6 +637,98 @@ impl<const CUBOIDS: usize> NetFinder<CUBOIDS> {
                 // be able to fit into a `u32`.
                 buffer.extend_from_slice(&u32::to_le_bytes(surface.0.try_into().unwrap()));
             }
+        }
+    }
+
+    fn from_gpu(pipeline: &Pipeline<CUBOIDS>, mut bytes: &[u8]) -> Self {
+        let Constants {
+            net_width,
+            num_cursors,
+            surface_words,
+            instruction_size,
+            pos_state_size,
+            trie_size,
+            queue_size,
+            potential_size,
+            pos_states_size,
+            surfaces_size,
+            ..
+        } = pipeline.constants();
+
+        let trie_data: Vec<u32> = bytemuck::cast_slice(&bytes[..trie_size.try_into().unwrap()])
+            .iter()
+            .copied()
+            .map(u32::from_le)
+            .collect();
+        let skip = SkipSet {
+            data: trie_data,
+            page_size: num_cursors,
+        };
+        bytes = &bytes[trie_size.try_into().unwrap()..];
+
+        let queue_size: usize = queue_size.try_into().unwrap();
+        let queue_len = u32::from_le_bytes(bytes[queue_size - 4..queue_size].try_into().unwrap());
+        let queue = bytes[0..queue_size - 4]
+            .chunks(instruction_size.try_into().unwrap())
+            .take(queue_len.try_into().unwrap())
+            .map(Instruction::from_gpu)
+            .collect();
+        bytes = &bytes[queue_size..];
+
+        let potential_size: usize = potential_size.try_into().unwrap();
+        let potential_len = u32::from_le_bytes(
+            bytes[potential_size - 4..potential_size]
+                .try_into()
+                .unwrap(),
+        );
+        let potential: Vec<usize> = bytemuck::cast_slice(&bytes[..potential_size])
+            [..potential_len.try_into().unwrap()]
+            .iter()
+            .map(|&index| u32::from_le(index).try_into().unwrap())
+            .collect();
+        bytes = &bytes[potential_size..];
+
+        let index = u32::from_le_bytes(bytes[0..4].try_into().unwrap())
+            .try_into()
+            .unwrap();
+        let base_index = u32::from_le_bytes(bytes[4..8].try_into().unwrap())
+            .try_into()
+            .unwrap();
+        bytes = &bytes[8..];
+
+        let pos_states_size: usize = pos_states_size.try_into().unwrap();
+        let pos_states = bytes[0..pos_states_size.try_into().unwrap()]
+            .chunks(pos_state_size.try_into().unwrap())
+            .map(PosState::from_gpu)
+            .collect();
+        let pos_states = Net {
+            width: net_width.try_into().unwrap(),
+            squares: pos_states,
+        };
+        bytes = &bytes[pos_states_size..];
+
+        let surfaces = match surface_words {
+            1 => {
+                bytemuck::from_bytes::<[u32; CUBOIDS]>(&bytes[..surfaces_size.try_into().unwrap()])
+                    .map(u32::from_le)
+                    .map(u64::from)
+            }
+            2 => {
+                bytemuck::from_bytes::<[u64; CUBOIDS]>(&bytes[..surfaces_size.try_into().unwrap()])
+                    .map(u64::from_le)
+            }
+            _ => unreachable!("area > 64"),
+        }
+        .map(Surface);
+
+        Self {
+            skip,
+            queue,
+            potential,
+            pos_states,
+            surfaces,
+            index,
+            base_index,
         }
     }
 }
@@ -603,41 +791,81 @@ impl<const CUBOIDS: usize> PosState<CUBOIDS> {
         buffer.extend_from_slice(&u32::to_le_bytes(setter.try_into().unwrap()));
         buffer.extend_from_slice(&u32::to_le_bytes(conflict.try_into().unwrap()));
     }
+
+    fn from_gpu(bytes: &[u8]) -> Self {
+        let state = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let mapping = Mapping {
+            cursors: array::from_fn(|i| {
+                let offset = 4 + 4 * i;
+                let index = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+                Cursor(index.try_into().unwrap())
+            }),
+        };
+        let offset = 4 + 4 * CUBOIDS;
+        let setter = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            .try_into()
+            .unwrap();
+        let conflict = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap())
+            .try_into()
+            .unwrap();
+        match state {
+            0 => PosState::Unknown,
+            1 => PosState::Known { mapping, setter },
+            2 => PosState::Invalid {
+                mapping,
+                setter,
+                conflict,
+            },
+            3 => PosState::Filled { mapping, setter },
+            _ => unreachable!(),
+        }
+    }
 }
 
 pub fn run<const CUBOIDS: usize>(
-    _cuboids: [Cuboid; CUBOIDS],
     state: Arc<Mutex<State<CUBOIDS>>>,
     mut yielded_nets: HashSet<Net>,
-    _progress: ProgressBar,
-) -> impl Iterator<Item = Solution> {
+    progress: ProgressBar,
+) -> anyhow::Result<impl Iterator<Item = Solution>> {
     let guard = state.lock().unwrap();
-    let mut finders = guard.finders.clone();
+    let cuboids = guard.cuboids;
     let prior_search_time = guard.prior_search_time;
-    drop(guard);
     let start = Instant::now();
 
-    let mut pipeline = pollster::block_on(Pipeline::new(&finders)).unwrap();
-    let mut new_solutions = Vec::new();
+    let mut finders = guard.finders.clone();
+    drop(guard);
 
-    std::iter::from_fn(move || {
-        while !finders.is_empty() && new_solutions.is_empty() {
-            (new_solutions, finders) =
-                pipeline.run_finders(mem::take(&mut finders), prior_search_time, start);
-            new_solutions.retain(|solution| {
+    let ctx = FinderCtx::new(cuboids, prior_search_time)?;
+
+    let mut pipeline = pollster::block_on(Pipeline::new(ctx, &finders)).unwrap();
+    // The list of solutions we're partway through yielding.
+    let mut yielding = Vec::new();
+
+    Ok(std::iter::from_fn(move || {
+        while !finders.is_empty() && yielding.is_empty() {
+            let (mut solutions, new_finders, finders_created, finders_finished) =
+                pipeline.run_finders(mem::take(&mut finders));
+            finders = new_finders;
+
+            solutions.retain(|solution| {
                 let new = yielded_nets.insert(solution.net.clone());
                 new
             });
+            yielding = solutions;
+
             let mut state = state.lock().unwrap();
             state.finders = finders.clone();
-            state.solutions.extend(new_solutions.iter().cloned());
+            state.solutions.extend(yielding.iter().cloned());
             state.prior_search_time = prior_search_time + start.elapsed();
+
+            progress.inc_length(finders_created);
+            progress.inc(finders_finished);
         }
-        if let Some(solution) = new_solutions.pop() {
+        if let Some(solution) = yielding.pop() {
             Some(solution)
         } else {
             // We must be out of finders if we broke out of that loop, so we're done.
             None
         }
-    })
+    }))
 }

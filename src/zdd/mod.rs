@@ -25,7 +25,7 @@ const MAX_EDGES: usize = 60;
 /// of storing developments of a cuboid.
 ///
 /// There are some caveats with this; it doesn't produce output quite as clean
-/// as `NetFinder`:
+/// as `Finder`:
 /// * It doesn't de-duplicate rotations and such of the same net.
 /// * It doesn't check to make sure that no cuts are required.
 ///
