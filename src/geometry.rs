@@ -1355,7 +1355,7 @@ impl SquareCache {
 /// A square on the surface of a cuboid, represented by an index into
 /// `SquareCache::squares`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Square(u8);
+pub struct Square(pub u8);
 
 impl Square {
     /// Returns a square representing (0, 0) on the bottom face of a cuboid.

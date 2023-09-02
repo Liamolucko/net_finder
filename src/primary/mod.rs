@@ -16,7 +16,6 @@ use std::{
 
 use anyhow::{bail, Context};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -26,8 +25,11 @@ use crate::{
 
 mod cpu;
 // mod gpu;
+mod set;
 
 use Direction::*;
+
+use self::set::InstructionSet;
 
 /// The additional information that we need to have on hand to actually run a
 /// `Finder`.
@@ -103,7 +105,7 @@ pub struct Finder<const CUBOIDS: usize> {
     potential: Vec<usize>,
 
     /// The set of instructions that are in the queue.
-    queued: FxHashSet<Instruction<CUBOIDS>>,
+    queued: InstructionSet<CUBOIDS>,
     /// Buffers storing which squares we've filled on the surface of each cuboid
     /// so far.
     #[serde(with = "crate::utils::arrays")]
@@ -123,7 +125,7 @@ pub struct Finder<const CUBOIDS: usize> {
 }
 
 /// An instruction to add a square.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Instruction<const CUBOIDS: usize> {
     /// The position on the net where the square should be added.
     net_pos: Pos,
@@ -255,8 +257,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                     state: InstructionState::NotRun,
                 }];
 
-                let mut queued = FxHashSet::default();
-                queued.insert(queue[0].clone());
+                let mut queued = InstructionSet::new(cuboids[0].surface_area());
+                queued.insert(queue[0]);
 
                 // Skip all of the equivalence classes prior to this one.
                 let mut skip = SkipSet::new(cuboids);
@@ -342,11 +344,11 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                 if !zip(&self.surfaces, instruction.mapping.cursors())
                     .any(|(surface, cursor)| surface.filled(cursor.square()))
                     && !self.skip.contains(instruction.mapping)
-                    && !self.queued.contains(&instruction)
                 {
-                    self.queued.insert(instruction.clone());
-                    self.queue.push(instruction);
-                    has_followups = true;
+                    if self.queued.insert(instruction) {
+                        self.queue.push(instruction);
+                        has_followups = true;
+                    }
                 }
             }
 
