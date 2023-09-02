@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::Instruction;
 
 /// Builds a `u64` consisting of 4 copies of `value`.
+#[inline]
 fn repeat(value: u16) -> u64 {
     0x0001_0001_0001_0001 * (value as u64)
 }
@@ -12,6 +13,7 @@ fn repeat(value: u16) -> u64 {
 ///
 /// Based on https://graphics.stanford.edu/~seander/bithacks.html#ValueInWord,
 /// which I found via. hashbrown.
+#[inline]
 fn find_u16(word: u64, value: u16) -> u32 {
     let cmp = word ^ repeat(value);
     (cmp.wrapping_sub(repeat(0x0001)) & !cmp & repeat(0x8000)).trailing_zeros() / 16
@@ -48,6 +50,7 @@ impl<const CUBOIDS: usize> InstructionSet<CUBOIDS> {
 
     /// Inserts an instruction into the set and returns whether it was already
     /// contained within the set.
+    #[inline]
     pub(super) fn insert(&mut self, instruction: Instruction<CUBOIDS>) -> bool {
         let (count, word) =
             &mut self.elements[usize::from(instruction.mapping.cursors[0].square().0)];
@@ -63,6 +66,7 @@ impl<const CUBOIDS: usize> InstructionSet<CUBOIDS> {
     /// Removes an instruction from the set.
     ///
     /// Does nothing if the instruction isn't in the set.
+    #[inline]
     pub(super) fn remove(&mut self, instruction: &Instruction<CUBOIDS>) {
         let (count, word) =
             &mut self.elements[usize::from(instruction.mapping.cursors[0].square().0)];
