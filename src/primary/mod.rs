@@ -16,15 +16,16 @@ use std::{
 
 use anyhow::{bail, Context};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    equivalence_classes, ColoredNet, Cuboid, Direction, Mapping, Net, NetPos, Pos, SkipSet,
-    SquareCache, Surface,
+    equivalence_classes, ColoredNet, Cuboid, Direction, Mapping, Net, Pos, SkipSet, SquareCache,
+    Surface,
 };
 
 mod cpu;
-mod gpu;
+// mod gpu;
 
 use Direction::*;
 
@@ -101,8 +102,8 @@ pub struct Finder<const CUBOIDS: usize> {
     /// Note that some of these may now be invalid.
     potential: Vec<usize>,
 
-    /// Information about the state of each position in the net.
-    pos_states: Net<PosState<CUBOIDS>>,
+    /// The set of instructions that are in the queue.
+    queued: FxHashSet<Instruction<CUBOIDS>>,
     /// Buffers storing which squares we've filled on the surface of each cuboid
     /// so far.
     #[serde(with = "crate::utils::arrays")]
@@ -124,8 +125,8 @@ pub struct Finder<const CUBOIDS: usize> {
 /// An instruction to add a square.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Instruction<const CUBOIDS: usize> {
-    /// The index in `net.squares` where the square will be added.
-    net_pos: NetPos,
+    /// The position on the net where the square should be added.
+    net_pos: Pos,
     /// The cursors on each of the cuboids that that square folds up into.
     mapping: Mapping<CUBOIDS>,
     state: InstructionState,
@@ -133,7 +134,7 @@ struct Instruction<const CUBOIDS: usize> {
 
 impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
     fn moved_in(&self, ctx: &FinderCtx<CUBOIDS>, direction: Direction) -> Instruction<CUBOIDS> {
-        let net_pos = self.net_pos.moved_in(direction, ctx.net_width());
+        let net_pos = self.net_pos.moved_in_unchecked(direction);
         let mut mapping = self.mapping.clone();
         zip(&ctx.square_caches, mapping.cursors_mut())
             .for_each(|(cache, cursor)| *cursor = cursor.moved_in(cache, direction));
@@ -242,9 +243,10 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             .map(|class| class.into_iter().next().unwrap())
             .enumerate()
             .map(|(i, start_mapping)| {
-                let mut pos_states = Net::for_cuboids(&cuboids);
-                let middle = Pos::new(pos_states.width() / 2, pos_states.height() / 2);
-                let start_pos = NetPos::from_pos(&pos_states, middle);
+                let start_pos = Pos {
+                    x: cuboids[0].surface_area().try_into().unwrap(),
+                    y: cuboids[0].surface_area().try_into().unwrap(),
+                };
 
                 // The first instruction is to add the first square.
                 let queue = vec![Instruction {
@@ -253,11 +255,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                     state: InstructionState::NotRun,
                 }];
 
-                pos_states[start_pos] = PosState::Known {
-                    mapping: queue[0].mapping.clone(),
-                    // this is incorrect but it should be fine
-                    setter: 0,
-                };
+                let mut queued = FxHashSet::default();
+                queued.insert(queue[0].clone());
 
                 // Skip all of the equivalence classes prior to this one.
                 let mut skip = SkipSet::new(cuboids);
@@ -273,7 +272,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                     queue,
                     potential: Vec::new(),
 
-                    pos_states,
+                    queued,
                     surfaces: array::from_fn(|_| Surface::new()),
 
                     index: 0,
@@ -301,42 +300,18 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         if last_success_index < self.base_index {
             return false;
         }
-        let (InstructionState::Completed { followup_index }, PosState::Filled { mapping, setter }) =
-            (instruction.state, self.pos_states[instruction.net_pos])
-        else {
+        let InstructionState::Completed { followup_index } = instruction.state else {
             unreachable!()
         };
         // Mark it as reverted.
         instruction.state = InstructionState::NotRun;
-        self.pos_states[instruction.net_pos] = PosState::Known { mapping, setter };
         // Remove the square it added.
         for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
             surface.set_filled(cursor.square(), false)
         }
-        let net_pos = instruction.net_pos;
         // Then remove all the instructions added as a result of this square.
-        self.queue.drain(followup_index..);
-        // Update the `pos_states` of all the neighbouring positions.
-        for direction in [Left, Up, Right, Down] {
-            let neighbour = net_pos.moved_in(direction, self.pos_states.width().into());
-
-            // Update the state of the net position the instruction wanted to set.
-            match self.pos_states[neighbour] {
-                // We've literally just found an instruction next to this position; this is
-                // impossible.
-                PosState::Unknown => unreachable!(),
-                PosState::Known { setter, .. } if setter == last_success_index => {
-                    self.pos_states[neighbour] = PosState::Unknown;
-                }
-                PosState::Invalid {
-                    setter,
-                    conflict,
-                    mapping,
-                } if conflict == last_success_index => {
-                    self.pos_states[neighbour] = PosState::Known { mapping, setter };
-                }
-                _ => {}
-            }
+        for instruction in self.queue.drain(followup_index..) {
+            self.queued.remove(&instruction);
         }
 
         // Also un-mark any instructions that come after this instruction as potential,
@@ -359,19 +334,21 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         // it to the queue in the first place if that was the case.
         if !zip(&self.surfaces, instruction.mapping.cursors())
             .any(|(surface, cursor)| surface.filled(cursor.square()))
-            && !matches!(
-                self.pos_states[instruction.net_pos],
-                PosState::Invalid { .. }
-            )
         {
-            // Check whether this instruction has any valid follow-up instructions.
-            let has_followups = [Left, Up, Right, Down].into_iter().any(|direction| {
+            // Add any follow-up instructions.
+            let mut has_followups = false;
+            for direction in [Left, Right, Up, Down] {
                 let instruction = self.queue[self.index].moved_in(ctx, direction);
-                matches!(self.pos_states[instruction.net_pos], PosState::Unknown)
-                    && !zip(&self.surfaces, instruction.mapping.cursors())
-                        .any(|(surface, cursor)| surface.filled(cursor.square()))
+                if !zip(&self.surfaces, instruction.mapping.cursors())
+                    .any(|(surface, cursor)| surface.filled(cursor.square()))
                     && !self.skip.contains(instruction.mapping)
-            });
+                    && !self.queued.contains(&instruction)
+                {
+                    self.queued.insert(instruction.clone());
+                    self.queue.push(instruction);
+                    has_followups = true;
+                }
+            }
 
             // If there are no valid follow-up instructions, we don't actually fill the
             // square, since we are now considering this a potentially filled square.
@@ -384,44 +361,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                 instruction.state = InstructionState::Completed {
                     followup_index: next_index,
                 };
-                let PosState::Known { setter, mapping } = self.pos_states[instruction.net_pos]
-                else {
-                    unreachable!()
-                };
-                self.pos_states[instruction.net_pos] = PosState::Filled { setter, mapping };
                 for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
                     surface.set_filled(cursor.square(), true);
-                }
-
-                // Now that this instruction's properly been run, we update the `pos_states` of
-                // its neighbours.
-                for direction in [Left, Right, Up, Down] {
-                    let instruction = self.queue[self.index].moved_in(ctx, direction);
-                    match self.pos_states[instruction.net_pos] {
-                        // Neighbouring instructions with unknown mappings now have a known mapping.
-                        PosState::Unknown => {
-                            self.pos_states[instruction.net_pos] = PosState::Known {
-                                mapping: instruction.mapping.clone(),
-                                setter: self.index,
-                            };
-                            if !zip(&self.surfaces, instruction.mapping.cursors())
-                                .any(|(surface, cursor)| surface.filled(cursor.square()))
-                                && !self.skip.contains(instruction.mapping)
-                            {
-                                self.queue.push(instruction);
-                            }
-                        }
-                        // If any of this position's neighbours have known mappings that disagree
-                        // with what we think they should map to, they're now invalid.
-                        PosState::Known { mapping, setter } if mapping != instruction.mapping => {
-                            self.pos_states[instruction.net_pos] = PosState::Invalid {
-                                mapping,
-                                setter,
-                                conflict: self.index,
-                            }
-                        }
-                        _ => {}
-                    }
                 }
             } else {
                 // Add this to the list of potential instructions.
@@ -436,48 +377,14 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         !zip(&self.surfaces, instruction.mapping.cursors())
             .any(|(surface, cursor)| surface.filled(cursor.square()))
             && !self.skip.contains(instruction.mapping)
-            && !matches!(
-                self.pos_states[instruction.net_pos],
-                PosState::Invalid { .. }
-            )
     }
 
     /// Runs the instruction at the given index.
-    ///
-    /// This does more than just filling the squares on the net and the surface that the instruction says to: it also updates the `pos_states` of neighbouring squares.
+    // wow this is now really useless huh
     fn run_instruction(&mut self, ctx: &FinderCtx<CUBOIDS>, index: usize) {
         let instruction = &self.queue[index];
-        let PosState::Known { setter, mapping } = self.pos_states[instruction.net_pos] else {
-            unreachable!()
-        };
-        self.pos_states[instruction.net_pos] = PosState::Filled { setter, mapping };
         for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
             surface.set_filled(cursor.square(), true);
-        }
-
-        // Now that this instruction's properly been run, we update the `pos_states` of
-        // its neighbours.
-        for direction in [Left, Right, Up, Down] {
-            let instruction = self.queue[index].moved_in(ctx, direction);
-            match self.pos_states[instruction.net_pos] {
-                // Neighbouring instructions with unknown mappings now have a known mapping.
-                PosState::Unknown => {
-                    self.pos_states[instruction.net_pos] = PosState::Known {
-                        mapping: instruction.mapping.clone(),
-                        setter: index,
-                    };
-                }
-                // If any of this position's neighbours have known mappings that disagree
-                // with what we think they should map to, they're now invalid.
-                PosState::Known { mapping, setter } if mapping != instruction.mapping => {
-                    self.pos_states[instruction.net_pos] = PosState::Invalid {
-                        mapping,
-                        setter,
-                        conflict: index,
-                    }
-                }
-                _ => {}
-            }
         }
     }
 
@@ -529,7 +436,14 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             })
             .collect();
 
-        ctx.finalize(&self.queue, potential_squares)
+        let completed = self
+            .queue
+            .iter()
+            .filter(|instruction| matches!(instruction.state, InstructionState::Completed { .. }))
+            .cloned()
+            .collect();
+
+        ctx.finalize(completed, potential_squares)
     }
 
     /// Splits this `Finder` in place, so that its work is now split between
@@ -595,16 +509,54 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
     /// the GPU.
     fn finalize(
         &self,
-        completed: &[Instruction<CUBOIDS>],
-        potential: Vec<Instruction<CUBOIDS>>,
+        completed: Vec<Instruction<CUBOIDS>>,
+        mut potential: Vec<Instruction<CUBOIDS>>,
     ) -> Finalize<CUBOIDS> {
+        // Check if `completed` is even valid: nothing in `Finder` prevents multiple
+        // instructions from setting the same net position, or being neighbours on the
+        // net but disagreeing on what each other should map to (which leads to a cut).
+        for instruction in completed.iter() {
+            let to_check = [
+                instruction.clone(),
+                instruction.moved_in(self, Left),
+                instruction.moved_in(self, Up),
+                instruction.moved_in(self, Right),
+                instruction.moved_in(self, Down),
+            ];
+            for other_instruction in completed.iter() {
+                if to_check.iter().any(|instruction| {
+                    other_instruction.net_pos == instruction.net_pos
+                        && other_instruction.mapping != instruction.mapping
+                }) {
+                    return Finalize::Known(None);
+                }
+            }
+        }
+
+        // Get rid of any potential instructions that are invalid for the same reason.
+        potential.retain(|instruction| {
+            let to_check = [
+                instruction.clone(),
+                instruction.moved_in(self, Left),
+                instruction.moved_in(self, Up),
+                instruction.moved_in(self, Right),
+                instruction.moved_in(self, Down),
+            ];
+            for other_instruction in completed.iter() {
+                if to_check.iter().any(|instruction| {
+                    other_instruction.net_pos == instruction.net_pos
+                        && other_instruction.mapping != instruction.mapping
+                }) {
+                    return false;
+                }
+            }
+            true
+        });
+
         // First figure out what squares on the surface are already filled by the
         // completed instructions.
         let mut surfaces = [Surface::new(); CUBOIDS];
-        for instruction in completed
-            .iter()
-            .filter(|instruction| matches!(instruction.state, InstructionState::Completed { .. }))
-        {
+        for instruction in completed.iter() {
             for (surface, cursor) in zip(&mut surfaces, instruction.mapping.cursors()) {
                 surface.set_filled(cursor.square(), true);
             }
@@ -690,7 +642,6 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
         // `included`.
         let completed: Vec<_> = completed
             .iter()
-            .filter(|instruction| matches!(instruction.state, InstructionState::Completed { .. }))
             .chain(included.iter().map(|&index| &potential[index]))
             .cloned()
             .collect();
@@ -994,7 +945,9 @@ fn run<const CUBOIDS: usize>(
 
     // Yield all our previous solutions before starting the new ones.
     Ok(solutions.into_iter().chain(if gpu {
-        Box::new(gpu::run(state, yielded_nets, progress)?) as Box<dyn Iterator<Item = Solution>>
+        panic!()
+        // Box::new(gpu::run(state, yielded_nets, progress)?) as Box<dyn
+        // Iterator<Item = Solution>>
     } else {
         Box::new(cpu::run(state, yielded_nets, progress)?) as Box<dyn Iterator<Item = Solution>>
     }))

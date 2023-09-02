@@ -645,6 +645,7 @@ impl Display for Net {
 
 // A position in 2D space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(align(2))]
 pub struct Pos {
     pub x: u8,
     pub y: u8,
@@ -681,6 +682,28 @@ impl Pos {
         } else {
             None
         }
+    }
+
+    /// Move the position 1 unit in the given direction, without checking for
+    /// overflow / going off the edge of the net.
+    #[inline]
+    pub fn move_in_unchecked(&mut self, direction: Direction) {
+        let (x_off, y_off) = match direction {
+            Left => (-1i8 as u8, 0),
+            Up => (0, 1),
+            Right => (1, 0),
+            Down => (0, -1i8 as u8),
+        };
+        self.x = self.x.wrapping_add(x_off);
+        self.y = self.y.wrapping_add(y_off);
+    }
+
+    /// Returns this position moved 1 unit in the given direction,  without
+    /// checking for overflow / going off the edge of the net.
+    #[inline]
+    pub fn moved_in_unchecked(mut self, direction: Direction) -> Self {
+        self.move_in_unchecked(direction);
+        self
     }
 
     /// Returns what this position would be if the surface it was on was rotated

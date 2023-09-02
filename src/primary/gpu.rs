@@ -21,7 +21,7 @@ use wgpu::{
 
 use crate::{Cursor, Finder, Mapping, Net, NetPos, SkipSet, Solution, SquareCache, State, Surface};
 
-use super::{FinderCtx, Instruction, InstructionState, PosState};
+use super::{FinderCtx, Instruction, InstructionState};
 
 /// The number of `Finder`s we always give to the GPU.
 const NUM_FINDERS: u32 = 1792;
@@ -727,32 +727,18 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         }
         .map(Surface);
 
-        let mut result = Self {
+        Self {
             skip,
             queue,
             potential,
-            pos_states: Net::new(net_width.try_into().unwrap(), net_width.try_into().unwrap()),
+            queued: queue
+                .iter()
+                .map(|instruction| instruction.mapping)
+                .collect(),
             surfaces,
             index,
             base_index,
-        };
-
-        if !result.queue.is_empty() {
-            // Fill in `pos_states`.
-            // To begin with, the first instruction needs special treatment.
-            let first_instruction = &result.queue[0];
-            result.pos_states[first_instruction.net_pos] = PosState::Known {
-                mapping: first_instruction.mapping,
-                setter: 0,
-            };
-            for i in 0..result.queue.len() {
-                if matches!(result.queue[i].state, InstructionState::Completed { .. }) {
-                    result.run_instruction(&pipeline.ctx, i);
-                }
-            }
         }
-
-        result
     }
 }
 
