@@ -330,7 +330,6 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     /// Handle the instruction at the current index in the queue, incrementing
     /// the index afterwards.
     fn handle_instruction(&mut self, ctx: &FinderCtx<CUBOIDS>) {
-        let next_index = self.queue.len();
         let instruction = &self.queue[self.index];
         // We don't need to check if it's in `self.skip` because we wouldn't have added
         // it to the queue in the first place if that was the case.
@@ -338,19 +337,12 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             .any(|(surface, cursor)| surface.filled(cursor.square()))
         {
             // Add any follow-up instructions.
-            let mut has_followups = false;
-            for direction in [Left, Right, Up, Down] {
-                let instruction = self.queue[self.index].moved_in(ctx, direction);
-                if !zip(&self.surfaces, instruction.mapping.cursors())
-                    .any(|(surface, cursor)| surface.filled(cursor.square()))
-                    && !self.skip.contains(instruction.mapping)
-                {
-                    if self.queued.insert(instruction) {
-                        self.queue.push(instruction);
-                        has_followups = true;
-                    }
-                }
-            }
+            // We do this instead of using a loop to effectively force rustc to unroll it.
+            let old_len = self.queue.len();
+            self.add_followup(ctx, Left);
+            self.add_followup(ctx, Up);
+            self.add_followup(ctx, Right);
+            self.add_followup(ctx, Down);
 
             // If there are no valid follow-up instructions, we don't actually fill the
             // square, since we are now considering this a potentially filled square.
@@ -358,10 +350,10 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             // not having been run for now and do a pass through the whole queue to find all
             // the instructions that are still valid, which have to be the ones that we
             // intentionally didn't run here.
-            if has_followups {
+            if self.queue.len() > old_len {
                 let instruction = &mut self.queue[self.index];
                 instruction.state = InstructionState::Completed {
-                    followup_index: next_index,
+                    followup_index: old_len,
                 };
                 for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
                     surface.set_filled(cursor.square(), true);
@@ -381,12 +373,19 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             && !self.skip.contains(instruction.mapping)
     }
 
-    /// Runs the instruction at the given index.
-    // wow this is now really useless huh
-    fn run_instruction(&mut self, ctx: &FinderCtx<CUBOIDS>, index: usize) {
-        let instruction = &self.queue[index];
-        for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
-            surface.set_filled(cursor.square(), true);
+    /// Adds the follow-up instruction of the current instruction in the given
+    /// direction, if it's valid.
+    // rustc REALLY doesn't want to inline this for some reason so we have to force it.
+    #[inline(always)]
+    fn add_followup(&mut self, ctx: &FinderCtx<CUBOIDS>, direction: Direction) {
+        let instruction = self.queue[self.index].moved_in(ctx, direction);
+        if !zip(&self.surfaces, instruction.mapping.cursors())
+            .any(|(surface, cursor)| surface.filled(cursor.square()))
+            && !self.skip.contains(instruction.mapping)
+        {
+            if self.queued.insert(instruction) {
+                self.queue.push(instruction);
+            }
         }
     }
 
@@ -738,6 +737,7 @@ enum Finalize<'a, const CUBOIDS: usize> {
 impl<const CUBOIDS: usize> Iterator for Finalize<'_, CUBOIDS> {
     type Item = Solution;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             Finalize::Known(net) => net.take(),
