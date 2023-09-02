@@ -10,6 +10,7 @@ use std::str::FromStr;
 
 use anyhow::{bail, Context};
 use arbitrary::Arbitrary;
+use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 
 #[derive(
@@ -644,8 +645,8 @@ impl Display for Net {
 }
 
 // A position in 2D space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(align(2))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Pod, Zeroable)]
+#[repr(C, align(2))]
 pub struct Pos {
     pub x: u8,
     pub y: u8,
