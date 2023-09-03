@@ -331,32 +331,23 @@ impl<T: Clone> Net<T> {
     }
 }
 
-impl<T> Index<NetPos> for Net<T> {
-    type Output = T;
-
-    fn index(&self, pos: NetPos) -> &Self::Output {
-        &self.squares[pos.0]
-    }
-}
-
-impl<T> IndexMut<NetPos> for Net<T> {
-    fn index_mut(&mut self, pos: NetPos) -> &mut Self::Output {
-        &mut self.squares[pos.0]
-    }
-}
-
 impl<T> Index<Pos> for Net<T> {
     type Output = T;
 
     fn index(&self, pos: Pos) -> &Self::Output {
-        &self[NetPos::from_pos(self, pos)]
+        let x: usize = pos.x.into();
+        let y: usize = pos.y.into();
+        let width: usize = self.width.into();
+        &self.squares[y * width + x]
     }
 }
 
 impl<T> IndexMut<Pos> for Net<T> {
     fn index_mut(&mut self, pos: Pos) -> &mut Self::Output {
-        let pos = NetPos::from_pos(self, pos);
-        &mut self[pos]
+        let x: usize = pos.x.into();
+        let y: usize = pos.y.into();
+        let width: usize = self.width.into();
+        &mut self.squares[y * width + x]
     }
 }
 
@@ -491,7 +482,10 @@ impl Net<bool> {
         // net would have to be if that was the case.
         // If we don't run into any contradictions, we've found a valid colouring.
         let index = self.squares.iter().position(|&square| square).unwrap();
-        let net_start = NetPos(index).to_pos(self);
+        let net_start = Pos {
+            x: (index % usize::from(self.width)).try_into().unwrap(),
+            y: (index / usize::from(self.width)).try_into().unwrap(),
+        };
 
         // Create a mapping from net positions to face positions.
         // A lot of time is spent on repeatedly allocating/deallocating this, so share
@@ -729,51 +723,6 @@ impl Pos {
 impl Display for Pos {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "({}, {})", self.x, self.y)
-    }
-}
-
-/// A position in a net, represented as an index into its squares.
-///
-/// This isn't really for general-purpose use, because it has *zero protection
-/// whatsoever* against going off the edge of the net; this means that
-/// `moved_in` can easily return an invalid result if you do so, either wrapping
-/// around to the other end of the net if going off the edge horizontally or
-/// overflowing/giving a completely invalid index if going off the edge
-/// vertically.
-///
-/// So, this type should only be used if you're _absolutely certain_ that you'll
-/// never go off the edge of the net, as is the case with `Finder`.
-///
-/// TODO: Check if this results in any actual performance improvement, and if
-/// not get rid of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NetPos(pub(crate) usize);
-
-impl NetPos {
-    /// Creates a `NetPos` that represents `pos` on the given net.
-    pub fn from_pos<T>(net: &Net<T>, pos: Pos) -> Self {
-        Self(usize::from(pos.y) * usize::from(net.width()) + usize::from(pos.x))
-    }
-
-    /// Converts a `NetPos` to a regular `Pos`, given that it's a position on
-    /// the given net.
-    pub fn to_pos<T>(self, net: &Net<T>) -> Pos {
-        Pos {
-            x: (self.0 % usize::from(net.width)).try_into().unwrap(),
-            y: (self.0 / usize::from(net.width)).try_into().unwrap(),
-        }
-    }
-
-    /// Moves this position in `direction` on a given net.
-    #[inline]
-    pub fn moved_in(self, direction: Direction, net_width: usize) -> Self {
-        let new_index = match direction {
-            Left => self.0 - 1,
-            Up => self.0 + net_width,
-            Right => self.0 + 1,
-            Down => self.0 - net_width,
-        };
-        Self(new_index)
     }
 }
 
