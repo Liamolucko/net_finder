@@ -146,35 +146,19 @@ fn insert(queued: ptr<function, array<vec4<u32>, num_squares>>, instruction: Ins
     return !exists;
 }
 
-/// Removes an instruction from `Finder::queued`. Does nothing if the
-/// instruction isn't contained within the set.
+/// Removes the last added instruction which sets the same square on the first
+/// cuboid as `instruction` from `Finder::queued`.
+///
+/// This would be rather a weird thing to do in general, but we always remove
+/// instructions from the queue in the opposite order we add them (it's a stack!)
+/// so it's fine.
 fn remove(queued: ptr<function, array<vec4<u32>, num_squares>>, instruction: Instruction) {
     let positions = &(*queued)[instruction.mapping[0] >> 2u];
-    let tagged_pos = instruction.net_pos | 0x80000000u;
-    // Unfortunately I don't think there's any better way of doing this than a
-    // plain old linear search. But it's unrolled so that we can do swizzling.
-    if ((*positions).x & 0x80000000u) == 0u {
-        return;
-    } else if ((*positions).x & 0x8fffffffu) == tagged_pos {
-        *positions = vec4((*positions).yzw, 0u);
-    } else if ((*positions).y & 0x80000000u) == 0u {
-        return;
-    } else if (*positions).y == tagged_pos {
-        *positions = vec4((*positions).xzw, 0u);
-    } else if ((*positions).z & 0x80000000u) == 0u {
-        return;
-    } else if (*positions).z == tagged_pos {
-        *positions = vec4((*positions).xyw, 0u);
-    } else if (*positions).w == tagged_pos {
-        (*positions).w = 0u;
-    } else {
-        return;
-    }
-
-    // If we got here, the instruction's been successfully removed (otherwise
-    // we'd have early returned).
-    // So now we need to decrement the length.
+    // Decrement the length.
     (*positions).x -= 0x10000000u;
+    // Set the entry we're removing back to 0.
+    let length = ((*positions).x >> 28u) & 0x7u;
+    (*positions)[length] = 0u;
 }
 
 /// Returns whether the given square is filled on the given surface.

@@ -81,21 +81,18 @@ impl<const CUBOIDS: usize> InstructionSet<CUBOIDS> {
         new
     }
 
-    /// Removes an instruction from the set.
+    /// Removes the last added instruction which sets the same square on the
+    /// first cuboid as `instruction` from the set.
     ///
-    /// Does nothing if the instruction isn't in the set.
+    /// This would be rather a weird thing to do in general, but we always
+    /// remove instructions from the queue in the opposite order we add them
+    /// (it's a stack!) so it's fine.
     #[inline]
     pub(super) fn remove(&mut self, instruction: &Instruction<CUBOIDS>) {
         let (count, word) =
             &mut self.elements[usize::from(instruction.mapping.cursors[0].square().0)];
-        let encoded_pos: u16 = bytemuck::cast(instruction.net_pos);
-        let index = find_u16(*word, encoded_pos);
-        if index < *count {
-            let after_mask = u64::MAX << 16 * index;
-            let before_mask = !after_mask;
-            *word = (*word & before_mask) | ((*word >> 16) & after_mask);
-            *count -= 1;
-        }
+        *count -= 1;
+        *word &= (1 << (16 * *count)) - 1;
     }
 }
 
