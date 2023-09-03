@@ -5,9 +5,6 @@
 // override area: u32;
 // override trie_capacity: u32;
 //
-// const net_width = 2u * area + 1u;
-// const net_len = net_width * net_width;
-//
 // const num_squares = area;
 // const num_cursors = 4u * num_squares;
 // // There can be at most 4 instructions trying to set each square, one coming
@@ -59,6 +56,18 @@ struct Finder {
     /// Bitfields encoding which squares on the surfaces of each cuboid are
     /// filled.
     surfaces: array<array<u32, surface_words>, num_cuboids>,
+    /// The set of instructions in `queue`, using a weird custom encoding.
+    ///
+    /// The encoding is similar to `InstructionSet` but slightly different.
+    /// Firstly, there's one `vec4<u32>` corresponding to every square on the
+    /// first cuboid. Each `u32` contains the net position of one instruction
+    /// that sets that square.
+    ///
+    /// However, a net position only takes up 16 bits. Since we have no choice
+    /// but to use full `u32`s, we use the upper bits to do two things at once:
+    /// - The MSB of any position represents whether that spot is filled.
+    /// - The next 3 bits of `positions.x` store the number of filled spots.
+    queued: array<vec4<u32>, num_squares>,
 }
 
 /// A list of instructions.
@@ -70,8 +79,8 @@ struct Queue {
 /// An instruction to set a position on the net, and map it to a particular
 /// cursor on each cuboid.
 struct Instruction {
-    /// The position on the net this instruction sets, as an index into
-    /// `pos_states`.
+    /// The position on the net this instruction sets. Encoded as
+    ///     00000000_00000000_xxxxxxxx_yyyyyyyy.
     net_pos: u32,
     /// The cursors on the surfaces of each cuboid that this instruction maps
     /// `net_pos` to.
@@ -82,37 +91,6 @@ struct Instruction {
     /// mean it had an index less than 0.)
     followup_index: u32,
 }
-
-struct PosState {
-    // note: all these u32s could actually be u8s, so try bit-packing them later
-    // as an optimisation.
-    /// The state that this position is in, one of:
-    /// - `UNKNOWN`: we don't know anything about this position yet.
-    /// - `KNOWN`: if this position is filled, it has to map to `mapping`.
-    /// - `INVALID`: there are two neighbouring instructions that expect this
-    ///   position to map to two different things, so it can't be filled.
-    /// - `FILLED`: this position is filled.
-    state: u32,
-    /// The earliest mapping that an instruction expected this position to map
-    /// to. So, in `KNOWN` or `FILLED` state this is just the one mapping that
-    /// this position has to / is mapped to, and in `INVALID` state this is the
-    /// first of multiple mappings that this position was expected to map to.
-    mapping: array<u32, num_cuboids>,
-    /// The index of the first instruction that expected this position to map to
-    /// `mapping`.
-    /// Note that this is *not* the instruction that actually wants to map this
-    /// position to said mapping; this is its parent, since we want this
-    /// `PosState` to get set even if the instruction's invalid.
-    setter: u32,
-    /// If `state` is `INVALID`, the index of the first instruction to expect
-    /// this position to map to something other than `mapping`.
-    conflict: u32,
-}
-
-const UNKNOWN = 0u;
-const KNOWN = 1u;
-const INVALID = 2u;
-const FILLED = 3u;
 
 @group(0) @binding(1) var<storage, read_write> finders: array<Finder>;
 
@@ -134,14 +112,14 @@ fn skip(trie: ptr<function, array<u32, trie_capacity>>, instruction: Instruction
 fn instruction_neighbour(instruction: Instruction, direction: u32) -> Instruction {
     var result = instruction;
 
-    // If `direction` is left/right (even), we need to offset the index by 1,
-    // otherwise we need to offset it by `net_width`.
-    let magnitude = select(net_width, 1u, direction % 2u == 0u);
-    // Then, if `direction` is left or down, we need to subtract that offset,
-    // otherwise we add it. Left and down are represented as 0 and 3, so
-    // subtracting 1 means they become 2^32 - 1 and 2 respectively, and so we
-    // can just check if that's >= 2.
-    result.net_pos = select(result.net_pos + magnitude, result.net_pos - magnitude, direction - 1u >= 2u);
+    // This is a little trick I noticed rustc using to optimise small match
+    // statements.
+    let x_offset = (0x000100ffu >> (8u * direction)) & 0xffu;
+    let y_offset = (0xff000100u >> (8u * direction)) & 0xffu;
+
+    let x = ((result.net_pos >> 8u) + x_offset) & 0xffu;
+    let y = (result.net_pos + y_offset) & 0xffu;
+    result.net_pos = (x << 8u) | y;
 
     for (var i = 0u; i < num_cuboids; i++) {
         result.mapping[i] = cursor_neighbour(i, result.mapping[i], direction);
@@ -151,6 +129,52 @@ fn instruction_neighbour(instruction: Instruction, direction: u32) -> Instructio
     result.followup_index = 0u;
 
     return result;
+}
+
+/// Inserts an instruction into `Finder::queued` and returns whether it was not
+/// already contained within the set.
+fn insert(queued: ptr<function, array<vec4<u32>, num_squares>>, instruction: Instruction) -> bool {
+    let positions = &(*queued)[instruction.mapping[0] >> 2u];
+    let tagged_pos = instruction.net_pos | 0x80000000u;
+    let exists = any((*positions & vec4(0x8fffffffu)) == vec4(tagged_pos));
+    if !exists {
+        let length = ((*positions).x >> 28u) & 0x7u;
+        (*positions)[length] = tagged_pos;
+        // Increment the length.
+        (*positions).x += 0x10000000u;
+    }
+    return !exists;
+}
+
+/// Removes an instruction from `Finder::queued`. Does nothing if the
+/// instruction isn't contained within the set.
+fn remove(queued: ptr<function, array<vec4<u32>, num_squares>>, instruction: Instruction) {
+    let positions = &(*queued)[instruction.mapping[0] >> 2u];
+    let tagged_pos = instruction.net_pos | 0x80000000u;
+    // Unfortunately I don't think there's any better way of doing this than a
+    // plain old linear search. But it's unrolled so that we can do swizzling.
+    if ((*positions).x & 0x80000000u) == 0u {
+        return;
+    } else if ((*positions).x & 0x8fffffffu) == tagged_pos {
+        *positions = vec4((*positions).yzw, 0u);
+    } else if ((*positions).y & 0x80000000u) == 0u {
+        return;
+    } else if (*positions).y == tagged_pos {
+        *positions = vec4((*positions).xzw, 0u);
+    } else if ((*positions).z & 0x80000000u) == 0u {
+        return;
+    } else if (*positions).z == tagged_pos {
+        *positions = vec4((*positions).xyw, 0u);
+    } else if (*positions).w == tagged_pos {
+        (*positions).w = 0u;
+    } else {
+        return;
+    }
+
+    // If we got here, the instruction's been successfully removed (otherwise
+    // we'd have early returned).
+    // So now we need to decrement the length.
+    (*positions).x -= 0x10000000u;
 }
 
 /// Returns whether the given square is filled on the given surface.
@@ -182,45 +206,21 @@ struct MaybeSolutions {
     items: array<MaybeSolution>,
 }
 
-@group(0) @binding(2) var<storage, read_write> pos_states: array<array<PosState, net_len>>;
-
-@group(0) @binding(3) var<storage, read_write> maybe_solutions: MaybeSolutions;
+@group(0) @binding(2) var<storage, read_write> maybe_solutions: MaybeSolutions;
 
 @compute @workgroup_size(64)
 fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
     var finder = finders[id.x];
-    let pos_states_idx = id.x;
-
-    let pos_states = &pos_states[pos_states_idx];
-    // Fill in `pos_states`.
-    // First off, the first instruction in the queue gets special treatement.
-    let first_instruction = finder.queue.items[0];
-    (*pos_states)[first_instruction.net_pos].state = KNOWN;
-    (*pos_states)[first_instruction.net_pos].mapping = first_instruction.mapping;
-    // This is incorrect, but works since this only ever does anything if this
-    // is set to the index of a neighbouring instruction, and the first
-    // instruction isn't a neighbour of itself.
-    (*pos_states)[first_instruction.net_pos].setter = 0u;
-    // Then for everything else, we can just re-run all the instructions in the
-    // queue that have already been run.
-    //
-    // (This also needlessly re-fills in `finder.surfaces` but it doesn't really
-    // matter.)
-    for (var i = 0u; i < finder.queue.len; i++) {
-        if finder.queue.items[i].followup_index != 0u {
-            run_instruction(&finder, pos_states_idx, i);
-        }
-    }
 
     for (var i = 0u; i < 10000u; i++) {
         if finder.index < finder.queue.len {
-            handle_instruction(&finder, pos_states_idx);
+            handle_instruction(&finder);
         } else {
             // We've reached the end of the queue, so we might have a solution!
             // However, the very very common case is that we definitely don't
             // because there are squares that no potential instructions cover.
-            if covers_surface(&finder, pos_states_idx) {
-                if !write_solution(&finder, pos_states_idx) {
+            if covers_surface(&finder) {
+                if !write_solution(&finder) {
                     // Stop searching if there's no room for more solutions.
                     //
                     // Don't backtrack, since we want to still be at the end of
@@ -229,7 +229,7 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
             }
 
-            if !backtrack(&finder, pos_states_idx) {
+            if !backtrack(&finder) {
                 break;
             }
         }
@@ -239,23 +239,31 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 /// Attempts to run the next instruction in `finder`'s queue.
-fn handle_instruction(finder: ptr<function, Finder>, pos_states_idx: u32) {
+fn handle_instruction(finder: ptr<function, Finder>) {
     let instruction = &(*finder).queue.items[(*finder).index];
-    if valid(finder, pos_states_idx, *instruction) {
+    if valid(finder, *instruction) {
         let old_len = (*finder).queue.len;
         // Add all this instruction's follow-up instructions to the queue.
         for (var direction = 0u; direction < 4u; direction++) {
             let instruction = instruction_neighbour(*instruction, direction);
-            if pos_states[pos_states_idx][instruction.net_pos].state == UNKNOWN && valid(finder, pos_states_idx, instruction) && !skip(&(*finder).skip, instruction) {
-                (*finder).queue.items[(*finder).queue.len] = instruction;
-                (*finder).queue.len += 1u;
+            if valid(finder, instruction) && !skip(&(*finder).skip, instruction) {
+                if insert(&(*finder).queued, instruction) {
+                    (*finder).queue.items[(*finder).queue.len] = instruction;
+                    (*finder).queue.len += 1u;
+                }
             }
         }
 
         // Only if it had follow-up instructions do we actually run it.
         if (*finder).queue.len > old_len {
             (*instruction).followup_index = old_len;
-            run_instruction(finder, pos_states_idx, (*finder).index);
+
+            // Fill in the squares that the instruction sets.
+            for (var i = 0u; i < num_cuboids; i++) {
+                // Functions aren't allowed to take pointers in the storage
+                // address space, so we have to make a copy.
+                set_filled(&(*finder).surfaces[i], (*instruction).mapping[i] >> 2u, true);
+            }
         } else {
             // Otherwise mark it as potential.
             (*finder).potential[(*finder).potential_len] = (*finder).index;
@@ -265,38 +273,11 @@ fn handle_instruction(finder: ptr<function, Finder>, pos_states_idx: u32) {
     (*finder).index += 1u;
 }
 
-/// Runs the instruction at index `index` in `finder`'s queue.
-fn run_instruction(finder: ptr<function, Finder>, pos_states_idx: u32, index: u32) {
-    var instruction = (*finder).queue.items[index];
-
-    // Fill in the squares that the instruction sets.
-    pos_states[pos_states_idx][instruction.net_pos].state = FILLED;
-    for (var i = 0u; i < num_cuboids; i++) {
-        // Functions aren't allowed to take pointers in the storage
-        // address space, so we have to make a copy.
-        set_filled(&(*finder).surfaces[i], instruction.mapping[i] >> 2u, true);
-    }
-
-    // Update the `pos_states` of neighbouring squares.
-    for (var direction = 0u; direction < 4u; direction++) {
-        let instruction = instruction_neighbour(instruction, direction);
-        let pos_state = &pos_states[pos_states_idx][instruction.net_pos];
-        if (*pos_state).state == UNKNOWN {
-            (*pos_state).mapping = instruction.mapping;
-            (*pos_state).state = KNOWN;
-            (*pos_state).setter = index;
-        } else if (*pos_state).state == KNOWN && !mapping_eq(instruction.mapping, (*pos_state).mapping) {
-            (*pos_state).state = INVALID;
-            (*pos_state).conflict = index;
-        }
-    }
-}
-
 /// Attempts to undo the last instruction run by `finder`.
 ///
 /// Returns true on success, and false otherwise, which happens if `finder` has
 /// no run instructions left; in that case, it's done!
-fn backtrack(finder: ptr<function, Finder>, pos_states_idx: u32) -> bool {
+fn backtrack(finder: ptr<function, Finder>) -> bool {
     // Find the instruction that was last run.
     var last_run = (*finder).queue.len - 1u;
     if last_run >= queue_capacity {
@@ -315,27 +296,15 @@ fn backtrack(finder: ptr<function, Finder>, pos_states_idx: u32) -> bool {
     let instruction = &(*finder).queue.items[last_run];
     // Remove all `instruction`'s follow-up instructions from the queue and mark
     // it as not run.
+    for (var i = (*instruction).followup_index; i < (*finder).queue.len; i++) {
+        remove(&(*finder).queued, (*finder).queue.items[i]);
+    }
     (*finder).queue.len = (*instruction).followup_index;
     (*instruction).followup_index = 0u;
 
-    // Unmark its squares on the net and the surface as filled.
-    pos_states[pos_states_idx][(*instruction).net_pos].state = KNOWN;
+    // Unmark its squares on the surface as filled.
     for (var i = 0u; i < num_cuboids; i++) {
-        var surface = (*finder).surfaces[i];
-        set_filled(&surface, (*instruction).mapping[i] >> 2u, false);
-        (*finder).surfaces[i] = surface;
-    }
-
-    // Update the `pos_states` of all the neighbouring net positions.
-    for (var direction = 0u; direction < 4u; direction++) {
-        let instruction = instruction_neighbour(*instruction, direction);
-        let pos_state = &pos_states[pos_states_idx][instruction.net_pos];
-        // If the instruction we just reverted was the one that advanced this
-        // `PosState` to the `KNOWN` or `INVALID` state, move it back to the
-        // previous state.
-        if ((*pos_state).state == INVALID && (*pos_state).conflict == last_run) || ((*pos_state).state == KNOWN && (*pos_state).setter == last_run) {
-            (*pos_state).state -= 1u;
-        }
+        set_filled(&(*finder).surfaces[i], (*instruction).mapping[i] >> 2u, false);
     }
 
     // Also un-mark any instructions that come after this instruction as
@@ -351,11 +320,9 @@ fn backtrack(finder: ptr<function, Finder>, pos_states_idx: u32) -> bool {
 }
 
 /// Returns whether an instruction is valid. Note that this does *not* consider whether it's skipped.
-fn valid(finder: ptr<function, Finder>, pos_states_idx: u32, instruction: Instruction) -> bool {
+fn valid(finder: ptr<function, Finder>, instruction: Instruction) -> bool {
     // wgpu doesn't support and-assign for bools yet so use an integer.
     var result = 1u;
-
-    result &= u32(pos_states[pos_states_idx][instruction.net_pos].state != INVALID);
 
     var mapping = instruction.mapping;
     for (var i = 0u; i < num_cuboids; i++) {
@@ -377,7 +344,7 @@ fn mapping_eq(a: array<u32, num_cuboids>, b: array<u32, num_cuboids>) -> bool {
     return bool(result);
 }
 
-fn covers_surface(finder: ptr<function, Finder>, pos_states_idx: u32) -> bool {
+fn covers_surface(finder: ptr<function, Finder>) -> bool {
     var surfaces = (*finder).surfaces;
 
     // Return early in the common case that there aren't enough potential
@@ -389,7 +356,7 @@ fn covers_surface(finder: ptr<function, Finder>, pos_states_idx: u32) -> bool {
     for (var i = 0u; i < (*finder).potential_len; i++) {
         let index = (*finder).potential[i];
         var instruction = (*finder).queue.items[index];
-        if valid(finder, pos_states_idx, instruction) {
+        if valid(finder, instruction) {
             for (var i = 0u; i < num_cuboids; i++) {
                 set_filled(&surfaces[i], instruction.mapping[i] >> 2u, true);
             }
@@ -418,7 +385,7 @@ fn num_filled(surface: ptr<function, array<u32, surface_words>>) -> u32 {
 ///
 /// Returns whether writing was successful; if false is returned, it means that
 /// there was no more room.
-fn write_solution(finder: ptr<function, Finder>, pos_states_idx: u32) -> bool {
+fn write_solution(finder: ptr<function, Finder>) -> bool {
     let index = atomicAdd(&maybe_solutions.len, 1u);
     if index >= arrayLength(&maybe_solutions.items) {
         // Oops, there's not actually that much room. Undo.
@@ -440,7 +407,7 @@ fn write_solution(finder: ptr<function, Finder>, pos_states_idx: u32) -> bool {
     for (var i = 0u; i < (*finder).potential_len; i++) {
         let index = (*finder).potential[i];
         let instruction = (*finder).queue.items[index];
-        if valid(finder, pos_states_idx, instruction) {
+        if valid(finder, instruction) {
             (*sol).potential.items[(*sol).potential.len] = instruction;
             (*sol).potential.len += 1u;
         }

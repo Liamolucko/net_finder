@@ -19,9 +19,9 @@ use wgpu::{
     ShaderModuleDescriptor, ShaderSource, ShaderStages,
 };
 
-use crate::{Cursor, Finder, Mapping, Net, NetPos, SkipSet, Solution, SquareCache, State, Surface};
+use crate::{Cursor, Finder, Mapping, Net, Pos, SkipSet, Solution, SquareCache, State, Surface};
 
-use super::{FinderCtx, Instruction, InstructionState};
+use super::{set::InstructionSet, FinderCtx, Instruction, InstructionState};
 
 /// The number of `Finder`s we always give to the GPU.
 const NUM_FINDERS: u32 = 1792;
@@ -48,11 +48,6 @@ struct Constants {
     /// The capacity of each `Finder`'s trie.
     trie_capacity: u32,
 
-    /// The width of the net that we've allocated (`2 * area + 1`).
-    net_width: u32,
-    /// The number of squares on the net (`net_width * net_width`).
-    net_len: u32,
-
     /// The number of squares on the surfaces of the cuboids (`area`).
     num_squares: u32,
     /// The number of cursors on the surfaces of the cuboids (`4 *
@@ -76,8 +71,6 @@ struct Constants {
     surface_words: u32,
     /// How many bytes an `Instruction` takes up (`4 * (2 + num_cuboids)`).
     instruction_size: u32,
-    /// How many bytes a `PosState` takes up (`4 * (3 + num_cuboids)`).
-    pos_state_size: u32,
 
     /// How many bytes a trie takes up (`4 * trie_capacity`).
     trie_size: u32,
@@ -90,9 +83,13 @@ struct Constants {
     /// How many bytes `Finder::surfaces` takes up (`4 * surface_words *
     /// num_cuboids`).
     surfaces_size: u32,
+    /// How many bytes of padding there are before `Finder::queued`.
+    queued_padding: u32,
+    /// How many bytes `Finder::queued` takes up (`4 * 4 * num_squares`).
+    queued_size: u32,
 
     /// How many bytes a `Finder` takes up (`trie_size + queue_size +
-    /// potential_size + 8 + pos_states_size + surfaces_size`).
+    /// potential_size + 8 + surfaces_size + queued_padding + queued_size`).
     finder_size: u32,
     /// The size of a `MaybeSolution` (`2 * queue_size`).
     solution_size: u32,
@@ -101,9 +98,6 @@ struct Constants {
 impl Constants {
     /// Computes a full set of `GpuConstants` from the fundamental three.
     fn compute(num_cuboids: u32, area: u32, trie_capacity: u32) -> Constants {
-        let net_width = 2 * area + 1;
-        let net_len = net_width * net_width;
-
         let num_squares = area;
         let num_cursors = 4 * num_squares;
         let queue_capacity = 4 * num_squares;
@@ -113,33 +107,38 @@ impl Constants {
         let surface_words = (num_squares + 31) / 32;
 
         let instruction_size = 4 * (2 + num_cuboids);
-        let pos_state_size = 4 * (3 + num_cuboids);
 
         let trie_size = 4 * trie_capacity;
         let queue_size = queue_capacity * instruction_size + 4;
         let potential_size = 4 * (queue_capacity + 1);
         let surfaces_size = 4 * surface_words * num_cuboids;
+        let queued_size = 4 * 4 * num_squares;
 
-        let finder_size = trie_size + queue_size + potential_size + 8 + surfaces_size;
+        let unpadded_finder_size =
+            trie_size + queue_size + potential_size + 8 + surfaces_size + queued_size;
+        let queued_padding = match unpadded_finder_size % 16 {
+            0 => 0,
+            x => 16 - x,
+        };
+        let finder_size = unpadded_finder_size + queued_padding;
         let solution_size = 2 * queue_size;
 
         Constants {
             num_cuboids,
             area,
             trie_capacity,
-            net_width,
-            net_len,
             num_squares,
             num_cursors,
             queue_capacity,
             trie_start,
             surface_words,
             instruction_size,
-            pos_state_size,
             trie_size,
             queue_size,
             potential_size,
             surfaces_size,
+            queued_padding,
+            queued_size,
             finder_size,
             solution_size,
         }
@@ -165,7 +164,6 @@ struct Pipeline<const CUBOIDS: usize> {
     bind_group: BindGroup,
 
     finder_buf: Buffer,
-    pos_states_buf: Buffer,
     solution_buf: Buffer,
     cpu_finder_buf: Buffer,
     cpu_solution_buf: Buffer,
@@ -215,14 +213,11 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             .try_into()?;
 
         let Constants {
-            net_width,
-            net_len,
             num_squares,
             num_cursors,
             queue_capacity,
             trie_start,
             surface_words,
-            pos_state_size,
             finder_size,
             solution_size,
             ..
@@ -236,13 +231,6 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             label: Some("neighbour lookup buffer"),
             contents: &lookup_buf_contents,
             usage: BufferUsages::UNIFORM,
-        });
-
-        let pos_states_buf = device.create_buffer(&BufferDescriptor {
-            label: Some("pos_states buffer"),
-            size: u64::from(pos_state_size * net_len * NUM_FINDERS),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
 
         let finder_buf = device.create_buffer(&BufferDescriptor {
@@ -295,7 +283,7 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
-                        min_binding_size: Some(cpu_finder_buf.size().try_into().unwrap()),
+                        min_binding_size: Some(finder_buf.size().try_into().unwrap()),
                     },
                     count: None,
                 },
@@ -305,17 +293,7 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
-                        min_binding_size: Some(pos_states_buf.size().try_into().unwrap()),
-                    },
-                    count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: ShaderStages::COMPUTE,
-                    ty: BindingType::Buffer {
-                        ty: BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: Some(cpu_solution_buf.size().try_into().unwrap()),
+                        min_binding_size: Some(solution_buf.size().try_into().unwrap()),
                     },
                     count: None,
                 },
@@ -345,14 +323,6 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
                 BindGroupEntry {
                     binding: 2,
                     resource: BindingResource::Buffer(BufferBinding {
-                        buffer: &pos_states_buf,
-                        offset: 0,
-                        size: None,
-                    }),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::Buffer(BufferBinding {
                         buffer: &solution_buf,
                         offset: 0,
                         size: None,
@@ -372,9 +342,6 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             const num_cuboids = {num_cuboids}u;
             const area = {area}u;
             const trie_capacity = {trie_capacity}u;
-
-            const net_width = {net_width}u;
-            const net_len = {net_len}u;
 
             const num_squares = {num_squares}u;
             const num_cursors = {num_cursors}u;
@@ -417,7 +384,6 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             bind_group,
 
             finder_buf,
-            pos_states_buf,
             solution_buf,
             cpu_finder_buf,
             cpu_solution_buf,
@@ -464,6 +430,8 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             }
         }
 
+        self.device.start_capture();
+
         // Write the finders into the GPU's buffer.
         let mut gpu_finders = Vec::new();
         for finder in finders.iter() {
@@ -476,10 +444,6 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             .create_command_encoder(&CommandEncoderDescriptor { label: None });
         // Clear the `len` field of the solutions to 0.
         encoder.clear_buffer(&self.solution_buf, 0, Some(NonZeroU64::new(4).unwrap()));
-        // Clear all the `pos_states` back to `UNKNOWN`.
-        // If this turns out to be slow we can do a cleanup phase at the end of
-        // the compute shader where we revert all the instructions again.
-        encoder.clear_buffer(&self.pos_states_buf, 0, None);
 
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -507,6 +471,8 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
         );
 
         let index = self.queue.submit([encoder.finish()]);
+
+        self.device.stop_capture();
 
         // Wait for the GPU to finish.
         self.device.poll(Maintain::WaitForSubmissionIndex(index));
@@ -566,7 +532,7 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
                         .map(Instruction::from_gpu)
                         .collect();
 
-                    self.ctx.finalize(&completed, potential)
+                    self.ctx.finalize(completed, potential)
                 }),
         );
 
@@ -604,8 +570,12 @@ impl SquareCache {
 
 impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     fn to_gpu(&self, pipeline: &Pipeline<CUBOIDS>, buffer: &mut Vec<u8>) {
-        let trie_capacity = pipeline.trie_capacity;
-        let queue_capacity = 4 * pipeline.area;
+        let Constants {
+            trie_capacity,
+            queue_capacity,
+            queued_padding,
+            ..
+        } = pipeline.constants();
 
         // Write `skip`.
         buffer.extend(
@@ -657,11 +627,34 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                 buffer.extend_from_slice(&u32::to_le_bytes(surface.0.try_into().unwrap()));
             }
         }
+
+        // Write `queued`.
+        buffer.extend(iter::repeat(0).take(queued_padding.try_into().unwrap()));
+        for &(length, positions) in &self.queued.elements {
+            let mut positions = bytemuck::cast::<u64, [Pos; 4]>(positions);
+            if cfg!(target_endian = "big") {
+                positions.reverse();
+            }
+            let encoded_positions: [u32; 4] = array::from_fn(|i| {
+                let mut result = 0;
+                if i == 0 {
+                    result |= length << 28;
+                }
+                if i < length.try_into().unwrap() {
+                    result |= 0x80000000;
+                    result |= (positions[i].x as u32) << 8;
+                    result |= positions[i].y as u32;
+                }
+                result
+            });
+            for word in encoded_positions {
+                buffer.extend_from_slice(&u32::to_le_bytes(word));
+            }
+        }
     }
 
     fn from_gpu(pipeline: &Pipeline<CUBOIDS>, mut bytes: &[u8]) -> Self {
         let Constants {
-            net_width,
             num_cursors,
             surface_words,
             instruction_size,
@@ -669,6 +662,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             queue_size,
             potential_size,
             surfaces_size,
+            queued_padding,
+            queued_size,
             ..
         } = pipeline.constants();
 
@@ -713,28 +708,42 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             .unwrap();
         bytes = &bytes[8..];
 
+        let surfaces_size: usize = surfaces_size.try_into().unwrap();
         let surfaces = match surface_words {
-            1 => {
-                bytemuck::from_bytes::<[u32; CUBOIDS]>(&bytes[..surfaces_size.try_into().unwrap()])
-                    .map(u32::from_le)
-                    .map(u64::from)
-            }
-            2 => {
-                bytemuck::from_bytes::<[u64; CUBOIDS]>(&bytes[..surfaces_size.try_into().unwrap()])
-                    .map(u64::from_le)
-            }
+            1 => bytemuck::from_bytes::<[u32; CUBOIDS]>(&bytes[..surfaces_size])
+                .map(u32::from_le)
+                .map(u64::from),
+            2 => bytemuck::from_bytes::<[u64; CUBOIDS]>(&bytes[..surfaces_size]).map(u64::from_le),
             _ => unreachable!("area > 64"),
         }
         .map(Surface);
+        bytes = &bytes[surfaces_size..];
+
+        bytes = &bytes[queued_padding.try_into().unwrap()..];
+        let queued_size: usize = queued_size.try_into().unwrap();
+        let elements = bytes[..queued_size]
+            .chunks(4 * 4)
+            .map(|bytes| {
+                let positions = bytemuck::from_bytes::<[u32; 4]>(bytes).map(u32::from_le);
+                let length = (positions[0] >> 28) & 0x7;
+                let mut positions = positions.map(|pos| Pos {
+                    x: (pos >> 8) as u8,
+                    y: pos as u8,
+                });
+                if cfg!(target_endian = "big") {
+                    positions.reverse();
+                }
+                let positions: u64 = bytemuck::cast(positions);
+                (length, positions)
+            })
+            .collect();
+        let queued = InstructionSet { elements };
 
         Self {
             skip,
             queue,
             potential,
-            queued: queue
-                .iter()
-                .map(|instruction| instruction.mapping)
-                .collect(),
+            queued,
             surfaces,
             index,
             base_index,
@@ -744,7 +753,9 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
 
 impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
     fn to_gpu(&self, buffer: &mut Vec<u8>) {
-        buffer.extend_from_slice(&u32::to_le_bytes(self.net_pos.0.try_into().unwrap()));
+        buffer.extend_from_slice(&u32::to_le_bytes(
+            ((self.net_pos.x as u32) << 8) | (self.net_pos.y as u32),
+        ));
         buffer.extend(
             self.mapping
                 .cursors()
@@ -758,7 +769,11 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
     }
 
     fn from_gpu(bytes: &[u8]) -> Self {
-        let net_pos = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let encoded_net_pos = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let net_pos = Pos {
+            x: (encoded_net_pos >> 8) as u8,
+            y: encoded_net_pos as u8,
+        };
         let mapping = Mapping {
             cursors: array::from_fn(|i| {
                 let offset = 4 + 4 * i;
@@ -769,7 +784,7 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
         let offset = 4 + 4 * CUBOIDS;
         let followup_index = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
         Self {
-            net_pos: NetPos(net_pos.try_into().unwrap()),
+            net_pos,
             mapping,
             state: match followup_index {
                 0 => InstructionState::NotRun,

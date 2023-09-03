@@ -54,7 +54,7 @@ pub(super) struct InstructionSet<const CUBOIDS: usize> {
     /// For each square on the first cuboid, the net positions of the up-to-4
     /// instructions that set that square. Represented as first the number of
     /// them, and then the actual positions.
-    elements: Vec<(u32, u64)>,
+    pub(super) elements: Vec<(u32, u64)>,
 }
 
 impl<const CUBOIDS: usize> InstructionSet<CUBOIDS> {
@@ -66,8 +66,8 @@ impl<const CUBOIDS: usize> InstructionSet<CUBOIDS> {
         }
     }
 
-    /// Inserts an instruction into the set and returns whether it was already
-    /// contained within the set.
+    /// Inserts an instruction into the set and returns whether it was not
+    /// already contained within the set.
     #[inline]
     pub(super) fn insert(&mut self, instruction: Instruction<CUBOIDS>) -> bool {
         let (count, word) =

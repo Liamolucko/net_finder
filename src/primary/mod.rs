@@ -24,7 +24,7 @@ use crate::{
 };
 
 mod cpu;
-// mod gpu;
+mod gpu;
 mod set;
 
 use Direction::*;
@@ -83,11 +83,6 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
             prior_search_time,
             start: Instant::now(),
         })
-    }
-
-    /// The width of the `pos_states` of `Finder`s with this context.
-    fn net_width(&self) -> usize {
-        2 * self.target_area + 1
     }
 }
 
@@ -179,47 +174,6 @@ impl<const CUBOIDS: usize> Hash for Instruction<CUBOIDS> {
         self.net_pos.hash(state);
         self.mapping.hash(state);
     }
-}
-
-/// The status of a position on the net.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-enum PosState<const CUBOIDS: usize> {
-    /// This position could still map to anything.
-    #[default]
-    Unknown,
-    /// If this position gets set, it has to map to the given mapping.
-    Known {
-        /// The mapping this position is known to map to.
-        mapping: Mapping<CUBOIDS>,
-        /// The index of the first instruction to require that this position
-        /// maps to `mapping`.
-        ///
-        /// This is *not* the index of the instruction that actually attempts to
-        /// map this position to `mapping`; this is the index of its
-        /// parent. This is because that instruction might not have been valid,
-        /// and so didn't get added to the queue; but we still need to properly
-        /// record this `PosState` anyway, and so we instead keep track of the
-        /// parent and set this back to `Unknown` once it gets backtracked.
-        setter: usize,
-    },
-    /// This position can't be set because it's required to map to two different
-    /// mappings by different neighbouring positions.
-    Invalid {
-        /// The mapping that `setter` thinks this position should map to.
-        mapping: Mapping<CUBOIDS>,
-        /// The index of the earliest neighbouring instruction to this position.
-        setter: usize,
-        /// The index of the first instruction which tried to map this position
-        /// to something different from `setter`.
-        conflict: usize,
-    },
-    /// This position is filled.
-    Filled {
-        /// The mapping that this position maps to.
-        mapping: Mapping<CUBOIDS>,
-        /// The index of the earliest neighbouring instruction to this position.
-        setter: usize,
-    },
 }
 
 impl<const CUBOIDS: usize> Finder<CUBOIDS> {
@@ -947,9 +901,7 @@ fn run<const CUBOIDS: usize>(
 
     // Yield all our previous solutions before starting the new ones.
     Ok(solutions.into_iter().chain(if gpu {
-        panic!()
-        // Box::new(gpu::run(state, yielded_nets, progress)?) as Box<dyn
-        // Iterator<Item = Solution>>
+        Box::new(gpu::run(state, yielded_nets, progress)?) as Box<dyn Iterator<Item = Solution>>
     } else {
         Box::new(cpu::run(state, yielded_nets, progress)?) as Box<dyn Iterator<Item = Solution>>
     }))
