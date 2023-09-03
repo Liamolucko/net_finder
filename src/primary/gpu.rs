@@ -24,7 +24,7 @@ use crate::{Cursor, Finder, Mapping, Net, Pos, SkipSet, Solution, SquareCache, S
 use super::{set::InstructionSet, FinderCtx, Instruction, InstructionState};
 
 /// The number of `Finder`s we always give to the GPU.
-const NUM_FINDERS: u32 = 1792;
+const NUM_FINDERS: u32 = 13440;
 /// The size of the compute shader's workgroups.
 const WORKGROUP_SIZE: u32 = 64;
 /// The capacity of the buffer into which our shader writes the solutions it
@@ -196,7 +196,11 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
                 &DeviceDescriptor {
                     label: None,
                     features: Features::empty(),
-                    limits: Limits::default(),
+                    limits: Limits {
+                        max_compute_workgroup_size_x: WORKGROUP_SIZE,
+                        max_compute_invocations_per_workgroup: WORKGROUP_SIZE,
+                        ..Limits::default()
+                    },
                 },
                 None,
             )
