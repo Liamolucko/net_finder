@@ -281,7 +281,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             surface.set_filled(cursor.square(), false)
         }
         // Then remove all the instructions added as a result of this square.
-        for instruction in self.queue.drain(followup_index..) {
+        for instruction in self.queue.drain(followup_index..).rev() {
             self.queued.remove(&instruction);
         }
 

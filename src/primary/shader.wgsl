@@ -280,7 +280,7 @@ fn backtrack(finder: ptr<function, Finder>) -> bool {
     let instruction = &(*finder).queue.items[last_run];
     // Remove all `instruction`'s follow-up instructions from the queue and mark
     // it as not run.
-    for (var i = (*instruction).followup_index; i < (*finder).queue.len; i++) {
+    for (var i = (*finder).queue.len - 1u; i >= (*instruction).followup_index; i--) {
         remove(&(*finder).queued, (*finder).queue.items[i]);
     }
     (*finder).queue.len = (*instruction).followup_index;
