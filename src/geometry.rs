@@ -1626,8 +1626,6 @@ impl Display for MappingData {
 /// This can also be used to indicate where a spot on the net maps to on each
 /// cuboid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Arbitrary)]
-// Aligning this to 4 bytes lets the compiler pack it into a 32-bit integer.
-#[repr(align(4))]
 pub struct Mapping<const CUBOIDS: usize> {
     #[serde(with = "crate::utils::arrays")]
     pub cursors: [Cursor; CUBOIDS],

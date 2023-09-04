@@ -8,6 +8,7 @@ use std::{
     hash::{Hash, Hasher},
     io::{BufReader, BufWriter},
     iter::zip,
+    num::NonZeroU8,
     path::{Path, PathBuf},
     process::exit,
     sync::{Arc, Mutex},
@@ -121,12 +122,27 @@ pub struct Finder<const CUBOIDS: usize> {
 
 /// An instruction to add a square.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+// Aligning this to 8 bytes lets the compiler pack it into a 32-bit integer.
+#[repr(align(8))]
 struct Instruction<const CUBOIDS: usize> {
     /// The position on the net where the square should be added.
     net_pos: Pos,
     /// The cursors on each of the cuboids that that square folds up into.
     mapping: Mapping<CUBOIDS>,
-    state: InstructionState,
+    /// If this instruction has been run, the index in `queue` at which the
+    /// instructions added as a result of this instruction begin.
+    ///
+    /// Otherwise, `None`.
+    ///
+    /// This will always fit in a `u8` because the queue's length can be at most
+    /// 4 times the area of the cuboids, since there can be at most 4
+    /// instructions setting each square (1 from each direction). Additionally,
+    /// we already limit the area to 64 so that `Cursor` can fit in a `u8`, so
+    /// the length is at most 256 and indices are at most 255.
+    ///
+    /// Also, it can't be 0 because that would imply that this instruction's
+    /// index is lower than 0, which makes no sense.
+    followup_index: Option<NonZeroU8>,
 }
 
 impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
@@ -138,7 +154,7 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
         Instruction {
             net_pos,
             mapping,
-            state: InstructionState::NotRun,
+            followup_index: None,
         }
     }
 }
@@ -208,7 +224,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                 let queue = vec![Instruction {
                     net_pos: start_pos,
                     mapping: start_mapping.clone(),
-                    state: InstructionState::NotRun,
+                    followup_index: None,
                 }];
 
                 let mut queued = InstructionSet::new(cuboids[0].surface_area());
@@ -246,21 +262,20 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     /// there are no more available options.
     fn backtrack(&mut self) -> bool {
         // Find the last instruction that was successfully carried out.
-        let Some((last_success_index, instruction)) =
-            self.queue.iter_mut().enumerate().rfind(|(_, instruction)| {
-                matches!(instruction.state, InstructionState::Completed { .. })
-            })
+        let Some((last_success_index, instruction)) = self
+            .queue
+            .iter_mut()
+            .enumerate()
+            .rfind(|(_, instruction)| instruction.followup_index.is_some())
         else {
             return false;
         };
         if last_success_index < self.base_index {
             return false;
         }
-        let InstructionState::Completed { followup_index } = instruction.state else {
-            unreachable!()
-        };
+
         // Mark it as reverted.
-        instruction.state = InstructionState::NotRun;
+        let followup_index: usize = instruction.followup_index.take().unwrap().get().into();
         // Remove the square it added.
         for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
             surface.set_filled(cursor.square(), false)
@@ -306,9 +321,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             // intentionally didn't run here.
             if self.queue.len() > old_len {
                 let instruction = &mut self.queue[self.index];
-                instruction.state = InstructionState::Completed {
-                    followup_index: old_len,
-                };
+                instruction.followup_index =
+                    Some(NonZeroU8::new(old_len.try_into().unwrap()).unwrap());
                 for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
                     surface.set_filled(cursor.square(), true);
                 }
@@ -386,15 +400,13 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             .potential
             .iter()
             .map(|&index| self.queue[index].clone())
-            .filter(|instruction| {
-                matches!(instruction.state, InstructionState::NotRun) & self.valid(instruction)
-            })
+            .filter(|instruction| instruction.followup_index.is_none() & self.valid(instruction))
             .collect();
 
         let completed = self
             .queue
             .iter()
-            .filter(|instruction| matches!(instruction.state, InstructionState::Completed { .. }))
+            .filter(|instruction| instruction.followup_index.is_some())
             .cloned()
             .collect();
 
@@ -422,9 +434,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             // Remember, the base index is the index of the first instruction _after_ the ones that
             // are fixed, so the one we're attempting to fix is the one _before_ the base index.
             .get(new_base_index - 1)
-            .is_some_and(|instruction| {
-                !matches!(instruction.state, InstructionState::Completed { .. })
-            })
+            .is_some_and(|instruction| instruction.followup_index.is_none())
         {
             new_base_index += 1;
         }
@@ -435,10 +445,10 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             // Create the new `Finder` by backtracking this one until the instruction at
             // `new_base_index - 1` hasn't been run.
             let mut new_finder = self.clone();
-            while matches!(
-                new_finder.queue[new_base_index - 1].state,
-                InstructionState::Completed { .. }
-            ) {
+            while new_finder.queue[new_base_index - 1]
+                .followup_index
+                .is_some()
+            {
                 new_finder.backtrack();
             }
 

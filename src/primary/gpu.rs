@@ -2,7 +2,7 @@ use std::{
     array,
     collections::HashSet,
     iter, mem,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroU8},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -21,7 +21,7 @@ use wgpu::{
 
 use crate::{Cursor, Finder, Mapping, Net, Pos, SkipSet, Solution, SquareCache, State, Surface};
 
-use super::{set::InstructionSet, FinderCtx, Instruction, InstructionState};
+use super::{set::InstructionSet, FinderCtx, Instruction};
 
 /// The number of `Finder`s we always give to the GPU.
 const NUM_FINDERS: u32 = 13440;
@@ -551,7 +551,7 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             !(finder.index >= finder.queue.len()
                 && finder.queue[finder.base_index..]
                     .iter()
-                    .all(|instruction| matches!(instruction.state, InstructionState::NotRun)))
+                    .all(|instruction| instruction.followup_index.is_none()))
         });
         finders_finished += u64::try_from(old_len - finders.len()).unwrap();
 
@@ -766,10 +766,9 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
                 .iter()
                 .flat_map(|&cursor| u32::to_le_bytes(cursor.0.into())),
         );
-        buffer.extend_from_slice(&u32::to_le_bytes(match self.state {
-            InstructionState::NotRun => 0,
-            InstructionState::Completed { followup_index } => followup_index.try_into().unwrap(),
-        }))
+        buffer.extend_from_slice(&u32::to_le_bytes(
+            self.followup_index.map_or(0, NonZeroU8::get).into(),
+        ))
     }
 
     fn from_gpu(bytes: &[u8]) -> Self {
@@ -790,12 +789,7 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
         Self {
             net_pos,
             mapping,
-            state: match followup_index {
-                0 => InstructionState::NotRun,
-                _ => InstructionState::Completed {
-                    followup_index: followup_index.try_into().unwrap(),
-                },
-            },
+            followup_index: NonZeroU8::new(followup_index.try_into().unwrap()),
         }
     }
 }
