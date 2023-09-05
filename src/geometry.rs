@@ -757,7 +757,7 @@ impl Size {
 }
 
 // A direction in 2D space.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Direction {
     Left,
     Up,

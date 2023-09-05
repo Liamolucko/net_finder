@@ -129,6 +129,11 @@ struct Instruction<const CUBOIDS: usize> {
     net_pos: Pos,
     /// The cursors on each of the cuboids that that square folds up into.
     mapping: Mapping<CUBOIDS>,
+    /// The direction that we can skip looking for followup instructions in, if
+    /// any, because it's the direction of the parent of this instruction.
+    ///
+    /// This is only `None` for the first instruction in the queue.
+    skip: Option<Direction>,
     /// If this instruction has been run, the index in `queue` at which the
     /// instructions added as a result of this instruction begin.
     ///
@@ -154,6 +159,7 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
         Instruction {
             net_pos,
             mapping,
+            skip: Some(direction.turned(2)),
             followup_index: None,
         }
     }
@@ -224,6 +230,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                 let queue = vec![Instruction {
                     net_pos: start_pos,
                     mapping: start_mapping.clone(),
+                    skip: None,
                     followup_index: None,
                 }];
 
@@ -299,7 +306,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     /// Handle the instruction at the current index in the queue, incrementing
     /// the index afterwards.
     fn handle_instruction(&mut self, ctx: &FinderCtx<CUBOIDS>) {
-        let instruction = &self.queue[self.index];
+        let instruction = self.queue[self.index];
         // We don't need to check if it's in `self.skip` because we wouldn't have added
         // it to the queue in the first place if that was the case.
         if !zip(&self.surfaces, instruction.mapping.cursors())
@@ -308,10 +315,10 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             // Add any follow-up instructions.
             // We do this instead of using a loop to effectively force rustc to unroll it.
             let old_len = self.queue.len();
-            self.add_followup(ctx, Left);
-            self.add_followup(ctx, Up);
-            self.add_followup(ctx, Right);
-            self.add_followup(ctx, Down);
+            self.add_followup(ctx, instruction, Left);
+            self.add_followup(ctx, instruction, Up);
+            self.add_followup(ctx, instruction, Right);
+            self.add_followup(ctx, instruction, Down);
 
             // If there are no valid follow-up instructions, we don't actually fill the
             // square, since we are now considering this a potentially filled square.
@@ -341,12 +348,21 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             && !self.skip.contains(instruction.mapping)
     }
 
-    /// Adds the follow-up instruction of the current instruction in the given
+    /// Adds the follow-up instruction of the given instruction in the given
     /// direction, if it's valid.
     // rustc REALLY doesn't want to inline this for some reason so we have to force it.
     #[inline(always)]
-    fn add_followup(&mut self, ctx: &FinderCtx<CUBOIDS>, direction: Direction) {
-        let instruction = self.queue[self.index].moved_in(ctx, direction);
+    fn add_followup(
+        &mut self,
+        ctx: &FinderCtx<CUBOIDS>,
+        instruction: Instruction<CUBOIDS>,
+        direction: Direction,
+    ) {
+        if instruction.skip == Some(direction) {
+            return;
+        }
+
+        let instruction = instruction.moved_in(ctx, direction);
         if !zip(&self.surfaces, instruction.mapping.cursors())
             .any(|(surface, cursor)| surface.filled(cursor.square()))
             && !self.skip.contains(instruction.mapping)
