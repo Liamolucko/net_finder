@@ -165,24 +165,6 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-enum InstructionState {
-    /// An instruction which has not been run, either because:
-    /// - We haven't gotten to it yet.
-    /// - It's invalid.
-    /// - It's been backtracked.
-    /// - It's been chosen as a 'potential' instruction to try at the end, which
-    ///   doesn't have a separate state because it's possible for it to become
-    ///   invalid later and so we'd need an extra check anyway.
-    NotRun,
-    /// The instruction has been run.
-    Completed {
-        /// The index in `queue` at which the instructions added as a result of
-        /// this instruction begin.
-        followup_index: usize,
-    },
-}
-
 impl<const CUBOIDS: usize> PartialEq for Instruction<CUBOIDS> {
     fn eq(&self, other: &Self) -> bool {
         self.net_pos == other.net_pos && self.mapping == other.mapping
