@@ -215,16 +215,18 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         // of mappings that will result in the same set of nets.
         let equivalence_classes = equivalence_classes(cuboids, &square_caches);
 
+        // A `SkipSet` containing all of the previous equivalence classes.
+        let mut prev_classes = SkipSet::new(cuboids);
+
         // Then create one `Finder` per equivalence class.
         let finders = equivalence_classes
             .iter()
-            .map(|class| class.into_iter().next().unwrap())
-            .enumerate()
-            .map(|(i, start_mapping)| {
+            .map(|class| {
                 let start_pos = Pos {
                     x: cuboids[0].surface_area().try_into().unwrap(),
                     y: cuboids[0].surface_area().try_into().unwrap(),
                 };
+                let start_mapping = class.into_iter().next().unwrap();
 
                 // The first instruction is to add the first square.
                 let queue = vec![Instruction {
@@ -237,12 +239,11 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                 let mut queued = InstructionSet::new(cuboids[0].surface_area());
                 queued.insert(queue[0]);
 
-                // Skip all of the equivalence classes prior to this one.
-                let mut skip = SkipSet::new(cuboids);
-                for class in &equivalence_classes[..i] {
-                    for mapping in class {
-                        skip.insert(&square_caches, mapping);
-                    }
+                // We want to skip all the equivalence classes prior to this one.
+                let skip = prev_classes.clone();
+                // Then add this equivalence class to the set of previous ones.
+                for mapping in class {
+                    prev_classes.insert(&square_caches, mapping);
                 }
 
                 Self {
