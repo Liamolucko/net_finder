@@ -11,6 +11,7 @@ use std::{
     num::NonZeroU8,
     path::{Path, PathBuf},
     process::exit,
+    simd::{Mask, Simd, SimdPartialEq, SimdUint},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -20,8 +21,8 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    equivalence_classes, ColoredNet, Cuboid, Direction, Mapping, Net, Pos, SkipSet, SquareCache,
-    Surface,
+    equivalence_classes, Class, ClassMapping, ColoredNet, Cuboid, Direction, Mapping, Net, Pos,
+    SquareCache, Surface,
 };
 
 mod cpu;
@@ -35,14 +36,30 @@ use self::set::InstructionSet;
 /// The additional information that we need to have on hand to actually run a
 /// `Finder`.
 struct FinderCtx<const CUBOIDS: usize> {
-    /// The cuboids that we're finding common nets for.
-    cuboids: [Cuboid; CUBOIDS],
-    /// The common area of all the cuboids in `cuboids`.
+    /// The cuboids that we're finding common nets for, from the outside world's
+    /// perspective.
+    outer_cuboids: [Cuboid; CUBOIDS],
+    /// The cuboids that we're finding common nets for, from a `Finder`'s
+    /// perspective.
+    ///
+    /// These are the same cuboids as `outer_cuboids`, but in a different order:
+    /// there's always one cuboid on which we start from the same cursor every
+    /// time, and this cuboid gets put first. This makes it easier to optimise
+    /// how we skip solutions covered by other `Finder`s.
+    inner_cuboids: [Cuboid; CUBOIDS],
+    /// The common area of all the cuboids in `outer_cuboids` / `inner_cuboids`.
     target_area: usize,
 
-    /// Square caches for the cuboids.
+    /// Square caches for the cuboids (`inner_cuboids`, specifically).
     square_caches: [SquareCache; CUBOIDS],
-    // TODO: move `skip` in here and make it a weird shared franken-trie :).
+    /// The cursor class on the first cuboid in `inner_cuboids` which we always
+    /// use as the starting point on that cuboid.
+    fixed_class: Class,
+    /// A bitfield indicating whether each cursor on the first cuboid is in the
+    /// same family of equivalence classes as `fixed_class`.
+    maybe_skipped_lookup: [u64; 4],
+    /// The equivalence classes of mappings that we build `Finder`s out of.
+    equivalence_classes: Vec<Vec<ClassMapping<CUBOIDS>>>,
 
     // These are used to timestamp the solutions we get.
     /// How long we've been searching for prior to the start of this run of
@@ -77,21 +94,105 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
             bail!("only cuboids with surface area <= 64 are currently supported");
         }
 
+        let mut square_caches = cuboids.map(SquareCache::new);
+
+        let (fixed_cuboid, fixed_class, equivalence_classes) = equivalence_classes(&square_caches);
+        // Move the fixed cuboid to the front of the list.
+        let mut inner_cuboids = cuboids;
+        inner_cuboids.swap(0, fixed_cuboid);
+        // Update the square caches and equivalence classes to also be in the order of
+        // the inner cuboids.
+        square_caches.swap(0, fixed_cuboid);
+        // We can't mutate `HashSet`s in place so we have to create a whole new list for
+        // the reordered equivalence classes.
+        let mut equivalence_classes: Vec<Vec<ClassMapping<CUBOIDS>>> = equivalence_classes
+            .into_iter()
+            .map(|class| {
+                let mut class: Vec<_> = class
+                    .into_iter()
+                    .map(|mut mapping| {
+                        mapping.classes.swap(0, fixed_cuboid);
+                        mapping
+                    })
+                    .collect();
+                // Sort the class by index.
+                class.sort_by_key(|mapping| mapping.index());
+                class
+            })
+            .collect();
+        // Sort the equivalence classes by the minimum index in each class.
+        // That way, each finder knows if a mapping was covered by a previous finder by
+        // checking if that mapping's index is less than its.
+        equivalence_classes.sort_by_key(|class| class[0].index());
+
+        let mut maybe_skipped_lookup = [0; 4];
+        for cursor in square_caches[0]
+            .classes()
+            .skip(fixed_class.index().into())
+            .take(fixed_class.family_size())
+            .flat_map(|class| class.contents(&square_caches[0]))
+        {
+            maybe_skipped_lookup[(cursor.0 >> 6) as usize] |= 1 << (cursor.0 & 0x3f);
+        }
+
         Ok(Self {
-            cuboids,
+            outer_cuboids: cuboids,
+            inner_cuboids,
             target_area: cuboids[0].surface_area(),
-            square_caches: cuboids.map(SquareCache::new),
+            square_caches,
+            fixed_class,
+            maybe_skipped_lookup,
+            equivalence_classes,
             prior_search_time,
             start: Instant::now(),
         })
+    }
+
+    /// Generates a list of `Finder`s to use for finding the common nets of this
+    /// `FinderCtx`'s cuboids.
+    fn gen_finders(&self) -> Vec<Finder<CUBOIDS>> {
+        self.equivalence_classes
+            .iter()
+            .map(|class| {
+                let start_pos = Pos {
+                    x: self.inner_cuboids[0].surface_area().try_into().unwrap(),
+                    y: self.inner_cuboids[0].surface_area().try_into().unwrap(),
+                };
+                let start_class_mapping = class[0];
+                let start_mapping = start_class_mapping.sample(&self.square_caches);
+
+                // The first instruction is to add the first square.
+                let queue = vec![Instruction {
+                    net_pos: start_pos,
+                    mapping: start_mapping,
+                    skip: None,
+                    followup_index: None,
+                }];
+
+                let mut queued = InstructionSet::new(self.inner_cuboids[0].surface_area());
+                queued.insert(queue[0]);
+                Finder {
+                    start_mapping_index: start_class_mapping.index(),
+
+                    queue,
+                    potential: Vec::new(),
+
+                    queued,
+                    surfaces: array::from_fn(|_| Surface::new()),
+
+                    index: 0,
+                    base_index: 0,
+                }
+            })
+            .collect()
     }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Finder<const CUBOIDS: usize> {
-    /// Mappings that we should skip over because they're the responsibility of
-    /// another `Finder`.
-    skip: SkipSet<CUBOIDS>,
+    /// The index of this `Finder`'s starting mapping (as returned by
+    /// `ClassMapping::index`).
+    start_mapping_index: usize,
 
     queue: Vec<Instruction<CUBOIDS>>,
     /// The indices of all the 'potential' instructions that we're saving until
@@ -181,71 +282,6 @@ impl<const CUBOIDS: usize> Hash for Instruction<CUBOIDS> {
 }
 
 impl<const CUBOIDS: usize> Finder<CUBOIDS> {
-    /// Create a bunch of `Finder`s that search for all the nets that fold
-    /// into all of the passed cuboids.
-    fn new(cuboids: [Cuboid; CUBOIDS]) -> anyhow::Result<Vec<Self>> {
-        if cuboids
-            .iter()
-            .any(|cuboid| cuboid.surface_area() != cuboids[0].surface_area())
-        {
-            bail!("all passed cuboids must have the same surface area")
-        }
-
-        let square_caches = cuboids.map(SquareCache::new);
-
-        // Divide all of the possible starting mappings up several equivalence classes
-        // of mappings that will result in the same set of nets.
-        let equivalence_classes = equivalence_classes(cuboids, &square_caches);
-
-        // A `SkipSet` containing all of the previous equivalence classes.
-        let mut prev_classes = SkipSet::new(cuboids);
-
-        // Then create one `Finder` per equivalence class.
-        let finders = equivalence_classes
-            .iter()
-            .map(|class| {
-                let start_pos = Pos {
-                    x: cuboids[0].surface_area().try_into().unwrap(),
-                    y: cuboids[0].surface_area().try_into().unwrap(),
-                };
-                let start_mapping = class.into_iter().next().unwrap();
-
-                // The first instruction is to add the first square.
-                let queue = vec![Instruction {
-                    net_pos: start_pos,
-                    mapping: start_mapping.clone(),
-                    skip: None,
-                    followup_index: None,
-                }];
-
-                let mut queued = InstructionSet::new(cuboids[0].surface_area());
-                queued.insert(queue[0]);
-
-                // We want to skip all the equivalence classes prior to this one.
-                let skip = prev_classes.clone();
-                // Then add this equivalence class to the set of previous ones.
-                for mapping in class {
-                    prev_classes.insert(&square_caches, mapping);
-                }
-
-                Self {
-                    skip,
-
-                    queue,
-                    potential: Vec::new(),
-
-                    queued,
-                    surfaces: array::from_fn(|_| Surface::new()),
-
-                    index: 0,
-                    base_index: 0,
-                }
-            })
-            .collect();
-
-        Ok(finders)
-    }
-
     /// Undoes the last instruction that was successfully carried out.
     ///
     /// Returns whether backtracking was successful. If `false` is returned,
@@ -325,10 +361,10 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     }
 
     /// Returns whether an instruction is valid to run.
-    fn valid(&self, instruction: &Instruction<CUBOIDS>) -> bool {
+    fn valid(&self, ctx: &FinderCtx<CUBOIDS>, instruction: &Instruction<CUBOIDS>) -> bool {
         !zip(&self.surfaces, instruction.mapping.cursors())
             .any(|(surface, cursor)| surface.filled(cursor.square()))
-            && !self.skip.contains(instruction.mapping)
+            && !self.skip(ctx, instruction.mapping)
     }
 
     /// Adds the follow-up instruction of the given instruction in the given
@@ -348,7 +384,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         let instruction = instruction.moved_in(ctx, direction);
         if !zip(&self.surfaces, instruction.mapping.cursors())
             .any(|(surface, cursor)| surface.filled(cursor.square()))
-            && !self.skip.contains(instruction.mapping)
+            && !self.skip(ctx, instruction.mapping)
         {
             if self.queued.insert(instruction) {
                 self.queue.push(instruction);
@@ -376,7 +412,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         // end, so it needs to be fast.
         let mut surfaces = self.surfaces.clone();
         for instruction in self.potential.iter().map(|&index| &self.queue[index]) {
-            if self.valid(instruction) {
+            if self.valid(ctx, instruction) {
                 for (surface, cursor) in zip(&mut surfaces, instruction.mapping.cursors()) {
                     surface.set_filled(cursor.square(), true);
                 }
@@ -399,7 +435,9 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             .potential
             .iter()
             .map(|&index| self.queue[index].clone())
-            .filter(|instruction| instruction.followup_index.is_none() & self.valid(instruction))
+            .filter(|instruction| {
+                instruction.followup_index.is_none() & self.valid(ctx, instruction)
+            })
             .collect();
 
         let completed = self
@@ -459,6 +497,45 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             // it isn't.
             Some(new_finder)
         }
+    }
+
+    /// Returns whether we should skip a mapping because it's already covered by
+    /// a previous `Finder`.
+    #[inline]
+    fn skip(&self, ctx: &FinderCtx<CUBOIDS>, mapping: Mapping<CUBOIDS>) -> bool {
+        let index = mapping.cursors[0].0 as usize;
+        if (ctx.maybe_skipped_lookup[index >> 6] >> (index & 0x3f)) & 1 == 0 {
+            return false;
+        }
+
+        // If the fixed class doesn't care about some bits of the transformation, then
+        // we're free to alter those bits to make the index of the transformed mapping
+        // smaller.
+        //
+        // To keep track, create a SIMD mask of exactly which transformations are still
+        // allowed, and disable some bits as we go along for any transformations which
+        // give a non-minimal index.
+        let mut valid = Mask::from([true; 8]);
+
+        let transformed: ClassMapping<CUBOIDS> = ClassMapping::new(array::from_fn(|i| {
+            let cursor = mapping.cursors[i];
+            let cache = &ctx.square_caches[i];
+            let mut undo_lookup = cursor.undo_lookup(cache);
+            // Set the transforms we get from undoing all the invalid transforms to 8 so
+            // they won't show up in `min`.
+            undo_lookup = valid.select(undo_lookup, Simd::splat(8));
+            // Then find out what the lowest transform we can get is.
+            let new_transform = undo_lookup.reduce_min();
+            // In order to minimise the index of `transformed`, this is the transform we
+            // need to use, since we're going from most-significant to least-significant.
+            //
+            // So the new set of valid transforms is all the ones that give us this value
+            // (and were valid before, remember we already set the invalid ones to 8).
+            valid = undo_lookup.simd_eq(Simd::splat(new_transform));
+            cursor.class(cache).with_transform(new_transform)
+        }));
+
+        transformed.index() < self.start_mapping_index
     }
 }
 
@@ -615,7 +692,7 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
         if remaining_area == 0 {
             // If we've already filled all the surface squares, we're done!
             return Finalize::Known(Some(Solution::new(
-                &self.square_caches,
+                &self,
                 completed.iter(),
                 self.prior_search_time + self.start.elapsed(),
             )));
@@ -629,9 +706,8 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
         // Finally, we return an iterator which will just brute-force try all the
         // combinations of remaining squares.
         Finalize::Solve(FinishIter {
-            square_caches: &self.square_caches,
+            ctx: self,
             completed,
-            search_time: self.prior_search_time + self.start.elapsed(),
 
             potential,
             remaining,
@@ -660,16 +736,21 @@ pub struct Solution {
 
 impl Solution {
     fn new<'a, const CUBOIDS: usize>(
-        square_caches: &[SquareCache; CUBOIDS],
+        ctx: &FinderCtx<CUBOIDS>,
         instructions: impl Iterator<Item = &'a Instruction<CUBOIDS>>,
         search_time: Duration,
     ) -> Self {
-        let cuboids: Vec<_> = square_caches.iter().map(|cache| cache.cuboid()).collect();
+        let cuboids: Vec<_> = ctx
+            .square_caches
+            .iter()
+            .map(|cache| cache.cuboid())
+            .collect();
         let mut net = Net::for_cuboids(&cuboids);
         let mut colored = vec![Net::for_cuboids(&cuboids); cuboids.len()];
         for instruction in instructions {
             net[instruction.net_pos] = true;
-            for ((cache, colored_net), cursor) in square_caches
+            for ((cache, colored_net), cursor) in ctx
+                .square_caches
                 .iter()
                 .zip(&mut colored)
                 .zip(instruction.mapping.cursors())
@@ -680,7 +761,17 @@ impl Solution {
 
         Solution {
             net: net.canon(),
-            colored: colored.iter().map(Net::canon).collect(),
+            colored: ctx
+                .outer_cuboids
+                .map(|cuboid| {
+                    let index = ctx
+                        .inner_cuboids
+                        .iter()
+                        .position(|&other_cuboid| other_cuboid == cuboid)
+                        .unwrap();
+                    colored[index].canon()
+                })
+                .into(),
             time: SystemTime::now(),
             search_time,
         }
@@ -713,9 +804,8 @@ impl<const CUBOIDS: usize> Iterator for Finalize<'_, CUBOIDS> {
 /// potential squares and yields nets of the ones which work.
 #[derive(Clone)]
 struct FinishIter<'a, const CUBOIDS: usize> {
-    square_caches: &'a [SquareCache; CUBOIDS],
+    ctx: &'a FinderCtx<CUBOIDS>,
     completed: Vec<Instruction<CUBOIDS>>,
-    search_time: Duration,
 
     potential: Vec<Instruction<CUBOIDS>>,
     conflicts: Vec<HashSet<usize>>,
@@ -777,13 +867,13 @@ impl<const CUBOIDS: usize> Iterator for FinishIter<'_, CUBOIDS> {
         // If we got here, we've found a set of instructions which don't conflict.
         // Yield the solution they produce.
         let solution = Solution::new(
-            &self.square_caches,
+            &self.ctx,
             self.completed.iter().chain(
                 self.next
                     .iter()
                     .map(|&index| &self.potential[self.remaining[index]]),
             ),
-            self.search_time,
+            self.ctx.prior_search_time + self.ctx.start.elapsed(),
         );
 
         self.advance();
@@ -826,9 +916,12 @@ impl<const CUBOIDS: usize> State<CUBOIDS> {
     /// Creates a new `State` for finding the common nets of the given cuboids
     /// where nothing's been done yet.
     pub fn new(cuboids: [Cuboid; CUBOIDS]) -> anyhow::Result<Self> {
+        // TODO we should probably take this as a parameter, right now we wastefully
+        // create this twice.
+        let ctx = FinderCtx::new(cuboids, Duration::ZERO)?;
         Ok(State {
             cuboids,
-            finders: Finder::new(cuboids)?,
+            finders: ctx.gen_finders(),
             solutions: Vec::new(),
             prior_search_time: Duration::ZERO,
         })

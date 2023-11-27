@@ -19,7 +19,7 @@ use wgpu::{
     ShaderModuleDescriptor, ShaderSource, ShaderStages,
 };
 
-use crate::{Cursor, Finder, Mapping, Net, Pos, SkipSet, Solution, SquareCache, State, Surface};
+use crate::{Cursor, Finder, Mapping, Net, Pos, Solution, SquareCache, State, Surface};
 
 use super::{set::InstructionSet, FinderCtx, Instruction};
 
@@ -45,8 +45,6 @@ struct Constants {
     num_cuboids: u32,
     /// The shared area of those cuboids.
     area: u32,
-    /// The capacity of each `Finder`'s trie.
-    trie_capacity: u32,
 
     /// The number of squares on the surfaces of the cuboids (`area`).
     num_squares: u32,
@@ -72,8 +70,6 @@ struct Constants {
     /// How many bytes an `Instruction` takes up (`4 * (2 + num_cuboids)`).
     instruction_size: u32,
 
-    /// How many bytes a trie takes up (`4 * trie_capacity`).
-    trie_size: u32,
     /// How many bytes a `Queue` takes up (`queue_capacity * instruction_size +
     /// 4`).
     queue_size: u32,
@@ -97,7 +93,7 @@ struct Constants {
 
 impl Constants {
     /// Computes a full set of `GpuConstants` from the fundamental three.
-    fn compute(num_cuboids: u32, area: u32, trie_capacity: u32) -> Constants {
+    fn compute(num_cuboids: u32, area: u32) -> Constants {
         let num_squares = area;
         let num_cursors = 4 * num_squares;
         let queue_capacity = 4 * num_squares;
@@ -108,14 +104,12 @@ impl Constants {
 
         let instruction_size = 4 * (2 + num_cuboids);
 
-        let trie_size = 4 * trie_capacity;
         let queue_size = queue_capacity * instruction_size + 4;
         let potential_size = 4 * (queue_capacity + 1);
         let surfaces_size = 4 * surface_words * num_cuboids;
         let queued_size = 4 * 4 * num_squares;
 
-        let unpadded_finder_size =
-            trie_size + queue_size + potential_size + 8 + surfaces_size + queued_size;
+        let unpadded_finder_size = queue_size + potential_size + 8 + surfaces_size + queued_size;
         let queued_padding = match unpadded_finder_size % 16 {
             0 => 0,
             x => 16 - x,
@@ -126,14 +120,12 @@ impl Constants {
         Constants {
             num_cuboids,
             area,
-            trie_capacity,
             num_squares,
             num_cursors,
             queue_capacity,
             trie_start,
             surface_words,
             instruction_size,
-            trie_size,
             queue_size,
             potential_size,
             surfaces_size,
@@ -157,8 +149,6 @@ struct Pipeline<const CUBOIDS: usize> {
     /// The surface area of the cuboids that this pipeline's `Finder`s search
     /// for.
     area: u32,
-    /// The maximum length of a `SkipSet` supported by this pipeline.
-    trie_capacity: u32,
 
     pipeline: ComputePipeline,
     bind_group: BindGroup,
@@ -209,12 +199,6 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
         // Compute all the constants that we have to prepend to the WGSL module.
         let num_cuboids: u32 = CUBOIDS.try_into()?;
         let area = ctx.target_area.try_into().unwrap();
-        let trie_capacity = finders
-            .iter()
-            .map(|finder| finder.skip.data.len())
-            .max()
-            .unwrap()
-            .try_into()?;
 
         let Constants {
             num_squares,
@@ -225,7 +209,7 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             finder_size,
             solution_size,
             ..
-        } = Constants::compute(num_cuboids, area, trie_capacity);
+        } = Constants::compute(num_cuboids, area);
 
         let mut lookup_buf_contents = Vec::new();
         for cache in &ctx.square_caches {
@@ -345,7 +329,6 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             "\
             const num_cuboids = {num_cuboids}u;
             const area = {area}u;
-            const trie_capacity = {trie_capacity}u;
 
             const num_squares = {num_squares}u;
             const num_cursors = {num_cursors}u;
@@ -382,7 +365,6 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             ctx,
 
             area,
-            trie_capacity,
 
             pipeline,
             bind_group,
@@ -395,7 +377,7 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
     }
 
     fn constants(&self) -> Constants {
-        Constants::compute(CUBOIDS.try_into().unwrap(), self.area, self.trie_capacity)
+        Constants::compute(CUBOIDS.try_into().unwrap(), self.area)
     }
 
     /// Runs the given finders for a bit and returns all the solutions they
@@ -575,22 +557,10 @@ impl SquareCache {
 impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     fn to_gpu(&self, pipeline: &Pipeline<CUBOIDS>, buffer: &mut Vec<u8>) {
         let Constants {
-            trie_capacity,
             queue_capacity,
             queued_padding,
             ..
         } = pipeline.constants();
-
-        // Write `skip`.
-        buffer.extend(
-            self.skip
-                .data
-                .iter()
-                .copied()
-                .chain(iter::repeat(0))
-                .take(trie_capacity.try_into().unwrap())
-                .flat_map(u32::to_le_bytes),
-        );
 
         // Write `queue`.
         for i in 0..queue_capacity {
@@ -662,7 +632,6 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             num_cursors,
             surface_words,
             instruction_size,
-            trie_size,
             queue_size,
             potential_size,
             surfaces_size,
@@ -670,17 +639,6 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             queued_size,
             ..
         } = pipeline.constants();
-
-        let trie_data: Vec<u32> = bytemuck::cast_slice(&bytes[..trie_size.try_into().unwrap()])
-            .iter()
-            .copied()
-            .map(u32::from_le)
-            .collect();
-        let skip = SkipSet {
-            data: trie_data,
-            page_size: num_cursors,
-        };
-        bytes = &bytes[trie_size.try_into().unwrap()..];
 
         let queue_size: usize = queue_size.try_into().unwrap();
         let queue_len = u32::from_le_bytes(bytes[queue_size - 4..queue_size].try_into().unwrap());
@@ -744,7 +702,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         let queued = InstructionSet { elements };
 
         Self {
-            skip,
+            start_mapping_index: todo!(),
             queue,
             potential,
             queued,

@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use clap::Parser;
 use net_finder::{equivalence_classes, Cuboid, SquareCache, Zdd};
 
@@ -35,23 +33,13 @@ fn main() {
 
 fn run<const CUBOIDS: usize>(cuboids: [Cuboid; CUBOIDS], verbose: bool) {
     let square_caches = cuboids.map(SquareCache::new);
-    let equivalence_classes = equivalence_classes(cuboids, &square_caches);
+    let (_, _, equivalence_classes) = equivalence_classes(&square_caches);
     println!("Equivalence classes:");
     for (i, class) in equivalence_classes.iter().enumerate() {
-        print!("Class {}: {} members", i + 1, class.into_iter().count());
+        print!("Class {}: {} members", i + 1, class.len());
         if verbose {
-            let canon_mappings: HashSet<_> = class
-                .into_iter()
-                .map(|mapping| {
-                    let mut mapping = mapping.to_data(&square_caches);
-                    for cursor in &mut mapping.cursors {
-                        *cursor = cursor.canon();
-                    }
-                    mapping.canon_orientation()
-                })
-                .collect();
-            println!(" ({} canon): ", canon_mappings.len());
-            for mapping in canon_mappings {
+            println!(":");
+            for mapping in class {
                 println!("  {mapping}");
             }
         } else {

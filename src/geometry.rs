@@ -1,11 +1,13 @@
 //! Types for dealing with the geometry of cuboids.
 
 use std::array;
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
 use std::iter::zip;
 use std::ops::{Index, IndexMut};
+use std::simd::{Mask, Simd, SimdPartialEq};
 use std::str::FromStr;
 
 use anyhow::{bail, Context};
@@ -1203,6 +1205,31 @@ impl CursorData {
 
         self
     }
+
+    /// 'Flips' this cursor horizontally.
+    ///
+    /// If you have this cursor's cuboid positioned such that the cursor is
+    /// pointing upwards on the net, what this method does is flip the cuboid
+    /// horizontally around the cursor, then replace the cuboid with its
+    /// unflipped version in the same position and take the positions of the
+    /// cursor on that cuboid.
+    ///
+    /// In terms of actually computing this, it amounts to setting the cursor's
+    /// x to `face.width - x - 1` (or the same for y if the cursor isn't
+    /// pointing up relative to its face).
+    pub fn horizontal_flip(&mut self) {
+        let face_size = self.cuboid().face_size(self.square.face);
+        if self.orientation % 2 == 0 {
+            // If the cursor is pointing vertically relative to its face, that means that it
+            // agrees with what the face thinks is horizontal, and we can just flip the x
+            // coordinate around.
+            self.square.pos.x = face_size.width - self.square.pos.x - 1;
+        } else {
+            // Otherwise, horizontal relative to the cursor is vertical relative to the
+            // face, so we need to flip the y coordinate instead.
+            self.square.pos.y = face_size.height - self.square.pos.y - 1;
+        }
+    }
 }
 
 impl Display for CursorData {
@@ -1214,7 +1241,7 @@ impl Display for CursorData {
 /// A cache of all the squares on the surface of a cuboid, along with a lookup
 /// table for which square you reach by moving in any direction from another
 /// square.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SquareCache {
     /// All the squares on the surface of a cuboid.
     ///
@@ -1230,6 +1257,15 @@ pub struct SquareCache {
     /// direction you want to find a face position adjacent in, the index you
     /// need in this array is `index << 2 | (direction as usize)`.
     pub(crate) neighbour_lookup: Vec<Cursor>,
+    /// All of the equivalence classes that cursors can be categorised into,
+    /// along with the number of classes in each class's family..
+    classes: Vec<(u8, Vec<Cursor>)>,
+    /// A lookup table from cursors to two pieces of information at once:
+    ///
+    /// - The equivalence class they're a part of.
+    /// - The transforms their `Class`es end up with after undoing each possible
+    ///   transform of the fixed cursor's class.
+    undo_lookup: Vec<(Class, Simd<u8, 8>)>,
 }
 
 impl SquareCache {
@@ -1254,6 +1290,16 @@ impl SquareCache {
             }
         }
 
+        let cursor_from_data = |cursor: CursorData| {
+            let square = squares
+                .iter()
+                .position(|&square| square == cursor.square)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            Cursor::new(Square(square), cursor.orientation)
+        };
+
         let neighbour_lookup = squares
             .iter()
             .flat_map(|&square| {
@@ -1265,20 +1311,134 @@ impl SquareCache {
                     .moved_in(direction)
                 })
             })
+            .map(cursor_from_data)
+            .collect();
+
+        // A list of families of equivalence classes.
+        let mut families: Vec<Vec<Vec<Cursor>>> = Vec::new();
+        for (i, &square_data) in squares.iter().enumerate() {
+            let square = Square(i.try_into().unwrap());
+            let cursor = Cursor::new(square, 0);
+            if !families
+                .iter()
+                .any(|family| family.iter().any(|class| class.contains(&cursor)))
+            {
+                let mut family: Vec<Vec<Cursor>> = Vec::new();
+                // We've found the root of a new family of equivalence classes.
+                // Now it's time to see how many classes are in this family, by applying all the
+                // transformations in the correct order to generate our frr bit pattern,
+                // deduplicating them and seeing how many we end up with.
+                let mut should_be_done = false;
+                let mut add_class = |cursor: CursorData| {
+                    if !family
+                        .iter()
+                        .any(|class| class.contains(&cursor_from_data(cursor)))
+                    {
+                        let class = cursor
+                            .equivalents()
+                            .into_iter()
+                            .map(cursor_from_data)
+                            .collect();
+                        assert!(!should_be_done);
+                        family.push(class);
+                    } else {
+                        // Try and make sure I'm right about these transformations lining up nicely:
+                        // one we hit a transformation that doesn't give us a new class, all further
+                        // transformations shouldn't give us one either since they either also use
+                        // the same new transformation that was introduced here or a
+                        // less-likely-to-work one.
+                        should_be_done = true
+                    }
+                };
+
+                // First we just try the 4 rotations of the original cursor.
+                for orientation in 0..4 {
+                    add_class(CursorData {
+                        square: square_data,
+                        orientation,
+                    });
+                }
+
+                // Then we horizontally flip it and add all the rotations of that cursor.
+                let mut cursor_data = CursorData {
+                    square: square_data,
+                    orientation: 0,
+                };
+                cursor_data.horizontal_flip();
+                for _ in 0..4 {
+                    add_class(cursor_data);
+                    cursor_data.orientation += 1;
+                }
+
+                // Again try and make sure I'm right about the transformations
+                // lining up nicely to give us a power of two.
+                assert!(matches!(family.len(), 1 | 2 | 4 | 8));
+                families.push(family);
+            }
+        }
+
+        // Sort the families in descending order of size so that they're always aligned
+        // properly (i.e. the index of each family's root will end with the right amount
+        // of 0s).
+        families.sort_by_key(|family| Reverse(family.len()));
+
+        // Then flatten them into a list of equivalence classes.
+        let classes: Vec<(u8, Vec<Cursor>)> = families
+            .into_iter()
+            .flat_map(|family| {
+                let family_len = family.len().try_into().unwrap();
+                family.into_iter().map(move |class| (family_len, class))
+            })
+            .collect();
+
+        let find_class = |cursor: Cursor| {
+            let (index, (family_size, _)) = classes
+                .iter()
+                .enumerate()
+                .find(|(_, (_, class))| class.contains(&cursor))
+                .unwrap();
+            let transform_bits = family_size.ilog2() as u8;
+            Class(transform_bits << 6 | u8::try_from(index).unwrap())
+        };
+
+        let num_cursors = u8::try_from(4 * squares.len()).unwrap();
+        let undo_lookup = (0..num_cursors)
+            .map(Cursor)
             .map(|cursor| {
-                let square = squares
-                    .iter()
-                    .position(|&square| square == cursor.square)
-                    .unwrap()
-                    .try_into()
-                    .unwrap();
-                Cursor::new(Square(square), cursor.orientation)
+                let class = find_class(cursor);
+
+                // Now calculate the actual undo part of `undo_lookup`.
+                let undos = Simd::from(array::from_fn(|i| {
+                    let to_undo = i as u8;
+                    let transform = class.transform();
+                    // To start with, we can always just subtract off the rotation.
+                    let rotation = (transform & 0b11).wrapping_sub(to_undo & 0b11) & 0b11;
+                    let new_class = class.with_transform((transform & 0b100) | rotation);
+                    if i >= 4 {
+                        // Flipping is the annoying part (it's the whole reason for having a lookup
+                        // table here in the first place), so just go back to regular geometry.
+                        let new_cursor = classes[new_class.index() as usize].1[0];
+                        let mut cursor_data = CursorData {
+                            square: squares[new_cursor.square().0 as usize],
+                            orientation: new_cursor.orientation(),
+                        };
+                        cursor_data.horizontal_flip();
+                        let flipped_cursor = cursor_from_data(cursor_data);
+                        find_class(flipped_cursor).transform()
+                    } else {
+                        new_class.transform()
+                    }
+                }));
+
+                (class, undos)
             })
             .collect();
 
         Self {
             squares,
             neighbour_lookup,
+            classes,
+            undo_lookup,
         }
     }
 
@@ -1294,6 +1454,19 @@ impl SquareCache {
             .filter(|&squares| squares < 64)
             .expect("`SquareCache` contained more than 64 squares");
         (0..num_squares).map(Square)
+    }
+
+    /// Returns an iterator over all the equivalence classes of cursors in this
+    /// `SquareCache`.
+    pub fn classes(
+        &self,
+    ) -> impl Iterator<Item = Class> + DoubleEndedIterator + ExactSizeIterator + '_ {
+        self.classes
+            .iter()
+            .enumerate()
+            .map(|(index, (family_size, _))| {
+                Class(((family_size.ilog2() as u8) << 6) | u8::try_from(index).unwrap())
+            })
     }
 
     /// Returns the cuboid this `SquareCache` is for.
@@ -1419,6 +1592,111 @@ impl Cursor {
             orientation: self.orientation(),
         }
     }
+
+    /// Returns the equivalence class of this cursor.
+    #[inline]
+    pub fn class(self, cache: &SquareCache) -> Class {
+        cache.undo_lookup[usize::from(self.0)].0
+    }
+
+    /// Returns a lookup table of what this class's transform turns into when
+    /// you undo any transforamtion.
+    #[inline]
+    pub fn undo_lookup(self, cache: &SquareCache) -> Simd<u8, 8> {
+        cache.undo_lookup[usize::from(self.0)].1
+    }
+}
+
+/// An equivalence class that a `Cursor` falls into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Arbitrary)]
+pub struct Class(u8);
+
+// hmm what happens if a class doesn't care about flipping now that that affects
+// the upper bit of the rotation too? well yeah, it needs to have that bit
+// flipped actually. It's not that it actually doesn't care about flipping, it's
+// just that it doesn't introduce any new squares and you don't need any more
+// bits to represent it.
+
+impl Class {
+    /// Returns the index of this equivalence class.
+    pub fn index(self) -> u8 {
+        self.0 & 0x3f
+    }
+
+    pub fn transform_bits(self) -> u8 {
+        self.0 >> 6
+    }
+
+    pub fn transform_mask(self) -> u8 {
+        (1 << self.transform_bits()) - 1
+    }
+
+    /// The number of equivalence classes in this class's family.
+    pub fn family_size(self) -> usize {
+        1 << self.transform_bits()
+    }
+
+    /// Returns the root equivalence class in this class's family.
+    pub fn root(self) -> Class {
+        Class(self.0 & !self.transform_mask())
+    }
+
+    /// Returns the transformations needed to get to this equivalence class from
+    /// its family's root class.
+    ///
+    /// This is encoded as 00000frr, where f is whether the cuboid was flipped
+    /// around the cursor first, and r is how many 90-degree rotations were
+    /// performed to the cuboid after that.
+    pub fn transform(self) -> u8 {
+        self.0 & self.transform_mask()
+    }
+
+    /// Returns a new `Class` in the same family as this one, with the given
+    /// transformation from the root class of the family.
+    pub fn with_transform(self, transform: u8) -> Class {
+        Class((self.0 & !self.transform_mask()) | (transform & self.transform_mask()))
+    }
+
+    /// Returns an iterator over all the cursors contained within this
+    /// equivalence class.
+    pub fn contents<'a>(
+        &self,
+        cache: &'a SquareCache,
+    ) -> impl Iterator<Item = Cursor> + DoubleEndedIterator + ExactSizeIterator + 'a {
+        cache.classes[usize::from(self.index())].1.iter().copied()
+    }
+
+    /// Returns a SIMD mask of which transformations are valid ways of
+    /// interpreting `self.transform()`.
+    ///
+    /// So just a mask with a bit set for every permutation of the bits of the
+    /// transformation this class doesn't care about.
+    #[inline]
+    pub fn valid_transforms(&self) -> Mask<i8, 8> {
+        // Construct the mask as a `u64` before turning into a SIMD mask.
+
+        // First we create a mask of all the offsets from `self.transform()` that are
+        // allowed.
+        //
+        // This is just a fancy way of writing:
+        // ```
+        // let mut mask = match self.transform_bits() {
+        //     0 => 0x01010101_01010101,
+        //     1 => 0x00010001_00010001,
+        //     2 => 0x00000001_00000001,
+        //     3 => 0x00000000_00000001,
+        // };
+        // ```
+        let mut mask: u64 = 0x01030107_0103010f;
+        mask >>= self.transform_bits();
+        mask &= 0x0101_0101_0101_0101;
+
+        // Then shift left to make the valid options start from `self.transform()`.
+        mask <<= 8 * self.transform();
+
+        // Then convert it into a proper SIMD mask.
+        Simd::from(mask.to_le_bytes()).simd_ne(Simd::splat(0))
+    }
 }
 
 /// A buffer for storing which squares on the surface of a cuboid are filled.
@@ -1480,19 +1758,9 @@ impl MappingData {
     /// x to `face.width - x - 1` (or the same for y if the cursor isn't
     /// pointing up relative to its face).
     pub fn horizontal_flip(&mut self) {
-        for cursor in self.cursors.iter_mut() {
-            let face_size = cursor.cuboid().face_size(cursor.square.face);
-            if cursor.orientation % 2 == 0 {
-                // If the cursor is pointing vertically relative to its face, that means that it
-                // agrees with what the face thinks is horizontal, and we can just flip the x
-                // coordinate around.
-                cursor.square.pos.x = face_size.width - cursor.square.pos.x - 1;
-            } else {
-                // Otherwise, horizontal relative to the cursor is vertical relative to the
-                // face, so we need to flip the y coordinate instead.
-                cursor.square.pos.y = face_size.height - cursor.square.pos.y - 1;
-            }
-        }
+        self.cursors
+            .iter_mut()
+            .for_each(CursorData::horizontal_flip);
     }
 
     /// 'Flips' this mapping vertically around its cursors on each cuboid.
@@ -1653,12 +1921,74 @@ impl<const CUBOIDS: usize> Mapping<CUBOIDS> {
         }
     }
 
+    pub fn to_classes(&self, square_caches: &[SquareCache]) -> ClassMapping<CUBOIDS> {
+        ClassMapping {
+            classes: array::from_fn(|i| self.cursors[i].class(&square_caches[i])),
+        }
+    }
+
     pub fn cursors(&self) -> &[Cursor] {
         &self.cursors
     }
 
     pub fn cursors_mut(&mut self) -> &mut [Cursor] {
         &mut self.cursors
+    }
+}
+
+/// A mapping between equivalence classes of cursors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Arbitrary)]
+pub struct ClassMapping<const CUBOIDS: usize> {
+    #[serde(with = "crate::utils::arrays")]
+    pub classes: [Class; CUBOIDS],
+}
+
+impl<const CUBOIDS: usize> ClassMapping<CUBOIDS> {
+    /// Creates a mapping between the given list of cursor classes.
+    pub fn new(classes: [Class; CUBOIDS]) -> Self {
+        Self { classes }
+    }
+
+    /// Creates a mapping between the equivalence classes of the cursors in a
+    /// mapping, given the square caches for all the cursors in order.
+    pub fn from_data(caches: &[SquareCache; CUBOIDS], data: &MappingData) -> Self {
+        assert_eq!(data.cursors.len(), CUBOIDS);
+        let classes = array::from_fn(|i| {
+            let cache = &caches[i];
+            Cursor::from_data(cache, &data.cursors[i]).class(cache)
+        });
+        Self { classes }
+    }
+
+    /// Returns a mapping between one of the cursors contained in each of this
+    /// mapping's cursor classes.
+    pub fn sample(&self, caches: &[SquareCache; CUBOIDS]) -> Mapping<CUBOIDS> {
+        Mapping {
+            cursors: array::from_fn(|i| self.classes[i].contents(&caches[i]).next().unwrap()),
+        }
+    }
+
+    // Returns an 'index' for this mapping generated by gluing the bits of its
+    // classes together.
+    pub fn index(&self) -> usize {
+        let mut result = 0;
+        for class in self.classes {
+            result <<= 6;
+            result |= class.index() as usize;
+        }
+        result
+    }
+}
+
+impl<const CUBOIDS: usize> Display for ClassMapping<CUBOIDS> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for (i, class) in self.classes.into_iter().enumerate() {
+            if i != 0 {
+                write!(f, " -> ")?;
+            }
+            write!(f, "{}", class.index())?;
+        }
+        Ok(())
     }
 }
 
