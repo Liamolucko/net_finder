@@ -1253,9 +1253,9 @@ pub struct SquareCache {
     /// possible direction from a square, assuming the default orientation for
     /// its face.
     ///
-    /// If `index` is the index of a square in `squares` and `direction` is the
-    /// direction you want to find a face position adjacent in, the index you
-    /// need in this array is `index << 2 | (direction as usize)`.
+    /// If `index` is the index of a cursor and `direction` is the direction you
+    /// want to find a face position adjacent in, the index you need in this
+    /// array is `index << 2 | (direction as usize)`.
     pub(crate) neighbour_lookup: Vec<Cursor>,
     /// All of the equivalence classes that cursors can be categorised into,
     /// along with the number of classes in each class's family..
@@ -1303,12 +1303,14 @@ impl SquareCache {
         let neighbour_lookup = squares
             .iter()
             .flat_map(|&square| {
-                [Left, Up, Right, Down].into_iter().map(move |direction| {
-                    CursorData {
-                        square,
-                        orientation: 0,
-                    }
-                    .moved_in(direction)
+                (0..4).flat_map(move |orientation| {
+                    [Left, Up, Right, Down].into_iter().map(move |direction| {
+                        CursorData {
+                            square,
+                            orientation,
+                        }
+                        .moved_in(direction)
+                    })
                 })
             })
             .map(cursor_from_data)
@@ -1493,7 +1495,7 @@ impl Square {
     /// preserved, since that can change between faces. You need `Cursor` for
     /// that.
     pub fn moved_in(self, cache: &SquareCache, direction: Direction) -> Self {
-        cache.neighbour_lookup[usize::from(self.0 << 2) | direction as usize].square()
+        cache.neighbour_lookup[(usize::from(self.0) << 4) | direction as usize].square()
     }
 
     /// Creates a `Square` from a `SquareData`.
@@ -1570,13 +1572,7 @@ impl Cursor {
     /// Returns this cursor moved over by one in `direction`.
     #[inline]
     pub fn moved_in(self, cache: &SquareCache, direction: Direction) -> Self {
-        let cursor = cache.neighbour_lookup
-            [usize::from(self.0 & 0b11111100) | direction.turned(self.orientation()) as usize];
-        // The neighbour lookup table only contains what you get when you move
-        // in some direction from a particular _square_, which means our
-        // orientation's been ignored; to fix that we just add it back on
-        // afterwards.
-        Cursor::new(cursor.square(), cursor.orientation() + self.orientation())
+        cache.neighbour_lookup[(usize::from(self.0) << 2) | direction as usize]
     }
 
     pub fn from_data(cache: &SquareCache, data: &CursorData) -> Self {
