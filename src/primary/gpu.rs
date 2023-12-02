@@ -782,8 +782,6 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
         Self {
             net_pos,
             mapping,
-            // this is just an optimisation, we can leave it unset for now.
-            skip: None,
             followup_index: NonZeroU8::new(followup_index.try_into().unwrap()),
         }
     }

@@ -1402,6 +1402,13 @@ impl Cursor {
         cache.neighbour_lookup[(usize::from(self.0) << 2) | direction as usize]
     }
 
+    /// Returns all the neighbours of this cursor.
+    #[inline]
+    pub fn neighbours(self, cache: &SquareCache) -> [Self; 4] {
+        let index = usize::from(self.0) << 2;
+        cache.neighbour_lookup[index..index + 4].try_into().unwrap()
+    }
+
     pub fn from_data(cache: &SquareCache, data: &CursorData) -> Self {
         let square = Square::from_data(cache, &data.square);
         Self(square.0 << 2 | (data.orientation & 0b11) as u8)

@@ -148,11 +148,6 @@ struct Instruction<const CUBOIDS: usize> {
     net_pos: Pos,
     /// The cursors on each of the cuboids that that square folds up into.
     mapping: Mapping<CUBOIDS>,
-    /// The direction that we can skip looking for followup instructions in, if
-    /// any, because it's the direction of the parent of this instruction.
-    ///
-    /// This is only `None` for the first instruction in the queue.
-    skip: Option<Direction>,
     /// If this instruction has been run, the index in `queue` at which the
     /// instructions added as a result of this instruction begin.
     ///
@@ -178,7 +173,6 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
         Instruction {
             net_pos,
             mapping,
-            skip: Some(direction.turned(2)),
             followup_index: None,
         }
     }
@@ -233,7 +227,6 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                 let queue = vec![Instruction {
                     net_pos: start_pos,
                     mapping: start_mapping.clone(),
-                    skip: None,
                     followup_index: None,
                 }];
 
@@ -315,13 +308,38 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         if !zip(&self.surfaces, instruction.mapping.cursors())
             .any(|(surface, cursor)| surface.filled(cursor.square()))
         {
-            // Add any follow-up instructions.
-            // We do this instead of using a loop to effectively force rustc to unroll it.
             let old_len = self.queue.len();
-            self.add_followup(ctx, instruction, Left);
-            self.add_followup(ctx, instruction, Up);
-            self.add_followup(ctx, instruction, Right);
-            self.add_followup(ctx, instruction, Down);
+            // Add any follow-up instructions.
+            //
+            // First, go through each surface and check whether each of this instruction's
+            // neighbours try and set squares that are already filled.
+            //
+            // We do this here so that we don't have to repeatedly load the surfaces inside
+            // `add_followup`.
+            let mut valid = [true; 4];
+            for ((cache, surface), cursor) in ctx
+                .square_caches
+                .iter()
+                .zip(&self.surfaces)
+                .zip(instruction.mapping.cursors())
+            {
+                for (i, neighbour) in cursor.neighbours(cache).into_iter().enumerate() {
+                    valid[i] &= !surface.filled(neighbour.square());
+                }
+            }
+            // We do this instead of using a loop to effectively force rustc to unroll it.
+            if valid[0] {
+                self.add_followup(ctx, instruction, Left)
+            }
+            if valid[1] {
+                self.add_followup(ctx, instruction, Up)
+            }
+            if valid[2] {
+                self.add_followup(ctx, instruction, Right)
+            }
+            if valid[3] {
+                self.add_followup(ctx, instruction, Down)
+            }
 
             // If there are no valid follow-up instructions, we don't actually fill the
             // square, since we are now considering this a potentially filled square.
@@ -361,14 +379,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         instruction: Instruction<CUBOIDS>,
         direction: Direction,
     ) {
-        if instruction.skip == Some(direction) {
-            return;
-        }
-
         let instruction = instruction.moved_in(ctx, direction);
-        if !zip(&self.surfaces, instruction.mapping.cursors())
-            .any(|(surface, cursor)| surface.filled(cursor.square()))
-            && !self.skip.contains(instruction.mapping)
+        if !self.skip.contains(instruction.mapping)
             && self.net[usize::from(instruction.net_pos.x % 64)]
                 & (1 << (instruction.net_pos.y % 64))
                 == 0
