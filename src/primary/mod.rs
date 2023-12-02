@@ -375,8 +375,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     }
 
     /// Adds the given follow-up instruction to the queue, if it's valid.
-    // rustc REALLY doesn't want to inline this for some reason so we have to force it.
-    #[inline(always)]
+    #[inline]
     fn add_followup(&mut self, instruction: Instruction<CUBOIDS>) {
         if !self.skip.contains(instruction.mapping)
             && self.net[usize::from(instruction.net_pos.x % 64)]
