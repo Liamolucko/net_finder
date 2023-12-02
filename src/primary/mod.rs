@@ -339,18 +339,11 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                     neighbours[neighbour_index].mapping.cursors[cuboid_index] = neighbour;
                 }
             }
-            // We do this instead of using a loop to effectively force rustc to unroll it.
-            if valid[0] {
-                self.add_followup(neighbours[0])
-            }
-            if valid[1] {
-                self.add_followup(neighbours[1])
-            }
-            if valid[2] {
-                self.add_followup(neighbours[2])
-            }
-            if valid[3] {
-                self.add_followup(neighbours[3])
+
+            for i in 0..4 {
+                if valid[i] {
+                    self.add_followup(neighbours[i]);
+                }
             }
 
             // If there are no valid follow-up instructions, we don't actually fill the
