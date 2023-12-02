@@ -20,8 +20,8 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    equivalence_classes, ColoredNet, Cuboid, Direction, Mapping, Net, Pos, SkipSet, SquareCache,
-    Surface,
+    equivalence_classes, ColoredNet, Cuboid, Cursor, Direction, Mapping, Net, Pos, SkipSet, Square,
+    SquareCache, Surface,
 };
 
 mod cpu;
@@ -310,35 +310,47 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         {
             let old_len = self.queue.len();
             // Add any follow-up instructions.
-            //
+            let mut neighbours = [Left, Up, Right, Down].map(|direction| Instruction {
+                net_pos: instruction.net_pos.moved_in_unchecked(direction),
+                // Leave this blank for now so that we can calculate it for all the neighbours at
+                // once.
+                mapping: Mapping::new([Cursor::new(Square::new(), 0); CUBOIDS]),
+                followup_index: None,
+            });
+
             // First, go through each surface and check whether each of this instruction's
             // neighbours try and set squares that are already filled.
             //
             // We do this here so that we don't have to repeatedly load the surfaces inside
             // `add_followup`.
+            //
+            // We also calculate their mappings while we're at it.
             let mut valid = [true; 4];
-            for ((cache, surface), cursor) in ctx
+            for (cuboid_index, ((cache, surface), cursor)) in ctx
                 .square_caches
                 .iter()
                 .zip(&self.surfaces)
                 .zip(instruction.mapping.cursors())
+                .enumerate()
             {
-                for (i, neighbour) in cursor.neighbours(cache).into_iter().enumerate() {
-                    valid[i] &= !surface.filled(neighbour.square());
+                for (neighbour_index, neighbour) in cursor.neighbours(cache).into_iter().enumerate()
+                {
+                    valid[neighbour_index] &= !surface.filled(neighbour.square());
+                    neighbours[neighbour_index].mapping.cursors[cuboid_index] = neighbour;
                 }
             }
             // We do this instead of using a loop to effectively force rustc to unroll it.
             if valid[0] {
-                self.add_followup(ctx, instruction, Left)
+                self.add_followup(neighbours[0])
             }
             if valid[1] {
-                self.add_followup(ctx, instruction, Up)
+                self.add_followup(neighbours[1])
             }
             if valid[2] {
-                self.add_followup(ctx, instruction, Right)
+                self.add_followup(neighbours[2])
             }
             if valid[3] {
-                self.add_followup(ctx, instruction, Down)
+                self.add_followup(neighbours[3])
             }
 
             // If there are no valid follow-up instructions, we don't actually fill the
@@ -369,17 +381,10 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             && !self.skip.contains(instruction.mapping)
     }
 
-    /// Adds the follow-up instruction of the given instruction in the given
-    /// direction, if it's valid.
+    /// Adds the given follow-up instruction to the queue, if it's valid.
     // rustc REALLY doesn't want to inline this for some reason so we have to force it.
     #[inline(always)]
-    fn add_followup(
-        &mut self,
-        ctx: &FinderCtx<CUBOIDS>,
-        instruction: Instruction<CUBOIDS>,
-        direction: Direction,
-    ) {
-        let instruction = instruction.moved_in(ctx, direction);
+    fn add_followup(&mut self, instruction: Instruction<CUBOIDS>) {
         if !self.skip.contains(instruction.mapping)
             && self.net[usize::from(instruction.net_pos.x % 64)]
                 & (1 << (instruction.net_pos.y % 64))

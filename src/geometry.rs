@@ -1311,6 +1311,7 @@ pub struct Square(pub u8);
 
 impl Square {
     /// Returns a square representing (0, 0) on the bottom face of a cuboid.
+    #[inline]
     pub fn new() -> Self {
         Self(0)
     }
