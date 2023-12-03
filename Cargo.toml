@@ -3,6 +3,9 @@ name = "net_finder"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+no-trie = []
+
 [dependencies]
 anyhow = "1.0.66"
 arbitrary = { version = "1.2.0", features = ["derive"] }

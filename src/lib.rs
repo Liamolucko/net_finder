@@ -1,4 +1,4 @@
-#![feature(portable_simd)]
+#![cfg_attr(feature = "no-trie", feature(portable_simd))]
 
 //! A crate which finds nets for cubiods.
 

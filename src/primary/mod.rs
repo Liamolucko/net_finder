@@ -1,5 +1,7 @@
 //! The initial home-grown algorithm I came up with.
 
+#[cfg(feature = "no-trie")]
+use std::simd::{Mask, Simd, SimdPartialEq, SimdUint};
 use std::{
     array,
     collections::HashSet,
@@ -11,7 +13,6 @@ use std::{
     num::NonZeroU8,
     path::{Path, PathBuf},
     process::exit,
-    simd::{Mask, Simd, SimdPartialEq, SimdUint},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -51,9 +52,11 @@ struct FinderCtx<const CUBOIDS: usize> {
     square_caches: [SquareCache; CUBOIDS],
     /// The cursor class on the first cuboid in `inner_cuboids` which we always
     /// use as the starting point on that cuboid.
+    #[cfg(feature = "no-trie")]
     fixed_class: Class,
     /// A bitfield indicating whether each cursor on the first cuboid is in the
     /// same family of equivalence classes as `fixed_class`.
+    #[cfg(feature = "no-trie")]
     maybe_skipped_lookup: [u64; 4],
     /// The equivalence classes of mappings that we build `Finder`s out of.
     equivalence_classes: Vec<Vec<ClassMapping<CUBOIDS>>>,
@@ -137,7 +140,9 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
             inner_cuboids,
             target_area: cuboids[0].surface_area(),
             square_caches,
+            #[cfg(feature = "no-trie")]
             fixed_class,
+            #[cfg(feature = "no-trie")]
             maybe_skipped_lookup,
             equivalence_classes,
             prior_search_time,
@@ -548,6 +553,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     /// Returns whether we should skip a mapping because it's already covered by
     /// a previous `Finder`.
     #[inline]
+    #[cfg(feature = "no-trie")]
     fn skip(&self, ctx: &FinderCtx<CUBOIDS>, mapping: Mapping<CUBOIDS>) -> bool {
         let index = mapping.cursors[0].0 as usize;
         if (ctx.maybe_skipped_lookup[index >> 6] >> (index & 0x3f)) & 1 == 0 {
@@ -566,7 +572,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         let transformed: ClassMapping<CUBOIDS> = ClassMapping::new(array::from_fn(|i| {
             let cursor = mapping.cursors[i];
             let cache = &ctx.square_caches[i];
-            let mut undo_lookup = cursor.undo_lookup(cache);
+            let mut undo_lookup = Simd::from(cursor.undo_lookup(cache));
             // Set the transforms we get from undoing all the invalid transforms to 8 so
             // they won't show up in `min`.
             undo_lookup = valid.select(undo_lookup, Simd::splat(8));
@@ -582,6 +588,13 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         }));
 
         transformed.index() < self.start_mapping_index
+    }
+
+    /// Returns whether we should skip a mapping because it's already covered by
+    /// a previous `Finder`.
+    #[cfg(not(feature = "no-trie"))]
+    fn skip(&self, _ctx: &FinderCtx<CUBOIDS>, mapping: Mapping<CUBOIDS>) -> bool {
+        self.skip.contains(mapping)
     }
 }
 

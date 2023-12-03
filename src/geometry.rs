@@ -7,7 +7,6 @@ use std::fmt::{self, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
 use std::iter::zip;
 use std::ops::{Index, IndexMut};
-use std::simd::{Mask, Simd, SimdPartialEq};
 use std::str::FromStr;
 
 use anyhow::{bail, Context};
@@ -1265,7 +1264,7 @@ pub struct SquareCache {
     /// - The equivalence class they're a part of.
     /// - The transforms their `Class`es end up with after undoing each possible
     ///   transform of the fixed cursor's class.
-    undo_lookup: Vec<(Class, Simd<u8, 8>)>,
+    undo_lookup: Vec<(Class, [u8; 8])>,
 }
 
 impl SquareCache {
@@ -1410,7 +1409,7 @@ impl SquareCache {
                 let class = find_class(cursor);
 
                 // Now calculate the actual undo part of `undo_lookup`.
-                let undos = Simd::from(array::from_fn(|i| {
+                let undos = array::from_fn(|i| {
                     let to_undo = i as u8;
                     let transform = class.transform();
                     // To start with, we can always just subtract off the rotation.
@@ -1430,7 +1429,7 @@ impl SquareCache {
                     } else {
                         new_class.transform()
                     }
-                }));
+                });
 
                 (class, undos)
             })
@@ -1606,7 +1605,7 @@ impl Cursor {
     /// Returns a lookup table of what this class's transform turns into when
     /// you undo any transforamtion.
     #[inline]
-    pub fn undo_lookup(self, cache: &SquareCache) -> Simd<u8, 8> {
+    pub fn undo_lookup(self, cache: &SquareCache) -> [u8; 8] {
         cache.undo_lookup[usize::from(self.0)].1
     }
 }
@@ -1668,38 +1667,6 @@ impl Class {
         cache: &'a SquareCache,
     ) -> impl Iterator<Item = Cursor> + DoubleEndedIterator + ExactSizeIterator + 'a {
         cache.classes[usize::from(self.index())].1.iter().copied()
-    }
-
-    /// Returns a SIMD mask of which transformations are valid ways of
-    /// interpreting `self.transform()`.
-    ///
-    /// So just a mask with a bit set for every permutation of the bits of the
-    /// transformation this class doesn't care about.
-    #[inline]
-    pub fn valid_transforms(&self) -> Mask<i8, 8> {
-        // Construct the mask as a `u64` before turning into a SIMD mask.
-
-        // First we create a mask of all the offsets from `self.transform()` that are
-        // allowed.
-        //
-        // This is just a fancy way of writing:
-        // ```
-        // let mut mask = match self.transform_bits() {
-        //     0 => 0x01010101_01010101,
-        //     1 => 0x00010001_00010001,
-        //     2 => 0x00000001_00000001,
-        //     3 => 0x00000000_00000001,
-        // };
-        // ```
-        let mut mask: u64 = 0x01030107_0103010f;
-        mask >>= self.transform_bits();
-        mask &= 0x0101_0101_0101_0101;
-
-        // Then shift left to make the valid options start from `self.transform()`.
-        mask <<= 8 * self.transform();
-
-        // Then convert it into a proper SIMD mask.
-        Simd::from(mask.to_le_bytes()).simd_ne(Simd::splat(0))
     }
 }
 
