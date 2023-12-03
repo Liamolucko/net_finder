@@ -1,11 +1,8 @@
-use std::{
-    array,
-    collections::HashSet,
-    iter, mem,
-    num::{NonZeroU64, NonZeroU8},
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::collections::HashSet;
+use std::num::{NonZeroU64, NonZeroU8};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use std::{array, iter, mem};
 
 use anyhow::{bail, Context};
 use indicatif::ProgressBar;

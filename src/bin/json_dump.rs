@@ -1,10 +1,8 @@
 //! Dumps all the yielded nets stored in one of the saved state files.
 
-use std::{
-    fs::File,
-    io::{self, BufReader},
-    path::PathBuf,
-};
+use std::fs::File;
+use std::io::{self, BufReader};
+use std::path::PathBuf;
 
 use clap::Parser;
 use net_finder::Solution;

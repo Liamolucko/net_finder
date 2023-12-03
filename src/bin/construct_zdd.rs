@@ -1,8 +1,6 @@
-use std::{
-    fs::{self, File},
-    io::{BufWriter, Write},
-    path::PathBuf,
-};
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 
 use clap::Parser;
 use net_finder::{Cuboid, Zdd};

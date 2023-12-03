@@ -1,24 +1,21 @@
 //! The initial home-grown algorithm I came up with.
 
-use std::{
-    collections::HashSet,
-    fs::{self, File},
-    io::BufWriter,
-    iter::zip,
-    sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError},
-        Arc, Mutex,
-    },
-    thread,
-    time::Duration,
-};
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::BufWriter;
+use std::iter::zip;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use indicatif::ProgressBar;
 
 use crate::{Finder, Net, Solution, State};
 
 use super::{state_path, FinderCtx};
+
 /// Updates the passed `state` with the most recently sent `Finder`s, then
 /// writes it out to a file.
 fn update_state<const CUBOIDS: usize>(

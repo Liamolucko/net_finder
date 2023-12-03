@@ -1,29 +1,29 @@
 //! The initial home-grown algorithm I came up with.
 
+use std::array;
+use std::collections::HashSet;
+use std::fmt::{self, Display, Formatter, Write};
+use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
+use std::io::{BufReader, BufWriter};
+use std::iter::zip;
+use std::num::NonZeroU8;
+use std::path::{Path, PathBuf};
+use std::process::exit;
 #[cfg(feature = "no-trie")]
 use std::simd::{Mask, Simd, SimdPartialEq, SimdUint};
-use std::{
-    array,
-    collections::HashSet,
-    fmt::{self, Display, Formatter, Write},
-    fs::{self, File},
-    hash::{Hash, Hasher},
-    io::{BufReader, BufWriter},
-    iter::zip,
-    num::NonZeroU8,
-    path::{Path, PathBuf},
-    process::exit,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
-};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "no-trie")]
+use crate::Class;
 use crate::{
-    equivalence_classes, Class, ClassMapping, ColoredNet, Cuboid, Cursor, Direction, Mapping, Net,
-    Pos, SkipSet, Square, SquareCache, Surface,
+    equivalence_classes, ClassMapping, ColoredNet, Cuboid, Cursor, Direction, Mapping, Net, Pos,
+    SkipSet, Square, SquareCache, Surface,
 };
 
 mod cpu;

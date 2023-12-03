@@ -1,10 +1,14 @@
 //! Prints out the status of a state file.
 
-use std::{fs::File, io::BufReader, path::PathBuf, time::Duration};
+use std::fs::File;
+use std::io::BufReader;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use indicatif::FormattedDuration;
-use serde::{de::IgnoredAny, Deserialize};
+use serde::de::IgnoredAny;
+use serde::Deserialize;
 
 #[derive(Parser)]
 struct Args {

@@ -1,7 +1,9 @@
 //! Finds the common developments of two cuboids from their ZDDs (well, from
 //! their already-serialized nets that originated from their ZDDs.)
 
-use std::{fs, iter::zip, path::PathBuf};
+use std::fs;
+use std::iter::zip;
+use std::path::PathBuf;
 
 use anyhow::bail;
 use clap::Parser;

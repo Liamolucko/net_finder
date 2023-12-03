@@ -4,7 +4,9 @@
 
 // This file contains infrastructure shared between `primary.rs` and `alt.rs`.
 
-use std::{cmp::Reverse, iter, ops::RangeFrom};
+use std::cmp::Reverse;
+use std::iter;
+use std::ops::RangeFrom;
 
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};

@@ -1,6 +1,8 @@
 // This implements the ZDD-based algorithm for finding common developments of cuboids described in http://dx.doi.org/10.1016/j.comgeo.2017.03.001.
 
-use std::{collections::VecDeque, hash::Hash, mem};
+use std::collections::VecDeque;
+use std::hash::Hash;
+use std::mem;
 
 use crate::{Cuboid, CursorData, Direction, Face, Net, Pos};
 

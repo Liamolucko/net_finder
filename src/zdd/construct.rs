@@ -1,25 +1,21 @@
-use std::{
-    cell::Cell,
-    collections::{HashSet, VecDeque},
-    fmt::{self, Debug, Formatter},
-    hash::Hash,
-    iter::zip,
-    mem,
-    num::NonZeroU8,
-    sync::mpsc,
-    thread::{self, ScopedJoinHandle},
-    time::{Duration, Instant},
-};
+use std::cell::Cell;
+use std::collections::{HashSet, VecDeque};
+use std::fmt::{self, Debug, Formatter};
+use std::hash::Hash;
+use std::iter::zip;
+use std::mem;
+use std::num::NonZeroU8;
+use std::sync::mpsc;
+use std::thread::{self, ScopedJoinHandle};
+use std::time::{Duration, Instant};
 
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
 use rustc_hash::FxHashMap;
 
 use crate::Cuboid;
 
-use super::{
-    geometry::{rotations_for_cuboid, Edge},
-    ConstantNode, Node, NodeRef, Zdd, MAX_EDGES, MAX_VERTICES,
-};
+use super::geometry::{rotations_for_cuboid, Edge};
+use super::{ConstantNode, Node, NodeRef, Zdd, MAX_EDGES, MAX_VERTICES};
 
 /// The state of the graph represented by a node in a ZDD.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
