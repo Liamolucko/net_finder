@@ -4,7 +4,6 @@
 
 // This file contains infrastructure shared between `primary.rs` and `alt.rs`.
 
-use std::cmp::Reverse;
 use std::iter;
 use std::ops::RangeFrom;
 
@@ -95,7 +94,7 @@ pub fn equivalence_classes<const CUBOIDS: usize>(
     // Go through all the possible cursor classes we could fix and find the one
     // which results in the equivalence classes having the largest average size,
     // since this leads to the most mappings getting skipped.
-    let (cuboid, class, mut result) = (0..CUBOIDS)
+    let (fixed_cuboid, fixed_class, mut result) = (0..CUBOIDS)
         .flat_map(|cuboid| {
             square_caches[cuboid]
                 .classes()
@@ -121,10 +120,19 @@ pub fn equivalence_classes<const CUBOIDS: usize>(
                 .then(b.len().cmp(&a.len()))
         })
         .unwrap();
-    // Then sort the equivalence classes in descending order of size, so that more
-    // mappings get skipped earlier on.
-    result.sort_by_key(|class| Reverse(class.into_iter().count()));
-    (cuboid, class, result)
+
+    // Then sort the equivalence classes in ascending order of minimum mapping
+    // index, since `Finder::skip` relies on that being the case (when `no-trie` is
+    // enabled).
+    result.sort_by_key(|class| {
+        class
+            .into_iter()
+            .filter(|mapping| mapping.classes[fixed_cuboid] == fixed_class)
+            .map(|mapping| mapping.index())
+            .min()
+    });
+
+    (fixed_cuboid, fixed_class, result)
 }
 
 /// A set of mappings for a `Finder` to skip, implemented as a trie.

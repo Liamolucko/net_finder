@@ -1,6 +1,7 @@
 //! The initial home-grown algorithm I came up with.
 
 use std::array;
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter, Write};
 use std::fs::{self, File};
@@ -120,10 +121,12 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
                 class
             })
             .collect();
-        // Sort the equivalence classes by the minimum index in each class.
-        // That way, each finder knows if a mapping was covered by a previous finder by
-        // checking if that mapping's index is less than its.
-        equivalence_classes.sort_by_key(|class| class[0].index());
+
+        if cfg!(not(feature = "no-trie")) {
+            // Sort the equivalence classes in descending order of size, so that more
+            // mappings get skipped earlier on.
+            equivalence_classes.sort_by_key(|class| Reverse(class.len()));
+        }
 
         let mut maybe_skipped_lookup = [0; 4];
         for cursor in square_caches[0]
