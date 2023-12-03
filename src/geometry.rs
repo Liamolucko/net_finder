@@ -1484,6 +1484,7 @@ pub struct Square(pub u8);
 
 impl Square {
     /// Returns a square representing (0, 0) on the bottom face of a cuboid.
+    #[inline]
     pub fn new() -> Self {
         Self(0)
     }
@@ -1573,6 +1574,13 @@ impl Cursor {
     #[inline]
     pub fn moved_in(self, cache: &SquareCache, direction: Direction) -> Self {
         cache.neighbour_lookup[(usize::from(self.0) << 2) | direction as usize]
+    }
+
+    /// Returns all the neighbours of this cursor.
+    #[inline]
+    pub fn neighbours(self, cache: &SquareCache) -> [Self; 4] {
+        let index = usize::from(self.0) << 2;
+        cache.neighbour_lookup[index..index + 4].try_into().unwrap()
     }
 
     pub fn from_data(cache: &SquareCache, data: &CursorData) -> Self {

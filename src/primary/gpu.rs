@@ -21,7 +21,7 @@ use wgpu::{
 
 use crate::{Cursor, Finder, Mapping, Net, Pos, Solution, SquareCache, State, Surface};
 
-use super::{set::InstructionSet, FinderCtx, Instruction};
+use super::{FinderCtx, Instruction};
 
 /// The number of `Finder`s we always give to the GPU.
 const NUM_FINDERS: u32 = 13440;
@@ -603,28 +603,28 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         }
 
         // Write `queued`.
-        buffer.extend(iter::repeat(0).take(queued_padding.try_into().unwrap()));
-        for &(length, positions) in &self.queued.elements {
-            let mut positions = bytemuck::cast::<u64, [Pos; 4]>(positions);
-            if cfg!(target_endian = "big") {
-                positions.reverse();
-            }
-            let encoded_positions: [u32; 4] = array::from_fn(|i| {
-                let mut result = 0;
-                if i == 0 {
-                    result |= length << 28;
-                }
-                if i < length.try_into().unwrap() {
-                    result |= 0x80000000;
-                    result |= (positions[i].x as u32) << 8;
-                    result |= positions[i].y as u32;
-                }
-                result
-            });
-            for word in encoded_positions {
-                buffer.extend_from_slice(&u32::to_le_bytes(word));
-            }
-        }
+        // buffer.extend(iter::repeat(0).take(queued_padding.try_into().
+        // unwrap())); for &(length, positions) in &self.queued.elements
+        // {     let mut positions = bytemuck::cast::<u64, [Pos;
+        // 4]>(positions);     if cfg!(target_endian = "big") {
+        //         positions.reverse();
+        //     }
+        //     let encoded_positions: [u32; 4] = array::from_fn(|i| {
+        //         let mut result = 0;
+        //         if i == 0 {
+        //             result |= length << 28;
+        //         }
+        //         if i < length.try_into().unwrap() {
+        //             result |= 0x80000000;
+        //             result |= (positions[i].x as u32) << 8;
+        //             result |= positions[i].y as u32;
+        //         }
+        //         result
+        //     });
+        //     for word in encoded_positions {
+        //         buffer.extend_from_slice(&u32::to_le_bytes(word));
+        //     }
+        // }
     }
 
     fn from_gpu(pipeline: &Pipeline<CUBOIDS>, mut bytes: &[u8]) -> Self {
@@ -681,31 +681,25 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         .map(Surface);
         bytes = &bytes[surfaces_size..];
 
-        bytes = &bytes[queued_padding.try_into().unwrap()..];
-        let queued_size: usize = queued_size.try_into().unwrap();
-        let elements = bytes[..queued_size]
-            .chunks(4 * 4)
-            .map(|bytes| {
-                let positions = bytemuck::from_bytes::<[u32; 4]>(bytes).map(u32::from_le);
-                let length = (positions[0] >> 28) & 0x7;
-                let mut positions = positions.map(|pos| Pos {
-                    x: (pos >> 8) as u8,
-                    y: pos as u8,
-                });
-                if cfg!(target_endian = "big") {
-                    positions.reverse();
-                }
-                let positions: u64 = bytemuck::cast(positions);
-                (length, positions)
-            })
-            .collect();
-        let queued = InstructionSet { elements };
+        // bytes = &bytes[queued_padding.try_into().unwrap()..];
+        // let queued_size: usize = queued_size.try_into().unwrap();
+        // let elements = bytes[..queued_size]
+        //     .chunks(4 * 4)
+        //     .map(|bytes| {
+        //         let positions = bytemuck::from_bytes::<[u32;
+        // 4]>(bytes).map(u32::from_le);         let length = (positions[0] >>
+        // 28) & 0x7;         let mut positions = positions.map(|pos| Pos { x: (pos >>
+        //     8) as u8, y: pos as u8, }); if cfg!(target_endian = "big") {
+        //     positions.reverse(); } let positions: u64 = bytemuck::cast(positions);
+        //     (length, positions) }) .collect();
+        // let queued = InstructionSet { elements };
 
         Self {
+            skip: todo!(),
             start_mapping_index: todo!(),
             queue,
             potential,
-            queued,
+            net: todo!(),
             surfaces,
             index,
             base_index,
@@ -747,8 +741,6 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
         Self {
             net_pos,
             mapping,
-            // this is just an optimisation, we can leave it unset for now.
-            skip: None,
             followup_index: NonZeroU8::new(followup_index.try_into().unwrap()),
         }
     }

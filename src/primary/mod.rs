@@ -21,17 +21,14 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    equivalence_classes, Class, ClassMapping, ColoredNet, Cuboid, Direction, Mapping, Net, Pos,
-    SquareCache, Surface,
+    equivalence_classes, Class, ClassMapping, ColoredNet, Cuboid, Cursor, Direction, Mapping, Net,
+    Pos, SkipSet, Square, SquareCache, Surface,
 };
 
 mod cpu;
 mod gpu;
-mod set;
 
 use Direction::*;
-
-use self::set::InstructionSet;
 
 /// The additional information that we need to have on hand to actually run a
 /// `Finder`.
@@ -151,6 +148,9 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
     /// Generates a list of `Finder`s to use for finding the common nets of this
     /// `FinderCtx`'s cuboids.
     fn gen_finders(&self) -> Vec<Finder<CUBOIDS>> {
+        // A `SkipSet` containing all of the previous equivalence classes.
+        let mut prev_classes = SkipSet::new(self.inner_cuboids);
+
         self.equivalence_classes
             .iter()
             .map(|class| {
@@ -165,19 +165,27 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
                 let queue = vec![Instruction {
                     net_pos: start_pos,
                     mapping: start_mapping,
-                    skip: None,
                     followup_index: None,
                 }];
 
-                let mut queued = InstructionSet::new(self.inner_cuboids[0].surface_area());
-                queued.insert(queue[0]);
+                let mut net = [0; 64];
+                net[usize::from(start_pos.x % 64)] |= 1 << (start_pos.y % 64);
+
+                // We want to skip all the equivalence classes prior to this one.
+                let skip = prev_classes.clone();
+                // Then add this equivalence class to the set of previous ones.
+                for mapping in class {
+                    prev_classes.insert(&self.square_caches, mapping.sample(&self.square_caches));
+                }
+
                 Finder {
+                    skip,
                     start_mapping_index: start_class_mapping.index(),
 
                     queue,
                     potential: Vec::new(),
 
-                    queued,
+                    net,
                     surfaces: array::from_fn(|_| Surface::new()),
 
                     index: 0,
@@ -190,6 +198,9 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Finder<const CUBOIDS: usize> {
+    /// Mappings that we should skip over because they're the responsibility of
+    /// another `Finder`.
+    skip: SkipSet<CUBOIDS>,
     /// The index of this `Finder`'s starting mapping (as returned by
     /// `ClassMapping::index`).
     start_mapping_index: usize,
@@ -201,8 +212,30 @@ pub struct Finder<const CUBOIDS: usize> {
     /// Note that some of these may now be invalid.
     potential: Vec<usize>,
 
-    /// The set of instructions that are in the queue.
-    queued: InstructionSet<CUBOIDS>,
+    /// For each column of the net, whether each square in that column has an
+    /// instruction trying to set it.
+    ///
+    /// This is used to deduplicate instructions. That means that if there are
+    /// two instructions that map the same net position to different spots on
+    /// the surface, only the first one will be added; however, that's actually
+    /// a good thing. We don't really want to allow that anyway, since that's
+    /// what leads to cuts being required.
+    ///
+    /// What we should really do in that situation is mark the first one as
+    /// invalid too; however it's rare enough that it ends up being faster to
+    /// let it slide for now and fix it up at the end.
+    ///
+    /// Note that this is actually smaller than the net - 64x64, when the net
+    /// can go up to 129x129 (with our current max. surface area of 64).
+    /// However, this is fine because only a 64x64 region of it can ever be used
+    /// - it's only so big because it can be a 64x64 region in either direction.
+    ///
+    /// So we intentionally allow wrapping around by just using the lower 6 bits
+    /// of the coordinates; it doesn't matter that this makes the net
+    /// discontiguous, all that matters is that different net positions always
+    /// use different bits.
+    #[serde(with = "crate::utils::arrays")]
+    net: [u64; 64],
     /// Buffers storing which squares we've filled on the surface of each cuboid
     /// so far.
     #[serde(with = "crate::utils::arrays")]
@@ -230,11 +263,6 @@ struct Instruction<const CUBOIDS: usize> {
     net_pos: Pos,
     /// The cursors on each of the cuboids that that square folds up into.
     mapping: Mapping<CUBOIDS>,
-    /// The direction that we can skip looking for followup instructions in, if
-    /// any, because it's the direction of the parent of this instruction.
-    ///
-    /// This is only `None` for the first instruction in the queue.
-    skip: Option<Direction>,
     /// If this instruction has been run, the index in `queue` at which the
     /// instructions added as a result of this instruction begin.
     ///
@@ -260,7 +288,6 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
         Instruction {
             net_pos,
             mapping,
-            skip: Some(direction.turned(2)),
             followup_index: None,
         }
     }
@@ -308,7 +335,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         }
         // Then remove all the instructions added as a result of this square.
         for instruction in self.queue.drain(followup_index..).rev() {
-            self.queued.remove(&instruction);
+            self.net[usize::from(instruction.net_pos.x % 64)] &=
+                !(1 << (instruction.net_pos.y % 64));
         }
 
         // Also un-mark any instructions that come after this instruction as potential,
@@ -331,13 +359,43 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         if !zip(&self.surfaces, instruction.mapping.cursors())
             .any(|(surface, cursor)| surface.filled(cursor.square()))
         {
-            // Add any follow-up instructions.
-            // We do this instead of using a loop to effectively force rustc to unroll it.
             let old_len = self.queue.len();
-            self.add_followup(ctx, instruction, Left);
-            self.add_followup(ctx, instruction, Up);
-            self.add_followup(ctx, instruction, Right);
-            self.add_followup(ctx, instruction, Down);
+            // Add any follow-up instructions.
+            let mut neighbours = [Left, Up, Right, Down].map(|direction| Instruction {
+                net_pos: instruction.net_pos.moved_in_unchecked(direction),
+                // Leave this blank for now so that we can calculate it for all the neighbours at
+                // once.
+                mapping: Mapping::new([Cursor::new(Square::new(), 0); CUBOIDS]),
+                followup_index: None,
+            });
+
+            // First, go through each surface and check whether each of this instruction's
+            // neighbours try and set squares that are already filled.
+            //
+            // We do this here so that we don't have to repeatedly load the surfaces inside
+            // `add_followup`.
+            //
+            // We also calculate their mappings while we're at it.
+            let mut valid = [true; 4];
+            for (cuboid_index, ((cache, surface), cursor)) in ctx
+                .square_caches
+                .iter()
+                .zip(&self.surfaces)
+                .zip(instruction.mapping.cursors())
+                .enumerate()
+            {
+                for (neighbour_index, neighbour) in cursor.neighbours(cache).into_iter().enumerate()
+                {
+                    valid[neighbour_index] &= !surface.filled(neighbour.square());
+                    neighbours[neighbour_index].mapping.cursors[cuboid_index] = neighbour;
+                }
+            }
+
+            for i in 0..4 {
+                if valid[i] {
+                    self.add_followup(ctx, neighbours[i]);
+                }
+            }
 
             // If there are no valid follow-up instructions, we don't actually fill the
             // square, since we are now considering this a potentially filled square.
@@ -367,28 +425,16 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             && !self.skip(ctx, instruction.mapping)
     }
 
-    /// Adds the follow-up instruction of the given instruction in the given
-    /// direction, if it's valid.
-    // rustc REALLY doesn't want to inline this for some reason so we have to force it.
-    #[inline(always)]
-    fn add_followup(
-        &mut self,
-        ctx: &FinderCtx<CUBOIDS>,
-        instruction: Instruction<CUBOIDS>,
-        direction: Direction,
-    ) {
-        if instruction.skip == Some(direction) {
-            return;
-        }
-
-        let instruction = instruction.moved_in(ctx, direction);
-        if !zip(&self.surfaces, instruction.mapping.cursors())
-            .any(|(surface, cursor)| surface.filled(cursor.square()))
-            && !self.skip(ctx, instruction.mapping)
+    /// Adds the given follow-up instruction to the queue, if it's valid.
+    #[inline]
+    fn add_followup(&mut self, ctx: &FinderCtx<CUBOIDS>, instruction: Instruction<CUBOIDS>) {
+        if !self.skip(ctx, instruction.mapping)
+            && self.net[usize::from(instruction.net_pos.x % 64)]
+                & (1 << (instruction.net_pos.y % 64))
+                == 0
         {
-            if self.queued.insert(instruction) {
-                self.queue.push(instruction);
-            }
+            self.net[usize::from(instruction.net_pos.x % 64)] |= 1 << (instruction.net_pos.y % 64);
+            self.queue.push(instruction);
         }
     }
 
