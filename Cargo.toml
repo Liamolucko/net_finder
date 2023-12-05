@@ -4,17 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+default = ["no-trie"]
 no-trie = []
 
 [dependencies]
 anyhow = "1.0.66"
 arbitrary = { version = "1.2.0", features = ["derive"] }
 bytemuck = { version = "1.13.1", features = ["min_const_generics", "derive"] }
-chrono = { version = "0.4.26", features = ["std", "clock"], default-features = false }
+chrono = { version = "0.4.26", features = [
+    "std",
+    "clock",
+], default-features = false }
 clap = { version = "4.0.29", features = ["derive"] }
 ctrlc = "3.4.0"
 env_logger = "0.10.0"
 indicatif = { version = "0.17.3", features = ["rayon"] }
+itertools = "0.12.0"
 pollster = "0.3.0"
 postcard = { version = "1.0.2", features = ["use-std"] }
 rayon = "1.7.0"
