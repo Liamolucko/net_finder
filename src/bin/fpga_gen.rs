@@ -38,7 +38,8 @@ fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> any
 
     let cursor_bits = (4 * area).next_power_of_two().ilog2() as usize;
 
-    // Round the size of the net up to the nearest multiple of 4 to make our net layout work.
+    // Round the size of the net up to the nearest multiple of 4 to make our net
+    // layout work.
     let net_size = area.next_multiple_of(4);
     let coord_bits = net_size.next_power_of_two().ilog2();
 
@@ -217,7 +218,8 @@ fn gen_skip_checker<const CUBOIDS: usize>(
     // Figure out the list of transformations we have to try undoing given a
     // particular class on the fixed cuboid.
 
-    // For each index in `to_undo` (the VHDL signal), what that index should be set to for each possible class on the fixed cuboid.
+    // For each index in `to_undo` (the VHDL signal), what that index should be set
+    // to for each possible class on the fixed cuboid.
     let mut to_undo: Vec<HashMap<Class, u8>> = vec![HashMap::new(); num_options];
     for transform in 0..8 {
         let cache = &square_caches[fixed_cuboid];
@@ -360,7 +362,9 @@ fn gen_neighbour_lookup<const CUBOIDS: usize>(
         .enumerate()
         .map(|(i, cache)| {
             format!(
-                "with instruction.mapping({i}) select\n\
+                // I have no idea why, but if I don't include these pointless
+                // `std_logic_vector`s Vivado gives a weird 'found 2 definitions for &' error.
+                "with std_logic_vector(instruction.mapping({i})) & std_logic_vector(direction) select\n\
             \t\tneighbour.mapping({i}) <=\n\
             \t\t\t{},\n\
             \t\t\t\"{}\" when others;",
