@@ -355,7 +355,8 @@ fn gen_neighbour_lookup<const CUBOIDS: usize>(
     area: usize,
     square_caches: &[SquareCache; CUBOIDS],
 ) -> (String, String) {
-    let cursor_bits = (4 * area).next_power_of_two().ilog2() as usize;
+    let square_bits = area.next_power_of_two().ilog2() as usize;
+    let cursor_bits = square_bits + 2;
 
     let cursor_assignments = square_caches
         .iter()
@@ -364,20 +365,19 @@ fn gen_neighbour_lookup<const CUBOIDS: usize>(
             format!(
                 // I have no idea why, but if I don't include these pointless
                 // `std_logic_vector`s Vivado gives a weird 'found 2 definitions for &' error.
-                "with std_logic_vector(instruction.mapping({i})) & std_logic_vector(direction) select\n\
-            \t\tneighbour.mapping({i}) <=\n\
-            \t\t\t{},\n\
-            \t\t\t\"{}\" when others;",
+                "with std_logic_vector(instruction.mapping({i})(cursor_bits - 1 downto 2)) & std_logic_vector(direction) select\n\
+                 \t\tunrotated({i}) <=\n\
+                 \t\t\t{},\n\
+                 \t\t\t\"{}\" when others;\n\
+                 \n\
+                 \tneighbour.mapping({i}) <= unrotated({i})(cursor_bits - 1 downto 2) & (unrotated({i})(1 downto 0) + instruction.mapping({i})(1 downto 0));",
                 cache
                     .squares()
-                    .flat_map(
-                        |square| (0..4).map(move |orientation| Cursor::new(square, orientation))
-                    )
-                    .flat_map(|cursor| [Left, Up, Right, Down].into_iter().map(
+                    .flat_map(|square| [Left, Up, Right, Down].into_iter().map(
                         move |direction| format!(
-                            "\"{:0cursor_bits$b}\" when \"{:0cursor_bits$b}{:02b}\"",
-                            cursor.moved_in(cache, direction).0,
-                            cursor.0,
+                            "\"{:0cursor_bits$b}\" when \"{:0square_bits$b}{:02b}\"",
+                            Cursor::new(square, 0).moved_in(cache, direction).0,
+                            square.0,
                             direction as u8
                         )
                     ))
@@ -403,6 +403,8 @@ entity neighbour_lookup is
 end neighbour_lookup;
 
 architecture arch of neighbour_lookup is
+\ttype cursor_vector is array(integer range <>) of cursor;
+\tsignal unrotated: cursor_vector(0 to cuboids - 1);
 begin
 \twith direction select
 \t\tneighbour.pos.x <=
