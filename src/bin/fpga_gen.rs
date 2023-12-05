@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use anyhow::bail;
 use clap::Parser;
 use itertools::Itertools;
-use net_finder::{equivalence_classes, Class, Cuboid, Cursor, SquareCache};
+use net_finder::{equivalence_classes, Class, Cuboid, Cursor, Direction, SquareCache};
+
+use Direction::*;
 
 #[derive(Parser)]
 struct Options {
@@ -33,8 +35,70 @@ fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> any
     let area = cuboids[0].surface_area();
 
     let square_caches = cuboids.map(SquareCache::new);
+
+    let cursor_bits = (4 * area).next_power_of_two().ilog2() as usize;
+
+    // Round the size of the net up to the nearest multiple of 4 to make our net layout work.
+    let net_size = area.next_multiple_of(4);
+    let coord_bits = net_size.next_power_of_two().ilog2();
+
+    let (skip_checker_entity, skip_checker_component) = gen_skip_checker(area, &square_caches);
+    let (neighbour_lookup_entity, neighbour_lookup_component) =
+        gen_neighbour_lookup(area, &square_caches);
+
+    let mut file = File::create(output)?;
+    write!(
+        file,
+        "\
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+package generated is
+\tconstant cuboids: integer := {CUBOIDS};
+\tconstant area: integer := {area};
+\tconstant net_size: integer := {net_size};
+\tconstant net_len: integer := net_size * net_size;
+
+\tconstant cursor_bits: integer := {cursor_bits};
+\tconstant coord_bits: integer := {coord_bits};
+
+\tsubtype cursor is unsigned(cursor_bits - 1 downto 0);
+\ttype mapping is array(0 to cuboids - 1) of cursor;
+
+\ttype pos is record
+\t\tx: unsigned(coord_bits - 1 downto 0);
+\t\ty: unsigned(coord_bits - 1 downto 0);
+\tend record pos;
+
+\tsubtype direction is unsigned(1 downto 0);
+
+\ttype instruction is record
+\t\tpos: pos;
+\t\tmapping: mapping;
+\tend record instruction;
+\ttype instruction_vector is array(integer range <>) of instruction;
+
+\t{skip_checker_component}
+
+\t{neighbour_lookup_component}
+end package;
+
+{skip_checker_entity}
+
+{neighbour_lookup_entity}
+"
+    )?;
+    Ok(())
+}
+
+fn gen_skip_checker<const CUBOIDS: usize>(
+    area: usize,
+    square_caches: &[SquareCache; CUBOIDS],
+) -> (String, String) {
     let (fixed_cuboid, fixed_class, _) = equivalence_classes(&square_caches);
 
+    let cursor_bits = (4 * area).next_power_of_two().ilog2() as usize;
     let class_bits = square_caches
         .iter()
         .map(|cache| cache.classes().len().next_power_of_two().ilog2() as usize)
@@ -141,7 +205,7 @@ fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> any
                         index = class.index(),
                         cursors = class
                             .contents(cache)
-                            .map(|cursor| format!("{}", cursor.0))
+                            .map(|cursor| format!("\"{:0cursor_bits$b}\"", cursor.0))
                             .format(" | "),
                     ))
                     .format(",\n\t\t\t"),
@@ -242,28 +306,9 @@ fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> any
             .format(" or ")
     );
 
-    let mut file = File::create(output)?;
-    write!(
-        file,
-        "\
-library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
-
-package generated is
-\tconstant cuboids: integer := {CUBOIDS};
-\tconstant area: integer := {area};
-\tsubtype cursor is integer range 0 to 4 * area - 1;
-\ttype mapping is array (0 to cuboids - 1) of cursor;
-
-\tcomponent skip_checker is
-\t\tport(
-\t\t\tmapping: in mapping;
-\t\t\tstart_mapping_index: in unsigned({mapping_index_bits} - 1 downto 0);
-\t\t\tskipped: out std_logic);
-\tend component;
-end package;
-
+    (
+        format!(
+            "\
 {undo_entities}
 
 library ieee;
@@ -290,8 +335,94 @@ begin
 \t{uses_fixed_class_assignment}
 \t{undo_instances}
 \t{result_assignment}
-end arch;
-"
-    )?;
-    Ok(())
+end arch;"
+        ),
+        format!(
+            "\
+component skip_checker is
+\t\tport(
+\t\t\tmapping: in mapping;
+\t\t\tstart_mapping_index: in unsigned({mapping_index_bits} - 1 downto 0);
+\t\t\tskipped: out std_logic);
+\tend component;"
+        ),
+    )
+}
+
+fn gen_neighbour_lookup<const CUBOIDS: usize>(
+    area: usize,
+    square_caches: &[SquareCache; CUBOIDS],
+) -> (String, String) {
+    let cursor_bits = (4 * area).next_power_of_two().ilog2() as usize;
+
+    let cursor_assignments = square_caches
+        .iter()
+        .enumerate()
+        .map(|(i, cache)| {
+            format!(
+                "with instruction.mapping({i}) select\n\
+            \t\tneighbour.mapping({i}) <=\n\
+            \t\t\t{},\n\
+            \t\t\t\"{}\" when others;",
+                cache
+                    .squares()
+                    .flat_map(
+                        |square| (0..4).map(move |orientation| Cursor::new(square, orientation))
+                    )
+                    .flat_map(|cursor| [Left, Up, Right, Down].into_iter().map(
+                        move |direction| format!(
+                            "\"{:0cursor_bits$b}\" when \"{:0cursor_bits$b}{:02b}\"",
+                            cursor.moved_in(cache, direction).0,
+                            cursor.0,
+                            direction as u8
+                        )
+                    ))
+                    .format(",\n\t\t\t"),
+                "-".repeat(cursor_bits)
+            )
+        })
+        .join("\n\n\t");
+
+    (
+        format!(
+            "\
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+use work.generated.all;
+
+entity neighbour_lookup is
+\tport(
+\t\tinstruction: in instruction;
+\t\tdirection: in direction;
+\t\tneighbour: out instruction);
+end neighbour_lookup;
+
+architecture arch of neighbour_lookup is
+begin
+\twith direction select
+\t\tneighbour.pos.x <=
+\t\t\tinstruction.pos.x - 1 when \"00\",
+\t\t\tinstruction.pos.x + 1 when \"10\",
+\t\t\tinstruction.pos.x when others;
+
+\twith direction select
+\t\tneighbour.pos.y <=
+\t\t\tinstruction.pos.y + 1 when \"01\",
+\t\t\tinstruction.pos.y - 1 when \"11\",
+\t\t\tinstruction.pos.y when others;
+
+\t{cursor_assignments}
+end arch;"
+        ),
+        format!(
+            "\
+component neighbour_lookup is
+\t\tport(
+\t\t\tinstruction: in instruction;
+\t\t\tdirection: in direction;
+\t\t\tneighbour: out instruction);
+\tend component;"
+        ),
+    )
 }
