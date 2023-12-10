@@ -37,6 +37,10 @@ fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> any
     let square_caches = cuboids.map(SquareCache::new);
 
     let cursor_bits = (4 * area).next_power_of_two().ilog2() as usize;
+    let mapping_index_bits: usize = square_caches
+        .iter()
+        .map(|cache| cache.classes().len().next_power_of_two().ilog2() as usize)
+        .sum();
 
     // Round the size of the net up to the nearest multiple of 4 to make our net
     // layout work.
@@ -66,6 +70,7 @@ package generated is
 
 \tsubtype cursor is unsigned(cursor_bits - 1 downto 0);
 \ttype mapping is array(0 to cuboids - 1) of cursor;
+\tsubtype mapping_index is unsigned({mapping_index_bits} - 1 downto 0);
 
 \ttype pos is record
 \t\tx: unsigned(coord_bits - 1 downto 0);
@@ -104,7 +109,6 @@ fn gen_skip_checker<const CUBOIDS: usize>(
         .iter()
         .map(|cache| cache.classes().len().next_power_of_two().ilog2() as usize)
         .collect::<Vec<_>>();
-    let mapping_index_bits: usize = class_bits.iter().sum();
 
     let undo_entities = square_caches
         .iter()
@@ -321,7 +325,7 @@ use work.generated.all;
 entity skip_checker is
 \tport(
 \t\tmapping: in mapping;
-\t\tstart_mapping_index: in unsigned({mapping_index_bits} - 1 downto 0);
+\t\tstart_mapping_index: in mapping_index;
 \t\tskipped: out std_logic);
 end skip_checker;
 
@@ -344,7 +348,7 @@ end arch;"
 component skip_checker is
 \t\tport(
 \t\t\tmapping: in mapping;
-\t\t\tstart_mapping_index: in unsigned({mapping_index_bits} - 1 downto 0);
+\t\t\tstart_mapping_index: in mapping_index;
 \t\t\tskipped: out std_logic);
 \tend component;"
         ),
