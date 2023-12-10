@@ -406,17 +406,36 @@ architecture arch of neighbour_lookup is
 \ttype cursor_vector is array(integer range <>) of cursor;
 \tsignal unrotated: cursor_vector(0 to cuboids - 1);
 begin
-\twith direction select
-\t\tneighbour.pos.x <=
-\t\t\tinstruction.pos.x - 1 when \"00\",
-\t\t\tinstruction.pos.x + 1 when \"10\",
-\t\t\tinstruction.pos.x when others;
-
-\twith direction select
-\t\tneighbour.pos.y <=
-\t\t\tinstruction.pos.y + 1 when \"01\",
-\t\t\tinstruction.pos.y - 1 when \"11\",
-\t\t\tinstruction.pos.y when others;
+\tprocess(instruction)
+\tbegin
+\t\tneighbour.pos <= instruction.pos;
+\t\tcase direction is
+\t\t\twhen \"00\" =>
+\t\t\t\tif to_integer(instruction.pos.x) = 0 then
+\t\t\t\t\tneighbour.pos.x <= to_unsigned(net_size - 1, coord_bits);
+\t\t\t\telse
+\t\t\t\t\tneighbour.pos.x <= instruction.pos.x - 1;
+\t\t\t\tend if;
+\t\t\twhen \"01\" =>
+\t\t\t\tif to_integer(instruction.pos.y) = net_size - 1 then
+\t\t\t\t\tneighbour.pos.y <= (others => '0');
+\t\t\t\telse
+\t\t\t\t\tneighbour.pos.y <= instruction.pos.y + 1;
+\t\t\t\tend if;
+\t\t\twhen \"10\" =>
+\t\t\t\tif to_integer(instruction.pos.x) = net_size - 1 then
+\t\t\t\t\tneighbour.pos.x <= (others => '0');
+\t\t\t\telse
+\t\t\t\t\tneighbour.pos.x <= instruction.pos.x + 1;
+\t\t\t\tend if;
+\t\t\twhen \"11\" =>
+\t\t\t\tif to_integer(instruction.pos.y) = 0 then
+\t\t\t\t\tneighbour.pos.y <= to_unsigned(net_size - 1, coord_bits);
+\t\t\t\telse
+\t\t\t\t\tneighbour.pos.y <= instruction.pos.y - 1;
+\t\t\t\tend if;
+\t\tend case;
+\tend process;
 
 \t{cursor_assignments}
 end arch;"
