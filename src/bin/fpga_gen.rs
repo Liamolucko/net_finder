@@ -46,6 +46,11 @@ fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> any
     // layout work.
     let net_size = area.next_multiple_of(4);
     let coord_bits = net_size.next_power_of_two().ilog2();
+    // Multiplication logic is expensive, so we index into the net by just gluing
+    // the bits of x and y together; this means that we have to store an entry for
+    // every combination of y's bits (`1 << coord_bits`), but x is still normal
+    // since it's at the start.
+    let net_len = net_size * (1 << coord_bits);
 
     let (skip_checker_entity, skip_checker_component) = gen_skip_checker(area, &square_caches);
     let (neighbour_lookup_entity, neighbour_lookup_component) =
@@ -63,7 +68,7 @@ package generated is
 \tconstant cuboids: integer := {CUBOIDS};
 \tconstant area: integer := {area};
 \tconstant net_size: integer := {net_size};
-\tconstant net_len: integer := net_size * net_size;
+\tconstant net_len: integer := {net_len};
 
 \tconstant cursor_bits: integer := {cursor_bits};
 \tconstant coord_bits: integer := {coord_bits};
@@ -72,10 +77,14 @@ package generated is
 \ttype mapping is array(0 to cuboids - 1) of cursor;
 \tsubtype mapping_index is unsigned({mapping_index_bits} - 1 downto 0);
 
+\tsubtype square is integer range 0 to area - 1;
+\ttype square_vector is array(integer range <>) of square;
+
 \ttype pos is record
 \t\tx: unsigned(coord_bits - 1 downto 0);
 \t\ty: unsigned(coord_bits - 1 downto 0);
 \tend record pos;
+\ttype pos_vector is array(integer range <>) of pos;
 
 \tsubtype direction is unsigned(1 downto 0);
 
