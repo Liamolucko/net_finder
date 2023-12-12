@@ -376,9 +376,7 @@ fn gen_neighbour_lookup<const CUBOIDS: usize>(
         .enumerate()
         .map(|(i, cache)| {
             format!(
-                // I have no idea why, but if I don't include these pointless
-                // `std_logic_vector`s Vivado gives a weird 'found 2 definitions for &' error.
-                "with std_logic_vector(instruction.mapping({i})(cursor_bits - 1 downto 2)) & std_logic_vector(direction) select\n\
+                "with unsigned'(instruction.mapping({i})(cursor_bits - 1 downto 2) & (instruction.mapping({i})(1 downto 0) + direction)) select\n\
                  \t\tunrotated({i}) <=\n\
                  \t\t\t{},\n\
                  \t\t\t\"{}\" when others;\n\
