@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::bail;
 use clap::Parser;
 use itertools::Itertools;
-use net_finder::{equivalence_classes, Class, Cuboid, Cursor, Direction, SquareCache};
+use net_finder::{equivalence_classes, Class, Cuboid, Cursor, Direction, Square, SquareCache};
 
 use Direction::*;
 
@@ -374,23 +374,22 @@ fn gen_neighbour_lookup<const CUBOIDS: usize>(
     let square_bits = area.next_power_of_two().ilog2() as usize;
     let cursor_bits = square_bits + 2;
 
-    // For each cuboid, a map from offset to every cursor + direction which gives a
-    // neighbour with that offset from the original cursor.
-    let mut cursor_offsets: [BTreeMap<i32, Vec<(Cursor, Direction)>>; CUBOIDS] =
+    // For each cuboid, a map from offset to every square + direction which gives a
+    // neighbour with that offset from the original square (interpreted as a cursor
+    // with orientation 0).
+    let mut cursor_offsets: [BTreeMap<i32, Vec<(Square, Direction)>>; CUBOIDS] =
         array::from_fn(|_| BTreeMap::new());
 
     for (cache, offsets) in zip(square_caches, &mut cursor_offsets) {
-        for cursor in cache
-            .squares()
-            .flat_map(|square| (0..4).map(move |orientation| Cursor::new(square, orientation)))
-        {
+        for square in cache.squares() {
             for direction in [Left, Up, Right, Down] {
+                let cursor = Cursor::new(square, 0);
                 let neighbour = cursor.moved_in(cache, direction);
                 let offset = neighbour.0 as i32 - cursor.0 as i32;
                 offsets
                     .entry(offset)
                     .or_insert_with(Vec::new)
-                    .push((cursor, direction))
+                    .push((square, direction))
             }
         }
     }
@@ -410,7 +409,7 @@ fn gen_neighbour_lookup<const CUBOIDS: usize>(
         .enumerate()
         .map(|(i, offsets)| {
             format!(
-                "with unsigned'(instruction.mapping({i}) & direction) select\n\
+                "with unsigned'(instruction.mapping({i})(cursor_bits - 1 downto 2) & (instruction.mapping({i})(1 downto 0) + direction)) select\n\
                  \t\toffset{i} <=\n\
                  \t\t\t{},\n\
                  \t\t\t0 when others;\n\
@@ -423,9 +422,9 @@ fn gen_neighbour_lookup<const CUBOIDS: usize>(
                             "{offset} when {}",
                             cursors
                                 .iter()
-                                .map(|&(cursor, direction)| format!(
-                                    "\"{:0cursor_bits$b}{:02b}\"",
-                                    cursor.0, direction as u8
+                                .map(|&(square, direction)| format!(
+                                    "\"{:0square_bits$b}{:02b}\"",
+                                    square.0, direction as u8
                                 ))
                                 .format(" | ")
                         )
