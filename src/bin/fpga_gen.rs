@@ -1,7 +1,9 @@
+use std::array;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write as _;
+use std::iter::zip;
 use std::path::PathBuf;
 
 use anyhow::bail;
@@ -371,29 +373,63 @@ fn gen_neighbour_lookup<const CUBOIDS: usize>(
     let square_bits = area.next_power_of_two().ilog2() as usize;
     let cursor_bits = square_bits + 2;
 
-    let cursor_assignments = square_caches
+    // For each cuboid, a map from offset to every cursor + direction which gives a
+    // neighbour with that offset from the original cursor.
+    let mut cursor_offsets: [BTreeMap<i32, Vec<(Cursor, Direction)>>; CUBOIDS] =
+        array::from_fn(|_| BTreeMap::new());
+
+    for (cache, offsets) in zip(square_caches, &mut cursor_offsets) {
+        for cursor in cache
+            .squares()
+            .flat_map(|square| (0..4).map(move |orientation| Cursor::new(square, orientation)))
+        {
+            for direction in [Left, Up, Right, Down] {
+                let neighbour = cursor.moved_in(cache, direction);
+                let offset = neighbour.0 as i32 - cursor.0 as i32;
+                offsets
+                    .entry(offset)
+                    .or_insert_with(Vec::new)
+                    .push((cursor, direction))
+            }
+        }
+    }
+
+    let offset_signals = cursor_offsets
         .iter()
         .enumerate()
-        .map(|(i, cache)| {
+        .map(|(i, offsets)| {
+            let min_offset = offsets.keys().min().unwrap();
+            let max_offset = offsets.keys().max().unwrap();
+            format!("signal offset{i}: integer range {min_offset} to {max_offset};")
+        })
+        .join("\n\t");
+
+    let cursor_assignments = cursor_offsets
+        .iter()
+        .enumerate()
+        .map(|(i, offsets)| {
             format!(
-                "with unsigned'(instruction.mapping({i})(cursor_bits - 1 downto 2) & (instruction.mapping({i})(1 downto 0) + direction)) select\n\
-                 \t\tunrotated({i}) <=\n\
+                "with instruction.mapping({i}) select\n\
+                 \t\toffset{i} <=\n\
                  \t\t\t{},\n\
-                 \t\t\t\"{}\" when others;\n\
+                 \t\t\t0 when others;\n\
                  \n\
-                 \tneighbour.mapping({i}) <= unrotated({i})(cursor_bits - 1 downto 2) & (unrotated({i})(1 downto 0) + instruction.mapping({i})(1 downto 0));",
-                cache
-                    .squares()
-                    .flat_map(|square| [Left, Up, Right, Down].into_iter().map(
-                        move |direction| format!(
-                            "\"{:0cursor_bits$b}\" when \"{:0square_bits$b}{:02b}\"",
-                            Cursor::new(square, 0).moved_in(cache, direction).0,
-                            square.0,
-                            direction as u8
+                 \tneighbour.mapping({i}) <= to_unsigned(to_integer(instruction.mapping({i})) + offset{i}, cursor_bits);",
+                offsets
+                    .iter()
+                    .map(|(offset, cursors)| {
+                        format!(
+                            "{offset} when {}",
+                            cursors
+                                .iter()
+                                .map(|&(cursor, direction)| format!(
+                                    "\"{:0cursor_bits$b}{:02b}\"",
+                                    cursor.0, direction as u8
+                                ))
+                                .format(" | ")
                         )
-                    ))
+                    })
                     .format(",\n\t\t\t"),
-                "-".repeat(cursor_bits)
             )
         })
         .join("\n\n\t");
@@ -414,8 +450,7 @@ entity neighbour_lookup is
 end neighbour_lookup;
 
 architecture arch of neighbour_lookup is
-\ttype cursor_vector is array(integer range <>) of cursor;
-\tsignal unrotated: cursor_vector(0 to cuboids - 1);
+\t{offset_signals}
 begin
 \tprocess(instruction)
 \tbegin
