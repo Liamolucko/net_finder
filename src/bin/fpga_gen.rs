@@ -410,7 +410,7 @@ fn gen_neighbour_lookup<const CUBOIDS: usize>(
         .enumerate()
         .map(|(i, offsets)| {
             format!(
-                "with instruction.mapping({i}) select\n\
+                "with unsigned'(instruction.mapping({i}) & direction) select\n\
                  \t\toffset{i} <=\n\
                  \t\t\t{},\n\
                  \t\t\t0 when others;\n\
