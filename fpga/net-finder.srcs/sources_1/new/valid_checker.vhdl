@@ -158,8 +158,13 @@ architecture arch of valid_checker is
 
     type shard_num_vector is array(integer range <>) of integer range 0 to 3;
     type shard_index_vector is array(integer range <>) of integer range 0 to net_len / 4 - 1;
+    type onehot_direction_vector is array(integer range <>) of std_logic_vector(0 to 3);
     -- Which shard of the net each neighbour's net position falls into.
     signal shards: shard_num_vector(0 to 3);
+    -- For each shard, whether it's being used by each neighbour.
+    signal shard_neighbours_onehot: onehot_direction_vector(0 to 3);
+    -- Which neighbour each shard is being used by.
+    signal shard_neighbours: direction_vector(0 to 3);
     -- What index we're looking at in each net shard.
     signal shard_indices: shard_index_vector(0 to 3);
     -- Whether we want to write to each net.
@@ -225,39 +230,30 @@ begin
     surface_wr_en <= run or backtrack or clear_mode;
     wr_data <= run and not clear_mode;
 
-    -- Make this a process so that we can assign to `shard_indices` multiple times and
-    -- it'll just result in overwriting.
-    -- (That should never happen anyway, but the synthesiser doesn't know that.)
-    process(clear_index, clear_mode, neighbours, shards)
-    begin
-        for i in 0 to 3 loop
-            shard_indices(i) <= clear_index;
-        end loop;
-
-        if clear_mode = '0' then
-            for i in 0 to 3 loop
-                -- Then since each row within a chunk only contains 1 square in each shard, we
-                -- can just ignore the bottom 2 bits of the x coordinate and we have our index
-                -- within the shard.
-                shard_indices(shards(i)) <= to_integer(neighbours(i).pos.x(coord_bits - 1 downto 2) & neighbours(i).pos.y);
-            end loop;
-        end if;
-    end process;
-
-    process(clear_mode, shards, neighbours_valid)
-    begin
-        for i in 0 to 3 loop
-            shard_wr_ens(i) <= clear_mode;
-        end loop;
-
-        if clear_mode = '0' then
-            for i in 0 to 3 loop
-                shard_wr_ens(shards(i)) <= (run or backtrack) and neighbours_valid(i);
-            end loop;
-        end if;
-    end process;
-
     gen_shards: for shard in 0 to 3 generate
+        gen_shard_inner: for direction in 0 to 3 generate
+            shard_neighbours_onehot(shard)(direction) <= '1' when shards(direction) = shard else '0';
+        end generate;
+
+        with shard_neighbours_onehot(shard) select
+            shard_neighbours(shard) <=
+                "00" when "1000",
+                "01" when "0100",
+                "10" when "0010",
+                "11" when "0001",
+                "--" when others;
+
+        shard_indices(shard) <=
+            clear_index when clear_mode = '1'
+            -- Since each row within a chunk only contains 1 square in each shard, we can
+            -- just ignore the bottom 2 bits of the x coordinate and we have our index
+            -- within the shard.
+            else to_integer(
+                neighbours(to_integer(shard_neighbours(shard))).pos.x(coord_bits - 1 downto 2)
+                & neighbours(to_integer(shard_neighbours(shard))).pos.y
+            );
+        shard_wr_ens(shard) <= clear_mode or ((run or backtrack) and neighbours_valid(to_integer(shard_neighbours(shard))));
+
         net_shards: async_ram
             generic map(size => net_len / 4)
             port map(
@@ -287,7 +283,7 @@ begin
         surface_rw_indices(cuboid) <=
             clear_index when clear_mode = '1' and clear_index < area
             else to_integer(instruction.mapping(cuboid)(cursor_bits - 1 downto 2));
-        gen_inner: for direction in 0 to 3 generate
+        gen_cuboids_inner: for direction in 0 to 3 generate
             surface_rd_indices(cuboid)(direction) <= to_integer(neighbours(direction).mapping(cuboid)(cursor_bits - 1 downto 2));
         end generate;
         surfaces: surface port map(

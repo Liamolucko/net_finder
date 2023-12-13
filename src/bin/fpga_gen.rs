@@ -89,6 +89,7 @@ package generated is
 \ttype pos_vector is array(integer range <>) of pos;
 
 \tsubtype direction is unsigned(1 downto 0);
+\ttype direction_vector is array(integer range <>) of direction;
 
 \ttype instruction is record
 \t\tpos: pos;
