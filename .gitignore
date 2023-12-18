@@ -9,5 +9,6 @@
 /fpga/net-finder.hw/
 /fpga/net-finder.runs/
 /fpga/net-finder.sim/
-/fpga/net-finder.srcs/sources_1/new/generated.vhdl
-/fpga/net-finder.srcs/utils_1
+/fpga/net-finder.srcs/sources_1/new/generated.sv
+/fpga/net-finder.srcs/sources_1/new/obj_dir/
+/fpga/net-finder.srcs/utils_1/
