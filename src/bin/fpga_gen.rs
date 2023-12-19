@@ -43,7 +43,7 @@ fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> any
         .map(|cache| cache.classes().len().next_power_of_two().ilog2() as usize)
         .sum();
 
-    let mapping_index_module = gen_mapping_index(&square_caches);
+    let mapping_index_function = gen_mapping_index(&square_caches);
     let neighbour_offset_function = gen_neighbour_offset(&square_caches);
 
     let mut file = File::create(output)?;
@@ -61,7 +61,7 @@ typedef struct packed {{
 typedef cursor_t [CUBOIDS-1:0] mapping_t;
 typedef logic[{mapping_index_bits}-1:0] mapping_index_t;
 
-{mapping_index_module}
+{mapping_index_function}
 
 {neighbour_offset_function}
 "
@@ -196,25 +196,22 @@ fn gen_mapping_index<const CUBOIDS: usize>(square_caches: &[SquareCache; CUBOIDS
         .map(|(i, map)| {
             format!(
                 "case (cursor{fixed_cuboid}_class)\
-           \n      {}\
-           \n      default: to_undo[{i}] = 'x;\
-           \n    endcase",
+             \n    {}\
+             \n    default: to_undo[{i}] = 'x;\
+             \n  endcase",
                 map.iter()
                     .map(|(class, transform)| {
                         format!("{}: to_undo[{i}] = {transform};", class.index())
                     })
-                    .format("\n      ")
+                    .format("\n    ")
             )
         })
         .join("\n  ");
 
-    let uses_fixed_class_assignment = format!(
-        "assign uses_fixed_class = {};",
-        to_undo[0]
-            .keys()
-            .map(|class| format!("cursor{fixed_cuboid}_class == {}", class.index()))
-            .format(" | ")
-    );
+    let uses_fixed_class_expr = to_undo[0]
+        .keys()
+        .map(|class| format!("cursor{fixed_cuboid}_class == {}", class.index()))
+        .join(" | ");
 
     let undo_exprs = (0..CUBOIDS)
         .map(|cuboid| format!("cuboid{cuboid}_undo(cursor{cuboid}_class, to_undo[i])"))
@@ -225,32 +222,28 @@ fn gen_mapping_index<const CUBOIDS: usize>(square_caches: &[SquareCache; CUBOIDS
        \n\
        \n{undo_funcs}\
        \n\
-       \nmodule mapping_index_lookup(\
+       \nfunction automatic logic mapping_index_lookup(\
        \n    input mapping_t mapping,\
-       \n    output mapping_index_t index,\
-       \n    output logic uses_fixed_class\
+       \n    output mapping_index_t index\
        \n);\
        \n  {class_assignments}\
        \n\
-       \n  logic [2:0] to_undo [{num_options}];\
-       \n  always_comb begin\
-       \n    {to_undo_assignments}\
+       \n  logic [2:0] to_undo[{num_options}];\
+       \n  mapping_index_t options[{num_options}];\
+       \n\
+       \n  {to_undo_assignments}\
+       \n\
+       \n  // Make this as big as possible to start with so everything's less than it (or\
+       \n  // equal, in which case it happens to be correct anyway and so that's fine).\
+       \n  index = ~0;\
+       \n  for (int i = 0; i < {num_options}; i++) begin\
+       \n    options[i] = {{{undo_exprs}}};\
+       \n    // Pick the smallest version of the index.\
+       \n    if (options[i] < index) index = options[i];\
        \n  end\
        \n\
-       \n  mapping_index_t options [{num_options}];\
-       \n    always_comb begin\
-       \n    // Make this as big as possible to start with so everything's less than it (or\
-       \n    // equal, in which case it happens to be correct anyway and so that's fine).\
-       \n    index = ~0;\
-       \n    for (int i = 0; i < {num_options}; i++) begin\
-       \n      options[i] = {{{undo_exprs}}};\
-       \n      // Pick the smallest version of the index.\
-       \n      if (options[i] < index) index = options[i];\
-       \n    end\
-       \n  end\
-       \n\
-       \n  {uses_fixed_class_assignment}\
-       \nendmodule"
+       \n  return {uses_fixed_class_expr};\
+       \nendfunction"
     )
 }
 

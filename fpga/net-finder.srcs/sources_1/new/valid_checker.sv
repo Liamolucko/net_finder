@@ -1,4 +1,4 @@
-`include "instruction_neighbour.sv"
+import types::*;
 
 // A single-port, 1-bit wide RAM with asynchronous read and synchronous write.
 module async_ram #(
@@ -85,18 +85,13 @@ module valid_checker (
 );
   // For each neighbour of `instruction`, whether there's already a queued
   // instruction setting the same net position.
-  logic queued [4];
+  logic queued[4];
   // Whether each neighbour of `instruction` tries to set any squares on the
   // surface that are already filled.
-  logic filled [4];
+  logic filled[4];
   // Whether each neighbour of `instruction` is skipped due to being covered by
   // another finder.
   logic skipped[4];
-
-  // Instatiate the net. It's split into 4 shards, in order to allow for 4 write
-  // ports: one for each neighbour of `instruction`.
-  // verilator lint_off PINMISSING
-  async_ram #(.SIZE(NET_LEN / 4)) net_shards[4] (.clk(clk));
 
   // Find out what the neighbours of `instruction` in each direction are.
   instruction_t neighbours[4];
@@ -107,6 +102,7 @@ module valid_checker (
   end
 
   // verilator lint_off ASSIGNIN
+  // verilator lint_off PINMISSING
   // Check whether each neighbour is already queued by seeing if its bit is set on the net.
   genvar direction, shard, cuboid;
   generate
@@ -133,8 +129,9 @@ module valid_checker (
         endcase
     end
 
-    // Then each shard's address needs to be the position of the neighbour whose bit
-    // is stored there.
+    // Then instantiate all the shards. We need to put their outputs into a variable
+    // like this because arrays of module instances are weird.
+    logic shard_values[4];
     for (shard = 0; shard < 4; shard++) begin : gen_net_shards
       // First make a one-hot vector, where each bit just represents whether the
       // neighbour in that direction has its bit stored in this shard.
@@ -145,8 +142,8 @@ module valid_checker (
 
       // Then use a binary encoder to turn that into the actual index of the neighbour
       // using this shard.
+      logic [1:0] neighbour;
       always_comb begin
-        logic [1:0] neighbour;
         case (neighbour_onehot)
           'b0001:  neighbour = 0;
           'b0010:  neighbour = 1;
@@ -154,80 +151,70 @@ module valid_checker (
           'b1000:  neighbour = 3;
           default: neighbour = 'x;
         endcase
-
-        if (clear_mode) begin
-          net_shards[shard].addr = clear_index;
-          net_shards[shard].wr_en = 1;
-          net_shards[shard].wr_data = 1;
-        end else begin
-          // Since each row within a chunk only contains 1 square in each shard, we can
-          // just ignore the bottom 2 bits of the x coordinate and we have our index
-          // within the shard.
-          net_shards[shard].addr = {
-            neighbours[neighbour].pos.x[COORD_BITS-1:2], neighbours[neighbour].pos.y
-          };
-          // We only want to write to the neighbour's bit if it's valid, otherwise this
-          // neighbour wasn't queued. So when running we don't want to mark it as such,
-          // and when backtracking we don't want to accidently unset this bit which was
-          // set for an earlier instruction with the same position.
-          net_shards[shard].wr_en = clear_mode | ((run | backtrack) & neighbours_valid[neighbour]);
-          // We want to set this bit to 1 when running and 0 when backtracking.
-          net_shards[shard].wr_data = run;
-        end
       end
+
+      // Instantiate the actual RAM for this net shard.
+      async_ram #(
+          .SIZE(NET_LEN / 4)
+      ) ram (
+          .clk(clk),
+
+          .addr(clear_mode ? clear_index : {
+            neighbours[neighbour].pos.x[COORD_BITS-1:2], neighbours[neighbour].pos.y
+          }),
+          .wr_en(clear_mode ? 1 : (run | backtrack) & neighbours_valid[neighbour]),
+          .wr_data(clear_mode ? 0 : run),
+          .rd_data(shard_values[shard])
+      );
     end
 
     // Finally, whether each neighbour's queued is whether its bit is set.
-    logic shard_values[4];
-    for (shard = 0; shard < 4; shard++) assign shard_values[shard] = net_shards[shard].rd_data;
     for (direction = 0; direction < 4; direction++) begin : gen_queued
       assign queued[direction] = shard_values[shards[direction]];
     end
   endgenerate
 
-  // Instantiate the surfaces.
-  surface surfaces[4] (.clk(clk));
-
   generate
-    // Mark `instruction` as invalid if any of the squares it sets are
-    // already filled.
-    // Also wire up writes to occur to the surfaces when running/backtracking.
-    logic instruction_cursors_filled[CUBOIDS];
-    for (cuboid = 0; cuboid < CUBOIDS; cuboid++) begin : gen_surface_rw
-      always_comb begin
-        if (clear_mode) begin
-          surfaces[cuboid].rw_addr = square_t'(clear_index);
-          surfaces[cuboid].rw_wr_en = int'(clear_index) < AREA;
-          surfaces[cuboid].rw_wr_data = 0;
-        end else begin
-          surfaces[cuboid].rw_addr = instruction.mapping[cuboid].square;
-          surfaces[cuboid].rw_wr_en = run | backtrack;
-          // We want to set this bit to 1 when running and 0 when backtracking.
-          surfaces[cuboid].rw_wr_data = run;
-        end
-      end
-      assign instruction_cursors_filled[cuboid] = surfaces[cuboid].rw_rd_data;
-    end
-    assign instruction_valid = !|instruction_cursors_filled;
+    // Instantiate and wire up all the surfaces.
+    // We need these variables to hold the outputs of the surfaces again, for
+    // the same reason as before (module instances are weird).
+    logic [CUBOIDS-1:0] instruction_cursors_filled;
+    logic [CUBOIDS-1:0] neighbour_cursors_filled[4];
+    for (cuboid = 0; cuboid < CUBOIDS; cuboid++) begin : gen_surfaces
+      surface ram (
+          .clk(clk),
 
-    // Mark the neighbours invalid if any of the squares they set are already filled.
-    for (direction = 0; direction < 4; direction++) begin : gen_filled
-      // Figure out whether each cursor that this neighbour sets is filled on its surface.
-      logic neighbour_cursors_filled[CUBOIDS];
-      for (cuboid = 0; cuboid < CUBOIDS; cuboid++) begin : gen_surface_rd
-        assign surfaces[cuboid].rd_addrs[direction] = neighbours[direction].mapping[cuboid].square;
-        assign neighbour_cursors_filled[cuboid] = surfaces[cuboid].rd_data[direction];
+          .rw_addr(clear_mode ? square_t'(clear_index) : instruction.mapping[cuboid].square),
+          .rw_wr_en(clear_mode ? int'(clear_index) < AREA : run | backtrack),
+          // We want to set this bit to 1 when running and 0 when backtracking.
+          .rw_wr_data(clear_mode ? 0 : run),
+          .rw_rd_data(instruction_cursors_filled[cuboid])
+      );
+
+      for (direction = 0; direction < 4; direction++) begin : gen_neighbour_cursors_filled
+        assign ram.rd_addrs[direction] = neighbours[direction].mapping[cuboid].square;
+        assign neighbour_cursors_filled[direction][cuboid] = ram.rd_data[direction];
       end
-      assign filled[direction] = |neighbour_cursors_filled;
+    end
+
+    // Then check if `instruction` and its neighbours set any squares that area
+    // already filled. Mark `instruction` as invalid if it does so.
+    assign instruction_valid = !(|instruction_cursors_filled);
+    for (direction = 0; direction < 4; direction++) begin : gen_filled
+      assign filled[direction] = |neighbour_cursors_filled[direction];
     end
   endgenerate
 
-  mapping_index_lookup mapping_index_lookups[4];
   generate
     for (direction = 0; direction < 4; direction++) begin : gen_skipped
-      assign mapping_index_lookups[direction].mapping = neighbours[direction].mapping;
-      assign skipped[direction] = mapping_index_lookups[direction].uses_fixed_class
-        & mapping_index_lookups[direction].index < start_mapping_index;
+      mapping_index_t index;
+      always_comb begin
+        if (mapping_index_lookup(neighbours[direction].mapping, index)) begin
+          skipped[direction] = index < start_mapping_index;
+        end else begin
+          skipped[direction] = 0;
+        end
+      end
     end
   endgenerate
   // verilator lint_on ASSIGNIN

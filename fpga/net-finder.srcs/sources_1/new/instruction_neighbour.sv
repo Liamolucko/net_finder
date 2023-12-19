@@ -1,4 +1,4 @@
-`include "types.sv"
+import types::*;
 
 function automatic instruction_t instruction_neighbour(instruction_t instruction,
                                                        logic [1:0] direction);
