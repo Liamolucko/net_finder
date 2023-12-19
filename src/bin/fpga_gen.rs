@@ -38,12 +38,15 @@ fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> any
 
     let square_caches = cuboids.map(SquareCache::new);
 
+    let (fixed_cuboid, fixed_class, _) = equivalence_classes(&square_caches);
     let mapping_index_bits: usize = square_caches
         .iter()
-        .map(|cache| cache.classes().len().next_power_of_two().ilog2() as usize)
+        .enumerate()
+        .filter(|&(i, _)| i != fixed_cuboid)
+        .map(|(_, cache)| cache.classes().len().next_power_of_two().ilog2() as usize)
         .sum();
 
-    let mapping_index_function = gen_mapping_index(&square_caches);
+    let mapping_index_function = gen_mapping_index(&square_caches, fixed_cuboid, fixed_class);
     let neighbour_offset_function = gen_neighbour_offset(&square_caches);
 
     let mut file = File::create(output)?;
@@ -69,9 +72,11 @@ typedef logic[{mapping_index_bits}-1:0] mapping_index_t;
     Ok(())
 }
 
-fn gen_mapping_index<const CUBOIDS: usize>(square_caches: &[SquareCache; CUBOIDS]) -> String {
-    let (fixed_cuboid, fixed_class, _) = equivalence_classes(&square_caches);
-
+fn gen_mapping_index<const CUBOIDS: usize>(
+    square_caches: &[SquareCache; CUBOIDS],
+    fixed_cuboid: usize,
+    fixed_class: Class,
+) -> String {
     let class_bits = square_caches
         .iter()
         .map(|cache| cache.classes().len().next_power_of_two().ilog2() as usize)
@@ -105,6 +110,7 @@ fn gen_mapping_index<const CUBOIDS: usize>(square_caches: &[SquareCache; CUBOIDS
         .iter()
         .zip(&class_bits)
         .enumerate()
+        .filter(|&(cuboid, _)| cuboid != fixed_cuboid)
         .map(|(cuboid, (cache, bits))| {
             format!(
                 "function automatic logic [{top_bit}:0] cuboid{cuboid}_undo(logic [{top_bit}:0] klass, logic [2:0] transform);\
@@ -214,6 +220,7 @@ fn gen_mapping_index<const CUBOIDS: usize>(square_caches: &[SquareCache; CUBOIDS
         .join(" | ");
 
     let undo_exprs = (0..CUBOIDS)
+        .filter(|&cuboid| cuboid != fixed_cuboid)
         .map(|cuboid| format!("cuboid{cuboid}_undo(cursor{cuboid}_class, to_undo[i])"))
         .join(", ");
 
