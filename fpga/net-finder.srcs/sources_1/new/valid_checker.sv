@@ -1,4 +1,4 @@
-import types::*;
+`include "instruction_neighbour.sv"
 
 // A single-port, 1-bit wide RAM with asynchronous read and synchronous write.
 module async_ram #(
@@ -69,7 +69,7 @@ module valid_checker (
     input logic backtrack,
 
     // Whether `instruction`'s neighbour in each direction is valid.
-    output logic neighbours_valid [4],
+    output logic [3:0] neighbours_valid,
     // Whether `instruction` itself is valid.
     //
     // This only checks whether it tries to set any squares that are already
@@ -78,6 +78,10 @@ module valid_checker (
     // whether it's skipped never changes.
     output logic instruction_valid,
 
+    // Whether each of `instruction`'s cursors are filled on the surfaces. Needed
+    // for `CHECK` state.
+    output logic [CUBOIDS-1:0] instruction_cursors_filled,
+
     // 7 series distributed RAM doesn't have any way of clearing the whole thing at
     // once, so we have to go through and individually set each bit to 0.
     input logic clear_mode,
@@ -85,13 +89,13 @@ module valid_checker (
 );
   // For each neighbour of `instruction`, whether there's already a queued
   // instruction setting the same net position.
-  logic queued[4];
+  logic [3:0] queued;
   // Whether each neighbour of `instruction` tries to set any squares on the
   // surface that are already filled.
-  logic filled[4];
+  logic [3:0] filled;
   // Whether each neighbour of `instruction` is skipped due to being covered by
   // another finder.
-  logic skipped[4];
+  logic [3:0] skipped;
 
   // Find out what the neighbours of `instruction` in each direction are.
   instruction_t neighbours[4];
@@ -178,7 +182,6 @@ module valid_checker (
     // Instantiate and wire up all the surfaces.
     // We need these variables to hold the outputs of the surfaces again, for
     // the same reason as before (module instances are weird).
-    logic [CUBOIDS-1:0] instruction_cursors_filled;
     logic [CUBOIDS-1:0] neighbour_cursors_filled[4];
     for (cuboid = 0; cuboid < CUBOIDS; cuboid++) begin : gen_surfaces
       surface ram (
@@ -220,10 +223,5 @@ module valid_checker (
   // verilator lint_on ASSIGNIN
   // verilator lint_on PINMISSING
 
-  generate
-    for (direction = 0; direction < 4; direction++) begin : gen_neighbours_valid
-      assign neighbours_valid[direction] =
-        !queued[direction] & !filled[direction] & !skipped[direction];
-    end
-  endgenerate
+  assign neighbours_valid = ~queued & ~filled & ~skipped;
 endmodule
