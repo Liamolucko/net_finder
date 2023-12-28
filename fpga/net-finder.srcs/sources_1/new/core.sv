@@ -1,5 +1,67 @@
 `include "valid_checker.sv"
 
+typedef logic [$clog2(4 * AREA)-1:0] potential_index_t;
+typedef logic [$clog2(4 * AREA)-1:0] decision_index_t;
+typedef logic [$clog2(AREA)-1:0] run_stack_index_t;
+
+typedef struct packed {
+  // The index of the instruction's parent in the run stack.
+  run_stack_index_t parent;
+  // The index of this instruction in its parent's list of valid children.
+  //
+  // If the index is past the end of that list, it represents the last valid
+  // child. Then we always store the last valid child as 11, so that when
+  // backtracking we can immediately see 'oh this is the last one, so we need to
+  // move onto the next instruction'.
+  logic [1:0] child_index;
+} instruction_ref_t;
+
+typedef struct packed {
+  // The instruction that was run.
+  instruction_t instruction;
+  // A reference to where in the run stack this instruction originally came from.
+  instruction_ref_t instruction_ref;
+  // Whether this instruction's child in each direction was valid at the time this
+  // instruction was run.
+  logic [3:0] children;
+  // The number of potential instructions there were at the point when it was run.
+  potential_index_t potential_len;
+  // The index of the decision to run this instruction in the list of decisions.
+  decision_index_t decision_index;
+} run_stack_entry_t;
+
+// A simple-dual-port, write-before-read, synchronous RAM for storing run stacks.
+module run_stack_ram (
+    input logic clk,
+
+    input run_stack_index_t wr_addr,
+    input run_stack_entry_t wr_data,
+    input logic wr_en,
+
+    input  run_stack_index_t rd_addr,
+    output run_stack_entry_t rd_data
+);
+  logic [$bits(run_stack_entry_t)-1:0] memory[AREA];
+
+  run_stack_entry_t unsynced_rd_data;
+  run_stack_entry_t last_wr_data;
+  logic conflict;
+  always_ff @(posedge clk) begin
+    unsynced_rd_data <= memory[rd_addr];
+    if (wr_en) begin
+      memory[wr_addr] <= wr_data;
+    end
+
+    last_wr_data <= wr_data;
+    conflict <= wr_en & wr_addr == rd_addr;
+  end
+
+  // Note: I don't think this can use 7 series BRAMs' `WRITE_FIRST` mode because
+  // that only applies when you're reading and writing on the same port. In this
+  // case reads & writes use different ports and so we need to do it manually.
+  assign rd_data = conflict ? last_wr_data : unsynced_rd_data;
+endmodule
+
 module core (
     input logic clk,
     input logic reset,
@@ -94,23 +156,6 @@ module core (
   // Whether to reset `prefix_bits` back to `$bits(prefix_t)`.
   logic reset_prefix_bits;
 
-  // Declare all the types we use across multiple places.
-  typedef logic [$clog2(4 * AREA)-1:0] potential_index_t;
-  typedef logic [$clog2(4 * AREA)-1:0] decision_index_t;
-  typedef logic [$clog2(AREA)-1:0] run_stack_index_t;
-
-  typedef struct packed {
-    // The index of the instruction's parent in the run stack.
-    run_stack_index_t parent;
-    // The index of this instruction in its parent's list of valid children.
-    //
-    // If the index is past the end of that list, it represents the last valid
-    // child. Then we always store the last valid child as 11, so that when
-    // backtracking we can immediately see 'oh this is the last one, so we need to
-    // move onto the next instruction'.
-    logic [1:0] child_index;
-  } instruction_ref_t;
-
   // All the metadata about a finder that gets sent prior to the list of
   // decisions.
   typedef struct packed {
@@ -180,32 +225,67 @@ module core (
   // valid instruction it came across) is surprisingly difficult; it requires
   // making a whole second copy of the core's state.
   // So instead, we just store it as we go along.
-  logic decisions[4 * AREA];
+  async_ram #(
+      .SIZE(4 * AREA)
+  ) decisions (
+      .clk(clk),
+
+      .addr(decisions_addr),
+      .wr_en(decisions_wr_en),
+      .wr_data(decisions_wr_data),
+      .rd_data()
+  );
+
   // The number of decisions we've made.
   logic [$clog2(4*AREA+1)-1:0] decisions_len;
+  logic [$clog2(4*AREA+1)-1:0] next_decisions_len;
+
+  // stupid broken-out signals for the ports of `decisions`
+  decision_index_t decisions_addr;
+  logic decisions_wr_en;
+  logic decisions_wr_data;
 
   always_ff @(posedge clk or posedge reset) begin
     if (reset | sync_reset) begin
       decisions_len <= 0;
-    end else if (prefix_bits_left == 0 & in_valid & in_ready) begin
-      decisions[decisions_len] <= in_data;
-      decisions_len <= decisions_len + 1;
+    end else begin
+      decisions_len <= next_decisions_len;
+    end
+  end
+
+  always_comb begin
+    automatic decision_index_t last_run = 'x;
+
+    if (prefix_bits_left == 0 & in_valid & in_ready) begin
+      decisions_addr = decisions_len;
+      decisions_wr_data = in_data;
+      decisions_wr_en = 1;
+      next_decisions_len = decisions_len + 1;
     end else if (advance & vc.instruction_valid & |vc.neighbours_valid) begin
       // This instruction is valid to run and isn't a potential instruction, which
       // means that whether or not we run it is a decision. Add it to the list.
       // Note that the only scenario where we don't run it here is when receiving a
       // finder.
-      decisions[decisions_len] <= run;
-      decisions_len <= decisions_len + 1;
+      decisions_addr = decisions_len;
+      decisions_wr_data = run;
+      decisions_wr_en = 1;
+      next_decisions_len = decisions_len + 1;
     end else if (backtrack) begin
       // To backtrack, we find the last 1 in `decisions`, turn it into a 0, and get
       // rid of all the decisions after it.
       // The last 1 is just the decision associated with the last instruction we ran
       // (which should always be `target_parent` since we only backtrack when at the
       // end of the queue), and so we can retrieve its index from there.
-      decision_index_t last_run = target_parent.decision_index;
-      decisions[last_run] <= 0;
-      decisions_len <= last_run + 1;
+      last_run = target_parent.decision_index;
+      decisions_addr = last_run;
+      decisions_wr_data = 0;
+      decisions_wr_en = 1;
+      next_decisions_len = last_run + 1;
+    end else begin
+      decisions_addr = decision_index;
+      decisions_wr_data = 'x;
+      decisions_wr_en = 0;
+      next_decisions_len = decisions_len;
     end
   end
 
@@ -221,22 +301,27 @@ module core (
     end
   end
 
-  typedef struct packed {
-    // The instruction that was run.
-    instruction_t instruction;
-    // A reference to where in the run stack this instruction originally came from.
-    instruction_ref_t instruction_ref;
-    // Whether this instruction's child in each direction was valid at the time this
-    // instruction was run.
-    logic [3:0] children;
-    // The number of potential instructions there were at the point when it was run.
-    potential_index_t potential_len;
-    // The index of the decision to run this instruction in the list of decisions.
-    decision_index_t decision_index;
-  } run_stack_entry_t;
-
   // The list of instructions that have been run.
-  run_stack_entry_t run_stack[AREA];
+  run_stack_ram run_stack (
+      .clk(clk),
+      .wr_addr(run_stack_len),
+      .wr_en(run),
+      .wr_data(
+      '{
+          instruction: target,
+          // This is nonsense for the first instruction.
+          instruction_ref: '{
+              parent: target_ref.parent,
+              child_index: last_child ? 3 : target_ref.child_index
+          },
+          children: vc.neighbours_valid,
+          potential_len: potential_len,
+          decision_index: decisions_len
+      }
+      ),
+      .rd_addr(next_target_ref.parent),
+      .rd_data(target_parent)
+  );
   logic [$clog2(AREA+1)-1:0] run_stack_len;
 
   // A reference to the instruction we're currently looking at.
@@ -257,35 +342,16 @@ module core (
   instruction_ref_t next_target_ref;
 
   always_ff @(posedge clk or posedge reset) begin
-    automatic
-    run_stack_entry_t
-    target_entry = '{
-        instruction: target,
-        // This is nonsense for the first instruction.
-        instruction_ref: '{
-            parent: target_ref.parent,
-            child_index: last_child ? 3 : target_ref.child_index
-        },
-        children: vc.neighbours_valid,
-        potential_len: potential_len,
-        decision_index: decisions_len
-    };
-
     if (reset | sync_reset) begin
       run_stack_len <= 0;
       // Don't bother resetting `target_ref` and `target_parent`, they're nonsense
       // until `run_stack_len` is at least 1 anyway.
     end else begin
       if (run) begin
-        run_stack[run_stack_len] <= target_entry;
         run_stack_len <= run_stack_len + 1;
       end else if (backtrack) begin
         run_stack_len <= run_stack_len - 1;
       end
-      // TODO: make sure that Vivado infers this to use 7 series BRAMs' built-in
-      // write-before-read functionality.
-      target_parent <= run & next_target_ref.parent == run_stack_len
-        ? target_entry : run_stack[next_target_ref.parent];
       target_ref <= next_target_ref;
     end
   end
@@ -433,12 +499,13 @@ module core (
   // verilator lint_off ASSIGNIN
   // verilator lint_off PINMISSING
 
-  // RAMs used for keeping track of which squares on the surfaces are filled by
-  // potential instructions.
+  // Instantiate RAMs used for keeping track of which squares on the surfaces are
+  // filled by potential instructions.
   //
-  // Most of the time it's maintained as all 0s, and then gets it filled in in
+  // Most of the time they're maintained as all 0s, and then they're filled in in
   // `CHECK` state.
-  surface potential_surfaces[CUBOIDS] (.clk(clk));
+  // First we declare their signals, then actually instantiate them inside a `generate`.
+
   // How many bits are set on each surface in `potential_surfaces`.
   logic [$clog2(AREA+1)-1:0] potential_surface_counts[CUBOIDS];
   logic [$clog2(AREA+1)-1:0] next_potential_surface_counts[CUBOIDS];
@@ -470,22 +537,26 @@ module core (
   generate
     genvar cuboid;
     for (cuboid = 0; cuboid < CUBOIDS; cuboid++) begin : gen_potential_surfaces
-      assign potential_surfaces[cuboid].rw_addr =
-        state == CLEAR ? square_t'(clear_index)
-        : state == CHECK ? target.mapping[cuboid].square
-        : potential_surfaces_clear_index;
-
-      // While in `CHECK` state, we always want to write 1s for new squares filled by
-      // potential instructions.
-      // Otherwise, we're clearing and want to write 0s.
-      assign potential_surfaces[cuboid].rw_wr_data = state == CHECK;
-      // When in `CHECK` state, we only want to write a 1 if this square isn't already
-      // filled by run instructions.
-      // Otherwise we always want to write 0s (as long as the address is valid).
-      assign potential_surfaces[cuboid].rw_wr_en =
-        state == CLEAR ? int'(clear_index) < AREA
-        : state == CHECK ? !vc.instruction_cursors_filled[cuboid]
-        : int'(potential_surfaces_clear_index) < AREA;
+      surface ram (
+          .clk(clk),
+          .rw_addr(
+            state == CLEAR ? square_t'(clear_index)
+            : state == CHECK ? target.mapping[cuboid].square
+            : potential_surfaces_clear_index
+          ),
+          // While in `CHECK` state, we always want to write 1s for new squares filled by
+          // potential instructions.
+          // Otherwise, we're clearing and want to write 0s.
+          .rw_wr_data(state == CHECK),
+          // When in `CHECK` state, we only want to write a 1 if this square isn't already
+          // filled by run instructions.
+          // Otherwise we always want to write 0s (as long as the address is valid).
+          .rw_wr_en(
+            state == CLEAR ? int'(clear_index) < AREA
+            : state == CHECK ? !vc.instruction_cursors_filled[cuboid]
+            : int'(potential_surfaces_clear_index) < AREA
+          )
+      );
 
       always_comb begin
         if (state == CLEAR) begin
@@ -493,17 +564,9 @@ module core (
           // Just keep it as 0, which will eventually become correct once we're done
           // clearing.
           next_potential_surface_counts[cuboid] = 0;
-        end else if (
-          potential_surfaces[cuboid].rw_rd_data == 0
-            & potential_surfaces[cuboid].rw_wr_data == 1
-            & potential_surfaces[cuboid].rw_wr_en
-        ) begin
+        end else if (ram.rw_rd_data == 0 & ram.rw_wr_data == 1 & ram.rw_wr_en) begin
           next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid] + 1;
-        end else if (
-          potential_surfaces[cuboid].rw_rd_data == 1
-            & potential_surfaces[cuboid].rw_wr_data == 0
-            & potential_surfaces[cuboid].rw_wr_en
-        ) begin
+        end else if (ram.rw_rd_data == 1 & ram.rw_wr_data == 0 & ram.rw_wr_en) begin
           next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid] - 1;
         end else begin
           next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid];
@@ -523,7 +586,7 @@ module core (
     in_ready = 0;
     out_last = 'x;
     // This is almost always what it should be set to, except when we override it to 0 during splitting.
-    out_data = prefix_bits_left > 0 ? prefix[$bits(prefix)-1] : decisions[decision_index];
+    out_data = prefix_bits_left > 0 ? prefix[$bits(prefix)-1] : decisions.rd_data;
 
     sync_reset = 0;
     advance = 0;
@@ -679,13 +742,13 @@ module core (
             out_last = 1;
             // We just set `prefix.base_decision` to `next_base`, which should be the index
             // of a 1.
-            assert (decisions[decision_index] == 1);
+            assert (decisions.rd_data == 1);
           end
         end else begin
           // We've already finished sending, but we need to go through the rest of the
           // decisions to find out what the new `next_base` is (if any).
           inc_decision_index = 1;
-          if (decisions[decision_index] == 1) begin
+          if (decisions.rd_data == 1) begin
             // Great, we found it. Stop here.
             update_next_base = 1;
             inc_decision_index = 0;
