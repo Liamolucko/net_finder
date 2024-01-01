@@ -10,6 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+pretty_assertions = "1.4.0"
 
 [dependencies.net_finder]
 path = ".."
@@ -21,5 +22,11 @@ members = ["."]
 [[bin]]
 name = "skip_set"
 path = "fuzz_targets/skip_set.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "finder_info"
+path = "fuzz_targets/finder_info.rs"
 test = false
 doc = false

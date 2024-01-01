@@ -14,13 +14,21 @@ use arbitrary::Arbitrary;
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Arbitrary,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Cuboid {
     pub width: u8,
     pub depth: u8,
     pub height: u8,
+}
+
+impl<'a> Arbitrary<'a> for Cuboid {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Cuboid {
+            width: u.int_in_range(1..=u8::MAX)?,
+            depth: u.int_in_range(1..=u8::MAX)?,
+            height: u.int_in_range(1..=u8::MAX)?,
+        })
+    }
 }
 
 impl FromStr for Cuboid {
@@ -1402,8 +1410,8 @@ impl SquareCache {
             Class(transform_bits << 6 | u8::try_from(index).unwrap())
         };
 
-        let num_cursors = u8::try_from(4 * squares.len()).unwrap();
-        let undo_lookup = (0..num_cursors)
+        let max_cursor = u8::try_from(4 * squares.len() - 1).unwrap();
+        let undo_lookup = (0..=max_cursor)
             .map(Cursor)
             .map(|cursor| {
                 let class = find_class(cursor);

@@ -184,6 +184,15 @@ module core (
     )) begin
       prefix_bits_left <= prefix_bits_left - 1;
       prefix <= {prefix[$bits(prefix)-2:0], sending ? prefix[$bits(prefix)-1] : in_data};
+    end else if (backtrack & target_parent.decision_index == prefix.base_decision) begin
+      // The base decision is being backtracked, and so it doesn't really make sense
+      // to call it the base decision anymore. What being the base decision means is
+      // that it's the earliest decision that we need to backtrack; but we've just
+      // backtracked it, so its role has been fulfilled.
+      //
+      // Increment `base_decision`, which should result in it being 1 past the end of
+      // `decisions`.
+      prefix.base_decision <= prefix.base_decision + 1;
     end else if (prefix_bits_left == 0 & update_base) begin
       prefix.base_decision <= decision_index + 1;
     end

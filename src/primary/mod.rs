@@ -2,7 +2,7 @@
 
 use std::array;
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::{self, Display, Formatter, Write};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -12,11 +12,12 @@ use std::num::NonZeroU8;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 #[cfg(feature = "no-trie")]
-use std::simd::{Mask, Simd, SimdPartialEq, SimdUint};
+use std::simd::prelude::*;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context};
+use arbitrary::Arbitrary;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +35,7 @@ use Direction::*;
 
 /// The additional information that we need to have on hand to actually run a
 /// `Finder`.
-struct FinderCtx<const CUBOIDS: usize> {
+pub struct FinderCtx<const CUBOIDS: usize> {
     /// The cuboids that we're finding common nets for, from the outside world's
     /// perspective.
     outer_cuboids: [Cuboid; CUBOIDS],
@@ -76,7 +77,7 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
     ///
     /// You can also specify how long you've already been searching for, which
     /// will be counted in the timestamps for solutions.
-    fn new(cuboids: [Cuboid; CUBOIDS], prior_search_time: Duration) -> anyhow::Result<Self> {
+    pub fn new(cuboids: [Cuboid; CUBOIDS], prior_search_time: Duration) -> anyhow::Result<Self> {
         if cuboids.is_empty() {
             bail!("must specify at least one cuboid");
         }
@@ -162,22 +163,7 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
         self.equivalence_classes
             .iter()
             .map(|class| {
-                let start_pos = Pos {
-                    x: self.inner_cuboids[0].surface_area().try_into().unwrap(),
-                    y: self.inner_cuboids[0].surface_area().try_into().unwrap(),
-                };
                 let start_class_mapping = class[0];
-                let start_mapping = start_class_mapping.sample(&self.square_caches);
-
-                // The first instruction is to add the first square.
-                let queue = vec![Instruction {
-                    net_pos: start_pos,
-                    mapping: start_mapping,
-                    followup_index: None,
-                }];
-
-                let mut net = [0; 64];
-                net[usize::from(start_pos.x % 64)] |= 1 << (start_pos.y % 64);
 
                 // We want to skip all the equivalence classes prior to this one.
                 let skip = prev_classes.clone();
@@ -186,25 +172,13 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
                     prev_classes.insert(&self.square_caches, mapping.sample(&self.square_caches));
                 }
 
-                Finder {
-                    skip,
-                    start_mapping_index: start_class_mapping.index(),
-
-                    queue,
-                    potential: Vec::new(),
-
-                    net,
-                    surfaces: array::from_fn(|_| Surface::new()),
-
-                    index: 0,
-                    base_index: 0,
-                }
+                Finder::new_blank(self, start_class_mapping, skip)
             })
             .collect()
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Finder<const CUBOIDS: usize> {
     /// Mappings that we should skip over because they're the responsibility of
     /// another `Finder`.
@@ -262,6 +236,78 @@ pub struct Finder<const CUBOIDS: usize> {
     base_index: usize,
 }
 
+/// An almost-losslessly-compressed version of `Finder`, which can be much more
+/// easily tested to be valid and as such is capable of implementing
+/// `Arbitrary`.
+///
+/// It's not like it's perfect: the `Arbitrary` implementation can stil spit out
+/// `FinderInfo`s with invalid `start_mapping`s and `decisions` which continue
+/// after there are no instructions left, but checking those two cases is a lot
+/// easier than checking that `Finder`'s million pieces of redundant data all
+/// line up.
+///
+/// Ok, what about the 'almost'? This doesn't encode anything that's been done
+/// since the last decision made by the `Finder`, so the index will be back to
+/// the index of the instruction that decision was about and `potential` will be
+/// back to that state as well. But you can just run a few instructions to get
+/// back there.
+///
+/// This is also the rough format in which `Finder`s are sent to the FPGA. It
+/// has the same limitation of not including anything past the last decision
+/// when sending its state.
+///
+/// That's actually quite important: it means that before running `finalize` on
+/// the CPU, the `Finder`'s remaining instructions need to be run to get the
+/// last few potential instructions ready to go.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FinderInfo<const CUBOIDS: usize> {
+    /// The class mapping of the first instruction the finder runs (it can pick
+    /// any mapping with those classes, and it will have no effect). The net
+    /// position of the instruction has no effect on the `Finder`'s results
+    /// so we don't include it.
+    pub start_mapping: ClassMapping<CUBOIDS>,
+    /// The list of 'decisions' the finder made to get to its current state.
+    ///
+    /// A decision is whether or not an instruction was run; but we don't
+    /// include every instruction, only the ones that were valid to be run (and
+    /// potential instructions aren't considered valid for this purpose). So a
+    /// decision only ever gets to be 0 if that instruction was backtracked.
+    ///
+    /// This means we never end up with an invalid decision claiming we have to
+    /// run an invalid instruction.
+    pub decisions: Vec<bool>,
+    /// The index of the first decision in `decisions` that it's this finder's
+    /// job to try both options of.
+    pub base_decision: usize,
+}
+
+impl<'a, const CUBOIDS: usize> Arbitrary<'a> for FinderInfo<CUBOIDS> {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        let res = FinderInfo {
+            start_mapping: u.arbitrary()?,
+            decisions: u.arbitrary()?,
+            base_decision: u.arbitrary()?,
+        };
+
+        // `base_decision` doesn't actually need to be within `decisions`: it's fine if
+        // it's one past the end, since that means that the fixed part is fully
+        // specified and it just so happens that nothing's been run past there yet. But
+        // if it's any further than that, the fixed part isn't fully specified and it's
+        // invalid.
+        if res.base_decision > res.decisions.len() {
+            return Err(arbitrary::Error::IncorrectFormat);
+        }
+
+        // The base decision should always be a 1; if it's a 0, it may as well be moved
+        // to the next decision since it can't be backtracked again anyway.
+        if res.decisions.get(res.base_decision) == Some(&false) {
+            return Err(arbitrary::Error::IncorrectFormat);
+        }
+
+        Ok(res)
+    }
+}
+
 /// An instruction to add a square.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 // Aligning this to 8 bytes lets the compiler pack it into a 32-bit integer.
@@ -317,6 +363,198 @@ impl<const CUBOIDS: usize> Hash for Instruction<CUBOIDS> {
 }
 
 impl<const CUBOIDS: usize> Finder<CUBOIDS> {
+    /// Creates a new `Finder` from a `FinderInfo`.
+    ///
+    /// Returns an `Err` if the `FinderInfo` is invalid.
+    pub fn new(ctx: &FinderCtx<CUBOIDS>, info: &FinderInfo<CUBOIDS>) -> anyhow::Result<Self> {
+        let class_index = ctx
+            .equivalence_classes
+            .iter()
+            .position(|class| class.contains(&info.start_mapping))
+            // This will also catch situations where the classes of `info.start_mapping` are out of
+            // range.
+            .context("invalid start_mapping")?;
+
+        let mut skip = SkipSet::new(ctx.inner_cuboids);
+        for class in &ctx.equivalence_classes[..class_index] {
+            for mapping in class {
+                skip.insert(&ctx.square_caches, mapping.sample(&ctx.square_caches));
+            }
+        }
+
+        let mut this = Finder::new_blank(ctx, info.start_mapping, skip);
+
+        let mut decision_index = 0;
+        let mut base_index = None;
+        while decision_index < info.decisions.len() {
+            if this.index >= this.queue.len() {
+                bail!("Ran out of instructions to run when there were still decisions left");
+            }
+            let index = this.index;
+            let prev_area = this.area();
+            this.handle_instruction(ctx);
+            if this.area() > prev_area {
+                // It just ran the instruction, so clearly the instruction was valid to run and
+                // this is a decision: if the decision was meant to be not running it, just
+                // backtrack.
+                if !info.decisions[decision_index] {
+                    // Reset this to make sure we can backtrack.
+                    this.base_index = 0;
+                    assert!(this.backtrack());
+                }
+                if decision_index == info.base_decision {
+                    // We've just found what index in the queue `base_decision` corresponds to; set
+                    // `base_index` to that.
+                    base_index = Some(index);
+                }
+                decision_index += 1;
+            }
+        }
+
+        // If `base_index` is `None`, that means `base_decision` is past the end of
+        // `decisions`, which means that all the decisions are fixed but everything from
+        // there on can change.
+        //
+        // And we've just gone through all the decisions, so `this.index` is the index
+        // of the first instruction not covered by a decision.
+        this.base_index = base_index.unwrap_or(this.index);
+
+        Ok(this)
+    }
+
+    /// Creates a new, blank `Finder` from a `SkipSet` and starting mapping.
+    ///
+    /// The `SkipSet` is an optimisation, it takes a while to construct them and
+    /// it's significantly faster to build up one `SkipSet` that we repeatedly
+    /// copy as we go along instead of making a whole new one for every
+    /// `Finder`.
+    fn new_blank(
+        ctx: &FinderCtx<CUBOIDS>,
+        start_class_mapping: ClassMapping<CUBOIDS>,
+        skip: SkipSet<CUBOIDS>,
+    ) -> Self {
+        let start_pos = Pos {
+            x: ctx.inner_cuboids[0].surface_area().try_into().unwrap(),
+            y: ctx.inner_cuboids[0].surface_area().try_into().unwrap(),
+        };
+        let start_mapping = start_class_mapping.sample(&ctx.square_caches);
+
+        // The first instruction is to add the first square.
+        let queue = vec![Instruction {
+            net_pos: start_pos,
+            mapping: start_mapping,
+            followup_index: None,
+        }];
+
+        let mut net = [0; 64];
+        net[usize::from(start_pos.x % 64)] |= 1 << (start_pos.y % 64);
+
+        Finder {
+            skip,
+            start_mapping_index: start_class_mapping.index(),
+
+            queue,
+            potential: Vec::new(),
+
+            net,
+            surfaces: array::from_fn(|_| Surface::new()),
+
+            index: 0,
+            base_index: 0,
+        }
+    }
+
+    /// Returns the `FinderInfo` of this `Finder`.
+    ///
+    /// This method takes ownership of `self` because it needs to mutate
+    /// `self`'s state and recreate the state at the time an instruction was
+    /// processed to figure out whether not running it was a decision.
+    pub fn into_info(mut self, ctx: &FinderCtx<CUBOIDS>) -> FinderInfo<CUBOIDS> {
+        let start_mapping = self.queue[0].mapping.to_classes(&ctx.square_caches);
+
+        let base_index = self.base_index;
+
+        let mut decisions = VecDeque::new();
+        let mut base_decision = None;
+
+        // Go through all the instructions we've processed and, if they're decisions,
+        // add them to the list.
+        for index in (0..self.index).rev() {
+            let instruction = &self.queue[index];
+            let mut decision_added = false;
+            if instruction.followup_index.is_some() {
+                // This instruction's been run, so clearly it was a decision.
+                decisions.push_front(true);
+                // Reset the base index so that we can backtrack whatever we want.
+                self.base_index = 0;
+                assert!(self.backtrack());
+                if index == base_index {
+                    // We found the base decision. For the moment, its index is 0, and we'll add to
+                    // it as we add more decisions.
+                    base_decision = Some(0)
+                }
+            } else {
+                // `base_index` should always be the index of an instruction that was run.
+                debug_assert_ne!(index, base_index);
+                // Figure out if not running this instruction was a decision by trying to run
+                // it.
+                self.index = index;
+                let old_area = self.area();
+                self.handle_instruction(ctx);
+                if self.area() > old_area {
+                    // It got run, so that means it's valid and not running it was a decision.
+                    self.base_index = 0;
+                    assert!(self.backtrack());
+                    decisions.push_front(false);
+                    decision_added = true;
+                } else {
+                    // Otherwise it's not a decision, so we do nothing.
+                }
+            }
+
+            if let Some(index) = &mut base_decision {
+                // Don't increment `base_decision` if we only just set it to 0.
+                if *index != base_index && decision_added {
+                    *index += 1;
+                }
+            }
+        }
+
+        FinderInfo {
+            start_mapping,
+            // The only scenario where `base_decision` can be `None` here is if `base_index` is past
+            // the end of the queue, meaning that the finder is responsible for doing... absolutely
+            // nothing. There are no instructions for it to try and run.
+            //
+            // While pointless, that's still a valid situation and maps to `base_decision` being 1
+            // past the end of the list of decisions, meaning that all the current decision are
+            // fixed and the only thing the finder can do is add more. In this case, it turns out it
+            // actually can't add more but there's no way nor need to encode that.
+            base_decision: base_decision.unwrap_or(decisions.len()),
+            decisions: decisions.into(),
+        }
+    }
+
+    /// Advances this `Finder` forwards by a step. In other words, calls either
+    /// `handle_instruction` or `backtrack`, whichever is appropriate.
+    ///
+    /// Returns whether stepping was successful; if this returns `false`, the
+    /// finder is done.
+    pub fn step(&mut self, ctx: &FinderCtx<CUBOIDS>) -> bool {
+        if self.index < self.queue.len() {
+            self.handle_instruction(ctx);
+            true
+        } else {
+            self.backtrack()
+        }
+    }
+
+    /// Returns the number of instructions in the queue that are currently run;
+    /// in other words, the number of squares filled on the surfaces so far.
+    pub fn area(&self) -> u8 {
+        self.surfaces[0].num_filled().try_into().unwrap()
+    }
+
     /// Undoes the last instruction that was successfully carried out.
     ///
     /// Returns whether backtracking was successful. If `false` is returned,
@@ -355,6 +593,12 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
 
         // We continue executing from just after the instruction we undid.
         self.index = last_success_index + 1;
+        if last_success_index == self.base_index {
+            // For the same reasons as in `handle_instruction`, we want to increment
+            // `base_index` if it now points to a 0.
+            self.base_index += 1;
+        }
+
         true
     }
 
@@ -362,6 +606,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     /// the index afterwards.
     fn handle_instruction(&mut self, ctx: &FinderCtx<CUBOIDS>) {
         let instruction = self.queue[self.index];
+        let mut run = false;
         // We don't need to check if it's in `self.skip` because we wouldn't have added
         // it to the queue in the first place if that was the case.
         if !zip(&self.surfaces, instruction.mapping.cursors())
@@ -418,11 +663,26 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                 for (surface, cursor) in zip(&mut self.surfaces, instruction.mapping.cursors()) {
                     surface.set_filled(cursor.square(), true);
                 }
+                run = true;
             } else {
                 // Add this to the list of potential instructions.
                 self.potential.push(self.index);
             }
         }
+
+        if !run && self.index == self.base_index {
+            // If we didn't run the instruction at `base_index`, increment it.
+            //
+            // It makes no difference to the behaviour since all the base index means is
+            // that you're allowed to backtrack instructions from here on, and this
+            // instruction now can't be backtracked anyway. So really, you can now only
+            // backtrack instructions from `base_index + 1` on.
+            //
+            // Doing this means that there's only one canonical `base_index` for a finder,
+            // which is important for fuzzing purposes.
+            self.base_index += 1;
+        }
+
         self.index += 1;
     }
 
@@ -454,7 +714,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     /// It also takes a `search_time` to be inserted into any `Solution`s it
     /// yields.
     fn finalize<'a>(&self, ctx: &'a FinderCtx<CUBOIDS>) -> Finalize<'a, CUBOIDS> {
-        if self.surfaces[0].num_filled() as usize + self.potential.len() < ctx.target_area {
+        if self.area() as usize + self.potential.len() < ctx.target_area {
             // If there aren't at least as many potential instructions as the number of
             // squares left to fill, there's no way that this could produce a valid net.
             return Finalize::Known(None);
