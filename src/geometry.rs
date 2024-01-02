@@ -58,7 +58,7 @@ impl Display for Cuboid {
 }
 
 impl Cuboid {
-    pub fn new(width: u8, depth: u8, height: u8) -> Self {
+    pub const fn new(width: u8, depth: u8, height: u8) -> Self {
         Self {
             width,
             depth,
@@ -75,10 +75,10 @@ impl Cuboid {
         }
     }
 
-    pub fn surface_area(&self) -> usize {
-        let width: usize = self.width.into();
-        let height: usize = self.height.into();
-        let depth: usize = self.depth.into();
+    pub const fn surface_area(&self) -> usize {
+        let width: usize = self.width as usize;
+        let height: usize = self.height as usize;
+        let depth: usize = self.depth as usize;
         2 * width * depth + 2 * depth * height + 2 * width * height
     }
 

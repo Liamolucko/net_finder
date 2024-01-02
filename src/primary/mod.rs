@@ -19,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{bail, Context};
 use arbitrary::Arbitrary;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "no-trie")]
@@ -61,7 +62,7 @@ pub struct FinderCtx<const CUBOIDS: usize> {
     #[cfg(feature = "no-trie")]
     maybe_skipped_lookup: [u64; 4],
     /// The equivalence classes of mappings that we build `Finder`s out of.
-    equivalence_classes: Vec<Vec<ClassMapping<CUBOIDS>>>,
+    equivalence_classes: Vec<FxHashSet<ClassMapping<CUBOIDS>>>,
 
     // These are used to timestamp the solutions we get.
     /// How long we've been searching for prior to the start of this run of
@@ -92,36 +93,29 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
             );
         }
 
+        for i in 0..CUBOIDS {
+            if cuboids[i + 1..].contains(&cuboids[i]) {
+                bail!("{} cuboid specified twice", cuboids[i])
+            }
+        }
+
         if cuboids[0].surface_area() > 64 {
             bail!("only cuboids with surface area <= 64 are currently supported");
         }
 
         let mut square_caches = cuboids.map(SquareCache::new);
 
-        let (fixed_cuboid, fixed_class, equivalence_classes) = equivalence_classes(&square_caches);
+        let (fixed_cuboid, fixed_class, mut equivalence_classes) =
+            equivalence_classes(&square_caches);
         // Move the fixed cuboid to the front of the list.
         let mut inner_cuboids = cuboids;
         inner_cuboids.swap(0, fixed_cuboid);
-        // Update the square caches and equivalence classes to also be in the order of
-        // the inner cuboids.
+        // Update the square caches to also be in the order of the inner cuboids.
         square_caches.swap(0, fixed_cuboid);
-        // We can't mutate `HashSet`s in place so we have to create a whole new list for
-        // the reordered equivalence classes.
-        let mut equivalence_classes: Vec<Vec<ClassMapping<CUBOIDS>>> = equivalence_classes
-            .into_iter()
-            .map(|class| {
-                let mut class: Vec<_> = class
-                    .into_iter()
-                    .map(|mut mapping| {
-                        mapping.classes.swap(0, fixed_cuboid);
-                        mapping
-                    })
-                    .collect();
-                // Sort the class by index.
-                class.sort_by_key(|mapping| mapping.index());
-                class
-            })
-            .collect();
+        // We leave the equivalence classes as is, since they get passed to
+        // `Finder::new_blank` which expects things to be in the order of
+        // `outer_cuboids` since it's exposed to the outside world (indirectly through
+        // `Finder::new`).
 
         if cfg!(not(feature = "no-trie")) {
             // Sort the equivalence classes in descending order of size, so that more
@@ -163,18 +157,62 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
         self.equivalence_classes
             .iter()
             .map(|class| {
-                let start_class_mapping = class[0];
+                // We start from the mapping with the smallest index, since `skip` relies on it.
+                //
+                // Note that the one with the smallest index always uses the correct fixed class
+                // since we always pick the root of the family to be the fixed class.
+                let start_class_mapping = *class
+                    .iter()
+                    .min_by_key(|&&mapping| self.to_inner(mapping).index())
+                    .unwrap();
 
                 // We want to skip all the equivalence classes prior to this one.
                 let skip = prev_classes.clone();
                 // Then add this equivalence class to the set of previous ones.
-                for mapping in class {
-                    prev_classes.insert(&self.square_caches, mapping.sample(&self.square_caches));
+                for &mapping in class {
+                    prev_classes.insert(
+                        &self.square_caches,
+                        self.to_inner(mapping).sample(&self.square_caches),
+                    );
                 }
 
                 Finder::new_blank(self, start_class_mapping, skip)
             })
             .collect()
+    }
+
+    /// Converts a `ClassMapping` whose classes are in the order of
+    /// `self.outer_cuboids` to one whose classes are in the order of
+    /// `self.inner_cuboids`.
+    fn to_inner(&self, mapping: ClassMapping<CUBOIDS>) -> ClassMapping<CUBOIDS> {
+        ClassMapping {
+            classes: array::from_fn(|inner_index| {
+                let cuboid = self.inner_cuboids[inner_index];
+                let outer_index = self
+                    .outer_cuboids
+                    .into_iter()
+                    .position(|other_cuboid| other_cuboid == cuboid)
+                    .unwrap();
+                mapping.classes[outer_index]
+            }),
+        }
+    }
+
+    /// Converts a `ClassMapping` whose classes are in the order of
+    /// `self.inner_cuboids` to one whose classes are in the order of
+    /// `self.outer_cuboids`.
+    fn to_outer(&self, mapping: ClassMapping<CUBOIDS>) -> ClassMapping<CUBOIDS> {
+        ClassMapping {
+            classes: array::from_fn(|outer_index| {
+                let cuboid = self.outer_cuboids[outer_index];
+                let inner_index = self
+                    .inner_cuboids
+                    .into_iter()
+                    .position(|other_cuboid| other_cuboid == cuboid)
+                    .unwrap();
+                mapping.classes[inner_index]
+            }),
+        }
     }
 }
 
@@ -377,8 +415,11 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
 
         let mut skip = SkipSet::new(ctx.inner_cuboids);
         for class in &ctx.equivalence_classes[..class_index] {
-            for mapping in class {
-                skip.insert(&ctx.square_caches, mapping.sample(&ctx.square_caches));
+            for &mapping in class {
+                skip.insert(
+                    &ctx.square_caches,
+                    ctx.to_inner(mapping).sample(&ctx.square_caches),
+                );
             }
         }
 
@@ -437,7 +478,10 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             x: ctx.inner_cuboids[0].surface_area().try_into().unwrap(),
             y: ctx.inner_cuboids[0].surface_area().try_into().unwrap(),
         };
-        let start_mapping = start_class_mapping.sample(&ctx.square_caches);
+
+        // `FinderInfo` uses the outer order of cuboids, so we need to translate.
+        let inner_start_class_mapping = ctx.to_inner(start_class_mapping);
+        let start_mapping = inner_start_class_mapping.sample(&ctx.square_caches);
 
         // The first instruction is to add the first square.
         let queue = vec![Instruction {
@@ -451,7 +495,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
 
         Finder {
             skip,
-            start_mapping_index: start_class_mapping.index(),
+            start_mapping_index: inner_start_class_mapping.index(),
 
             queue,
             potential: Vec::new(),
@@ -470,7 +514,10 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     /// `self`'s state and recreate the state at the time an instruction was
     /// processed to figure out whether not running it was a decision.
     pub fn into_info(mut self, ctx: &FinderCtx<CUBOIDS>) -> FinderInfo<CUBOIDS> {
-        let start_mapping = self.queue[0].mapping.to_classes(&ctx.square_caches);
+        let inner_start_mapping = self.queue[0].mapping.to_classes(&ctx.square_caches);
+        // Reorder `inner_start_mapping` to be in the order of `ctx.outer_cuboids`, not
+        // `ctx.inner_cuboids`.
+        let start_mapping = ctx.to_outer(inner_start_mapping);
 
         let base_index = self.base_index;
 
@@ -481,7 +528,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         // add them to the list.
         for index in (0..self.index).rev() {
             let instruction = &self.queue[index];
-            let mut decision_added = false;
+            // Whether to increment `base_decision`, if it's `Some`.
+            let mut inc_base_decision = false;
             if instruction.followup_index.is_some() {
                 // This instruction's been run, so clearly it was a decision.
                 decisions.push_front(true);
@@ -492,6 +540,10 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                     // We found the base decision. For the moment, its index is 0, and we'll add to
                     // it as we add more decisions.
                     base_decision = Some(0)
+                } else {
+                    // Only increment `base_decision` if it was already `Some`, not if we just set
+                    // it - it's still index 0 at that point.
+                    inc_base_decision = true;
                 }
             } else {
                 // `base_index` should always be the index of an instruction that was run.
@@ -506,16 +558,15 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                     self.base_index = 0;
                     assert!(self.backtrack());
                     decisions.push_front(false);
-                    decision_added = true;
+                    inc_base_decision = true;
                 } else {
                     // Otherwise it's not a decision, so we do nothing.
                 }
             }
 
-            if let Some(index) = &mut base_decision {
-                // Don't increment `base_decision` if we only just set it to 0.
-                if *index != base_index && decision_added {
-                    *index += 1;
+            if let Some(base_decision) = &mut base_decision {
+                if inc_base_decision {
+                    *base_decision += 1;
                 }
             }
         }
@@ -527,7 +578,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             // nothing. There are no instructions for it to try and run.
             //
             // While pointless, that's still a valid situation and maps to `base_decision` being 1
-            // past the end of the list of decisions, meaning that all the current decision are
+            // past the end of the list of decisions, meaning that all the current decisions are
             // fixed and the only thing the finder can do is add more. In this case, it turns out it
             // actually can't add more but there's no way nor need to encode that.
             base_decision: base_decision.unwrap_or(decisions.len()),
