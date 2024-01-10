@@ -12,3 +12,7 @@
 /fpga/net-finder.srcs/sources_1/new/generated.sv
 /fpga/net-finder.srcs/sources_1/new/obj_dir/
 /fpga/net-finder.srcs/utils_1/
+
+**/*.json
+**/*.fst
+**/*.gtkw

@@ -46,7 +46,7 @@ fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> any
         .map(|(_, cache)| cache.classes().len().next_power_of_two().ilog2() as usize)
         .sum();
 
-    let mapping_index_function = gen_mapping_index(&square_caches, fixed_cuboid, fixed_class);
+    let mapping_index_module = gen_mapping_index(&square_caches, fixed_cuboid, fixed_class);
     let neighbour_offset_function = gen_neighbour_offset(&square_caches);
 
     let mut file = File::create(output)?;
@@ -64,7 +64,7 @@ typedef struct packed {{
 typedef cursor_t [CUBOIDS-1:0] mapping_t;
 typedef logic[{mapping_index_bits}-1:0] mapping_index_t;
 
-{mapping_index_function}
+{mapping_index_module}
 
 {neighbour_offset_function}
 "
@@ -113,7 +113,10 @@ fn gen_mapping_index<const CUBOIDS: usize>(
         .filter(|&(cuboid, _)| cuboid != fixed_cuboid)
         .map(|(cuboid, (cache, bits))| {
             format!(
-                "function automatic logic [{top_bit}:0] cuboid{cuboid}_undo(logic [{top_bit}:0] klass, logic [2:0] transform);\
+                "function automatic logic [{top_bit}:0] cuboid{cuboid}_undo(\
+               \n  logic [{top_bit}:0] klass,\
+               \n  logic [2:0] transform\
+               \n);\
                \n  logic [2:0] new_transform;\
                \n  case ({{klass, transform}})\
                \n    {}\
@@ -136,7 +139,12 @@ fn gen_mapping_index<const CUBOIDS: usize>(
                                 format!(
                                     "{}: new_transform = {};",
                                     (class.index() as usize) << 3 | transform,
-                                    new_transform,
+                                    // Include the full lower 3 bits of the transformed class,
+                                    // rather than padding out the transform with 0s. This means we
+                                    // can blindly replace the lower 3 bits of the class with this
+                                    // without having to find out how many bits of it are actually
+                                    // the new transform and how many are just the class.
+                                    class.with_transform(new_transform).index() & 0b111,
                                 )
                             })
                     })
@@ -146,11 +154,14 @@ fn gen_mapping_index<const CUBOIDS: usize>(
         })
         .join("\n");
 
-    let class_assignments = class_bits
+    let class_signals = class_bits
         .iter()
         .enumerate()
-        .map(|(cuboid, bits)| {
-            format!("logic [{bits}-1:0] cursor{cuboid}_class = cuboid{cuboid}_class(mapping[{cuboid}]);")
+        .map(|(cuboid, bits)| format!("logic [{bits}-1:0] cursor{cuboid}_class;"))
+        .join("\n  ");
+    let class_assignments = (0..CUBOIDS)
+        .map(|cuboid| {
+            format!("assign cursor{cuboid}_class = cuboid{cuboid}_class(mapping[{cuboid}]);")
         })
         .join("\n  ");
 
@@ -202,17 +213,17 @@ fn gen_mapping_index<const CUBOIDS: usize>(
         .map(|(i, map)| {
             format!(
                 "case (cursor{fixed_cuboid}_class)\
-             \n    {}\
-             \n    default: to_undo[{i}] = 'x;\
-             \n  endcase",
+           \n      {}\
+           \n      default: to_undo[{i}] = 'x;\
+           \n    endcase",
                 map.iter()
                     .map(|(class, transform)| {
                         format!("{}: to_undo[{i}] = {transform};", class.index())
                     })
-                    .format("\n    ")
+                    .format("\n      ")
             )
         })
-        .join("\n  ");
+        .join("\n    ");
 
     let uses_fixed_class_expr = to_undo[0]
         .keys()
@@ -229,28 +240,33 @@ fn gen_mapping_index<const CUBOIDS: usize>(
        \n\
        \n{undo_funcs}\
        \n\
-       \nfunction automatic logic mapping_index_lookup(\
+       \nmodule mapping_index_lookup(\
        \n    input mapping_t mapping,\
-       \n    output mapping_index_t index\
+       \n    output mapping_index_t index,\
+       \n    output logic uses_fixed_class\
        \n);\
+       \n  {class_signals}\
        \n  {class_assignments}\
        \n\
        \n  logic [2:0] to_undo[{num_options}];\
-       \n  mapping_index_t options[{num_options}];\
-       \n\
-       \n  {to_undo_assignments}\
-       \n\
-       \n  // Make this as big as possible to start with so everything's less than it (or\
-       \n  // equal, in which case it happens to be correct anyway and so that's fine).\
-       \n  index = ~0;\
-       \n  for (int i = 0; i < {num_options}; i++) begin\
-       \n    options[i] = {{{undo_exprs}}};\
-       \n    // Pick the smallest version of the index.\
-       \n    if (options[i] < index) index = options[i];\
+       \n  always_comb begin\
+       \n    {to_undo_assignments}\
        \n  end\
        \n\
-       \n  return {uses_fixed_class_expr};\
-       \nendfunction"
+       \n  mapping_index_t options[{num_options}];\
+       \n  always_comb begin\
+       \n    // Make this as big as possible to start with so everything's less than it (or\
+       \n    // equal, in which case it happens to be correct anyway and so that's fine).\
+       \n    index = ~0;\
+       \n    for (int i = 0; i < {num_options}; i++) begin\
+       \n      options[i] = {{{undo_exprs}}};\
+       \n      // Pick the smallest version of the index.\
+       \n      if (options[i] < index) index = options[i];\
+       \n    end\
+       \n  end\
+       \n\
+       \n  assign uses_fixed_class = {uses_fixed_class_expr};\
+       \nendmodule"
     )
 }
 
@@ -267,6 +283,19 @@ fn gen_neighbour_offset<const CUBOIDS: usize>(square_caches: &[SquareCache; CUBO
                 let cursor = Cursor::new(square, 0);
                 let neighbour = cursor.moved_in(cache, direction);
                 let offset = neighbour.0 as i32 - cursor.0 as i32;
+                // double-check that this offset works for all orientations
+                for orientation in 1..=3 {
+                    let cursor = Cursor::new(square, orientation);
+                    let neighbour = cursor.moved_in(cache, direction.turned(-orientation));
+                    if neighbour.orientation() < orientation {
+                        // Naively adding the offset here would lead cause the cursor to overflow
+                        // into the next square, instead of just having the orientation overflow
+                        // like it should; so the real offset is 4 less.
+                        assert_eq!(neighbour.0 as i32 - cursor.0 as i32, offset - 4);
+                    } else {
+                        assert_eq!(neighbour.0 as i32 - cursor.0 as i32, offset);
+                    }
+                }
                 offsets
                     .entry(offset)
                     .or_insert_with(Vec::new)

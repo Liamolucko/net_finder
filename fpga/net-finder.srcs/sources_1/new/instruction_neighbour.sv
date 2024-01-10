@@ -18,7 +18,10 @@ function automatic instruction_t instruction_neighbour(instruction_t instruction
         instruction.mapping[cuboid].square,
         instruction.mapping[cuboid].orientation + direction
     );
-    result.mapping[cuboid] = cursor_t'(int'(instruction.mapping[cuboid]) + offset);
+    result.mapping[cuboid] = '{
+        square: square_t'(int'(instruction.mapping[cuboid].square) + int'(offset[31:2])),
+        orientation: instruction.mapping[cuboid].orientation + offset[1:0]
+    };
   end
 
   return result;

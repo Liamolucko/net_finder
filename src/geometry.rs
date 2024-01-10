@@ -1611,7 +1611,7 @@ impl Cursor {
     }
 
     /// Returns a lookup table of what this class's transform turns into when
-    /// you undo any transforamtion.
+    /// you undo any transformation.
     #[inline]
     pub fn undo_lookup(self, cache: &SquareCache) -> [u8; 8] {
         cache.undo_lookup[usize::from(self.0)].1
@@ -1620,7 +1620,7 @@ impl Cursor {
 
 /// An equivalence class that a `Cursor` falls into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Arbitrary)]
-pub struct Class(u8);
+pub struct Class(pub u8);
 
 // hmm what happens if a class doesn't care about flipping now that that affects
 // the upper bit of the rotation too? well yeah, it needs to have that bit
@@ -1876,6 +1876,18 @@ impl Display for MappingData {
 pub struct Mapping<const CUBOIDS: usize> {
     #[serde(with = "crate::utils::arrays")]
     pub cursors: [Cursor; CUBOIDS],
+}
+
+impl<const CUBOIDS: usize> Display for Mapping<CUBOIDS> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for (i, cursor) in self.cursors.into_iter().enumerate() {
+            if i != 0 {
+                write!(f, " -> ")?;
+            }
+            write!(f, "{}o{}", cursor.square().0, cursor.orientation())?;
+        }
+        Ok(())
+    }
 }
 
 impl<const CUBOIDS: usize> Mapping<CUBOIDS> {

@@ -2,7 +2,10 @@
 
 typedef logic [$clog2(4 * AREA)-1:0] potential_index_t;
 typedef logic [$clog2(4 * AREA)-1:0] decision_index_t;
-typedef logic [$clog2(AREA)-1:0] run_stack_index_t;
+// Make `AREA` a valid `run_stack_index_t` so that we can use
+// `next_target_ref.parent >= next_run_stack_len` to check if we're about to go
+// past the end of the queue without worrying about overflow.
+typedef logic [$clog2(AREA+1)-1:0] run_stack_index_t;
 
 typedef struct packed {
   // The index of the instruction's parent in the run stack.
@@ -95,10 +98,21 @@ module core (
     input  logic out_ready,
     output logic out_last,
 
+    // Whether the finder being emitted is a solution.
+    output logic out_solution,
+    // Whether the finder being emitted is a response to `req_split`.
+    output logic out_split,
+    // Whether the finder being emitted is a response to `req_pause`.
+    output logic out_pause,
+
     // These can be set to 1 to request that this core pause or split.
     // Pausing takes priority.
     input logic req_pause,
-    input logic req_split
+    input logic req_split,
+
+    // Whether the next clock cycle will be put to use for either running or
+    // backtracking. For testing purposes.
+    output logic stepping
 );
   typedef enum {
     // The core is currently clearing out all its internal memory after a reset.
@@ -108,6 +122,22 @@ module core (
     RECEIVE,
     // The core is actively attempting to run instructions.
     RUN,
+    // The core is backtracking the last instruction in the run stack.
+    //
+    // This only just barely requires it's own state: the other way to do this would
+    // be to fold it into `RUN`, and backtrack on the same clock cycle that you find
+    // out that the last instruction in the queue produces no new instructions for
+    // you to try and run.
+    //
+    // However, that would actually end up needing two 4-way neighbour lookups,
+    // since you need to first look up the neighbours of the last instruction in the
+    // queue in order to check if any of them are valid (and thus whether that last
+    // instruction is a potential instruction), and then look up the neighbours of
+    // the instruction to backtrack so their bits can be unset on the net.
+    BACKTRACK,
+    // The core is waiting for its leftover state from the last `CHECK` to be
+    // cleared out before switching into `CHECK` state.
+    CHECK_WAIT,
     // The core is checking if its current solution is valid.
     CHECK,
     // The core is outputting a potential solution.
@@ -130,6 +160,10 @@ module core (
     end
   end
 
+  assign out_solution = out_valid & state == SOLUTION;
+  assign out_split = out_valid & state == SPLIT;
+  assign out_pause = out_valid & state == PAUSE;
+
   // Control signals.
   // Whether to do a synchronous reset on the next clock edge.
   logic sync_reset;
@@ -146,15 +180,13 @@ module core (
   logic update_next_base;
   // Whether to add 1 to `decision_index`.
   logic inc_decision_index;
-  // Whether `target` should be set to the potential instruction at
-  // `potential_index` on the next clock cycle, rather than moving according to
-  // `advance` / `backtrack`.
-  logic potential_target;
   // Whether we're currently sending `prefix`/`decisions`, as opposed to receiving
   // into them.
   logic sending;
   // Whether to reset `prefix_bits` back to `$bits(prefix_t)`.
   logic reset_prefix_bits;
+
+  assign stepping = run | backtrack;
 
   // All the metadata about a finder that gets sent prior to the list of
   // decisions.
@@ -203,9 +235,9 @@ module core (
   // through the decisions.
   //
   // More precisely, this is the index of the first 1 in
-  // `decisions[prefix.base_decisions:]`.
+  // `decisions[prefix.base_decision:]`.
   decision_index_t next_base;
-  // `decisions[prefix.base_decisions:]` might be all 0s though; this variable
+  // `decisions[prefix.base_decision:]` might be all 0s though; this variable
   // stores whether or not `next_base` is currently valid. If this is 0 that means
   // we aren't currently capable of splitting and `req_split` is ignored.
   logic next_base_valid;
@@ -332,10 +364,12 @@ module core (
       .rd_data(target_parent)
   );
   logic [$clog2(AREA+1)-1:0] run_stack_len;
+  logic [$clog2(AREA+1)-1:0] next_run_stack_len;
 
   // A reference to the instruction we're currently looking at.
   //
-  // This always lines up with `target`, except when `potential_target` is 1.
+  // This always lines up with `target`, except when `run_stack_len` is 0 and in
+  // `CHECK` state.
   instruction_ref_t target_ref;
   // The parent of `target`'s entry in the run stack.
   run_stack_entry_t target_parent;
@@ -353,15 +387,21 @@ module core (
   always_ff @(posedge clk or posedge reset) begin
     if (reset | sync_reset) begin
       run_stack_len <= 0;
-      // Don't bother resetting `target_ref` and `target_parent`, they're nonsense
-      // until `run_stack_len` is at least 1 anyway.
+      // Don't bother resetting `target_ref`, it's nonsense until `run_stack_len` is
+      // at least 1 anyway.
     end else begin
-      if (run) begin
-        run_stack_len <= run_stack_len + 1;
-      end else if (backtrack) begin
-        run_stack_len <= run_stack_len - 1;
-      end
+      run_stack_len <= next_run_stack_len;
       target_ref <= next_target_ref;
+    end
+  end
+
+  always_comb begin
+    if (run) begin
+      next_run_stack_len = run_stack_len + 1;
+    end else if (backtrack) begin
+      next_run_stack_len = run_stack_len - 1;
+    end else begin
+      next_run_stack_len = run_stack_len;
     end
   end
 
@@ -411,45 +451,20 @@ module core (
     end
   end
 
-  always_comb begin
-    automatic instruction_ref_t to_backtrack = 'x;
-
-    if (potential_target) begin
-      next_target_ref = potential_buf[potential_index];
-    end else if (advance) begin
-      if (last_child) begin
-        next_target_ref = '{parent: target_ref.parent + 1, child_index: 0};
-      end else begin
-        next_target_ref = '{parent: target_ref.parent, child_index: target_ref.child_index + 1};
-      end
-    end else if (backtrack) begin
-      // We want to backtrack the last instruction in the run stack (which should
-      // always be `target_parent` when backtracking), and then our next target is
-      // the instruction after it in the queue.
-      to_backtrack = target_parent.instruction_ref;
-      if (to_backtrack.child_index == 3) begin
-        // The instruction we're backtracking was the last child of its parent, and so
-        // the instruction after it that we want to try next is the first child of the
-        // next instruction.
-        next_target_ref = '{parent: to_backtrack.parent + 1, child_index: 0};
-      end else begin
-        // Otherwise it's the next child of the same parent.
-        next_target_ref = '{
-            parent: to_backtrack.parent,
-            child_index: to_backtrack.child_index + 1
-        };
-      end
-    end else begin
-      next_target_ref = target_ref;
-    end
-  end
-
   // The list of potential instructions.
   // I would've just named it `potential` but that's a keyword in SystemVerilog.
   instruction_ref_t potential_buf[4 * AREA];
 
-  // The index of the potential instruction we're currently looking at.
+  // The index of the potential instruction we're currently looking at (i.e., that
+  // `target` is set to if we're in `CHECK` state).
+  //
+  // Note that this isn't the index we're actually indexing into `potential_buf`
+  // right now - that's `next_potential_index`, so that we can set
+  // `next_target_ref` to that potential instruction in time to set `target_ref`
+  // and `target` on the next clock edge at the same time as we set
+  // `potential_index`.
   potential_index_t potential_index;
+  potential_index_t next_potential_index;
   // The length of `potential_buf`.
   //
   // In theory might need more bits than `potential_index_t`, except that it's
@@ -458,19 +473,42 @@ module core (
   // And doing it this way guarantees that this uses the same number of bits as a
   // cursor.
   potential_index_t potential_len;
+  potential_index_t next_potential_len;
 
-  always_ff @(posedge clk or posedge reset) begin : fsm_transitions
+  always_ff @(posedge clk or posedge reset) begin
     if (reset | sync_reset) begin
       potential_len <= 0;
-    end else if (advance & vc.instruction_valid & !(|vc.neighbours_valid)) begin
+      potential_index <= 0;
+    end else begin
+      if (advance & vc.instruction_valid & !(|vc.neighbours_valid)) begin
+        // We're advancing, and the instruction is valid but none of its neighbours are;
+        // that means this is a potential instruction. Add it to the list.
+        potential_buf[potential_len] <= target_ref;
+      end
+      potential_len   <= next_potential_len;
+      potential_index <= next_potential_index;
+    end
+  end
+
+  always_comb begin
+    if (advance & vc.instruction_valid & !(|vc.neighbours_valid)) begin
       // We're advancing, and the instruction is valid but none of its neighbours are;
       // that means this is a potential instruction. Add it to the list.
-      potential_buf[potential_len] <= target_ref;
-      potential_len <= potential_len + 1;
+      next_potential_len = potential_len + 1;
     end else if (backtrack) begin
       // Reset `potential_len` to whatever it was when the instruction we're
       // backtracking was run.
-      potential_len <= target_parent.potential_len;
+      next_potential_len = target_parent.potential_len;
+    end else begin
+      next_potential_len = potential_len;
+    end
+  end
+
+  always_comb begin
+    if (state == CHECK) begin
+      next_potential_index = potential_index + 1;
+    end else begin
+      next_potential_index = 0;
     end
   end
 
@@ -490,7 +528,7 @@ module core (
   valid_checker vc (
       .clk(clk),
 
-      .instruction(target),
+      .instruction(backtrack ? target_parent.instruction : target),
       .start_mapping_index(prefix.start_mapping_index),
 
       .run(run),
@@ -498,6 +536,8 @@ module core (
 
       .neighbours_valid (),
       .instruction_valid(),
+
+      .neighbours_valid_in(target_parent.children),
 
       .instruction_cursors_filled(),
 
@@ -588,10 +628,10 @@ module core (
 
   assign out_valid = sending;
 
-  always_comb begin : fsm
-    automatic potential_index_t updated_potential_len;
-    automatic logic maybe_solution;
-
+  // Use one big `always_comb` for most of our logic so that later steps can rely
+  // on the results of earlier steps without re-triggering earlier steps and
+  // creating cycles.
+  always_comb begin
     in_ready = 0;
     out_last = 'x;
     // This is almost always what it should be set to, except when we override it to 0 during splitting.
@@ -602,7 +642,6 @@ module core (
     run = 0;
     backtrack = 0;
     update_base = 0;
-    potential_target = 0;
     sending = 0;
     reset_prefix_bits = 0;
 
@@ -631,14 +670,23 @@ module core (
             run = in_data;
           end
         end else begin
+          // We always immediately read the prefix.
+          in_ready = 1;
           // The finder shouldn't cut off partway through receiving the prefix.
           assert (!(in_valid & in_last));
         end
 
-        if (in_valid & in_ready & in_last) next_state = RUN;
+        if (in_valid & in_ready & in_last) begin
+          // Note: this will get overridden later if there's no next instruction to run.
+          next_state = RUN;
+        end
       end
 
       RUN: begin
+        // Note: this is violated when running the first instruction, however that
+        // should always happen inside RECEIVE state not RUN state.
+        assert (target_ref.parent < run_stack_len);
+
         if (req_pause) begin
           // We always pause immediately upon request.
           reset_prefix_bits = 1;
@@ -659,69 +707,56 @@ module core (
             // The instruction's valid and isn't a potential instruction, run it.
             run = 1;
           end
-          if (target_ref.parent == run_stack_len - 1 & last_child & !run) begin
-            // There's no next instruction in the queue to advance to, so instead we
-            // backtrack.
-            // Note that we can advance anyway if running the instruction since a new
-            // instruction'll be getting added to the queue just in time for us to use it.
-            advance = 0;
-
-            // Before we go ahead and backtrack though, check if we have a solution on our
-            // hands.
-            updated_potential_len = potential_len;
-            // Make sure to include `target` in the count of potential instructions if it is
-            // one.
-            if (vc.instruction_valid & !(|vc.neighbours_valid)) updated_potential_len += 1;
-
-            if (int'(run_stack_len) + int'(updated_potential_len) >= AREA) begin
-              // This has passed the first test for being a solution (there's enough run +
-              // potential instructions to possibly cover the surfaces), so now we start the
-              // next test of whether every square has at least 1 instruction that fills it.
-              next_state = CHECK;
-              potential_target = 1;
-              // Except if we're still clearing `potential_surfaces`. In that case we do
-              // nothing and wait until we're done.
-              for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-                if (potential_surface_counts[cuboid] != 0) begin
-                  next_state = state;
-                end
-              end
-              if (next_state == CHECK) begin
-                // Assuming we weren't still clearing, we need to advance after all: even though
-                // we aren't actually going to look at the next instruction, we still have to
-                // mark this instruction as run or potential if it is one of those and `advance`
-                // is the marker we use for that.
-                advance = 1;
-              end
-            end else begin
-              backtrack = 1;
-            end
-          end
         end
+
+        // No, we don't just stay in RUN state forever; there's some code later which
+        // overrides next_state from RUN to CHECK_WAIT/CHECK/BACKTRACK (or even issues a
+        // synchronous reset) if we're at the end of the queue.
       end
 
-      CHECK: begin
-        potential_target = 1;
-        if (potential_index == potential_len - 1) begin
-          // We're about to advance to an invalid index, so stop now.
-          potential_target = 0;
+      BACKTRACK: begin
+        assert (target_ref.parent == run_stack_len - 1);
 
-          maybe_solution   = 1;
-          for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-            // Use `next_potential_surface_counts` to make sure we take into account the last potential instruction.
-            if (int'(run_stack_len) + int'(next_potential_surface_counts[cuboid]) != AREA) begin
-              maybe_solution = 0;
-            end
-          end
-
-          if (maybe_solution) begin
-            reset_prefix_bits = 1;
-            next_state = SOLUTION;
+        if (req_pause) begin
+          // We always pause immediately upon request.
+          reset_prefix_bits = 1;
+          next_state = PAUSE;
+        end else if (req_split & next_base_valid) begin
+          // We only split if `next_base` is valid. If it isn't, we continue until either:
+          // - An instruction is run, at which point we split on that.
+          // - We get to the end of the queue; the fact that `next_base` is invalid means
+          //   that the last run decision is before `base_decision`, and so we're done.
+          reset_prefix_bits = 1;
+          update_base = 1;
+          next_state = SPLIT;
+        end else begin
+          if (target_parent.decision_index < prefix.base_decision) begin
+            // Hold up, we're about to try and backtrack an decision that it isn't this
+            // finder's job to try both options of. That means we're done!
+            sync_reset = 1;
           end else begin
             backtrack  = 1;
             next_state = RUN;
           end
         end
+      end
+
+      CHECK_WAIT: begin
+        automatic logic clearing = 0;
+        for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
+          if (next_potential_surface_counts[cuboid] != 0) begin
+            clearing = 1;
+          end
+        end
+
+        if (!clearing) begin
+          next_state = CHECK;
+        end
+      end
+
+      CHECK: begin
+        // All the actual logic for this state happens down below, when checking for
+        // `next_state == CHECK`.
       end
 
       SOLUTION: begin
@@ -734,8 +769,7 @@ module core (
           // We've just written out the last decision (if it was a decision in the first
           // place), and so we can go back to running.
           out_last   = 1;
-          next_state = RUN;
-          backtrack  = 1;
+          next_state = BACKTRACK;
         end
       end
 
@@ -775,6 +809,7 @@ module core (
 
       PAUSE: begin
         sending = 1;
+        inc_decision_index = prefix_bits_left == 0;
         if (
           (prefix_bits_left == 0 & decision_index == decisions_len - 1)
           | (prefix_bits_left == 1 & decisions_len == 0)
@@ -791,10 +826,115 @@ module core (
       default: ;
     endcase
 
-    if (backtrack & target_parent.decision_index < prefix.base_decision) begin
-      // Hold up, we're about to try and backtrack an decision that it isn't this
-      // finder's job to try both options of. That means we're done!
-      sync_reset = 1;
+    if (advance) begin
+      if (run_stack_len == 0) begin
+        // We're running the first instruction, and so the next one we should look at is
+        // its first child.
+        next_target_ref = '{parent: 0, child_index: 0};
+      end else if (last_child) begin
+        next_target_ref = '{parent: target_ref.parent + 1, child_index: 0};
+      end else begin
+        next_target_ref = '{parent: target_ref.parent, child_index: target_ref.child_index + 1};
+      end
+    end else if (backtrack) begin
+      // We want to backtrack the last instruction in the run stack (which should
+      // always be `target_parent` when backtracking), and then our next target is
+      // the instruction after it in the queue.
+      automatic instruction_ref_t to_backtrack = target_parent.instruction_ref;
+      if (to_backtrack.child_index == 3) begin
+        // The instruction we're backtracking was the last child of its parent, and so
+        // the instruction after it that we want to try next is the first child of the
+        // next instruction.
+        next_target_ref = '{parent: to_backtrack.parent + 1, child_index: 0};
+      end else begin
+        // Otherwise it's the next child of the same parent.
+        next_target_ref = '{
+            parent: to_backtrack.parent,
+            child_index: to_backtrack.child_index + 1
+        };
+      end
+    end else begin
+      next_target_ref = target_ref;
+    end
+
+    if (next_state == RUN & next_target_ref.parent >= next_run_stack_len) begin
+      // Hang on a minute, we can't go into RUN state - we'd be trying to run an
+      // instruction past the end of the queue.
+      if (int'(run_stack_len) + int'(next_potential_len) >= AREA) begin
+        // This has passed the first test for being a solution (there's enough run +
+        // potential instructions to possibly cover the surfaces), so now we start the
+        // next test of whether every square has at least 1 instruction that fills it.
+
+        // Except if we're still clearing `potential_surfaces`. In that case we go into
+        // CHECK_WAIT state until we're done.
+        automatic logic clearing = 0;
+        for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
+          if (next_potential_surface_counts[cuboid] != 0) begin
+            clearing = 1;
+          end
+        end
+
+        if (clearing) begin
+          next_state = CHECK_WAIT;
+        end else begin
+          next_state = CHECK;
+        end
+      end else begin
+        next_state = BACKTRACK;
+      end
+    end
+
+    // This goes here instead of when we're already in `CHECK` state so that we
+    // don't go into `CHECK` state when `potential_len == 0`.
+    if (next_state == CHECK) begin
+      if (next_potential_index >= next_potential_len) begin
+        // We're about to advance to an invalid index, so stop now.
+        automatic logic maybe_solution = 1;
+        for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
+          // Use `next_potential_surface_counts` to make sure we take into account the
+          // last potential instruction.
+          if (int'(run_stack_len) + int'(next_potential_surface_counts[cuboid]) != AREA) begin
+            maybe_solution = 0;
+          end
+        end
+
+        if (maybe_solution) begin
+          reset_prefix_bits = 1;
+          next_state = SOLUTION;
+        end else begin
+          next_state = BACKTRACK;
+        end
+      end else begin
+        if (next_potential_index == potential_len) begin
+          // The potential instruction at `next_potential_index` is only being added to
+          // `potential_buf` on the next clock edge, so we can't get it from there;
+          // instead just set it to `target_ref` directly.
+          next_target_ref = target_ref;
+        end else begin
+          next_target_ref = potential_buf[next_potential_index];
+        end
+      end
+    end
+
+    if (next_state == BACKTRACK) begin
+      if (next_run_stack_len == 0) begin
+        // We're trying to backtrack when there are no instructions left to backtrack;
+        // that means we're done.
+        sync_reset = 1;
+      end else begin
+        // Make sure `target_parent` will be set to the last entry in the run stack.
+        next_target_ref = '{parent: next_run_stack_len - 1, child_index: 'x};
+      end
     end
   end
+
+  // TODO: replace this with Rust code that does tracing (lets you configure the
+  // file name, etc.) instead of having to uncomment this whenever running
+  // `net-finder-fpga-sim`'s bin target instead of the fuzz target.
+  // See option B at https://verilator.org/guide/latest/faq.html#how-do-i-generate-waveforms-traces-in-c
+  // for how.
+  // initial begin
+  //   $dumpfile("core.fst");
+  //   $dumpvars();
+  // end
 endmodule

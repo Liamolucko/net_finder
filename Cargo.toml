@@ -1,10 +1,12 @@
+[workspace]
+members = ["crates/fpga-sim"]
+
 [package]
-name = "net_finder"
+name = "net-finder"
 version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["no-trie"]
 no-trie = []
 
 [dependencies]

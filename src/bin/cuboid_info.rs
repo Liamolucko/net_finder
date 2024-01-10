@@ -33,7 +33,12 @@ fn main() {
 
 fn run<const CUBOIDS: usize>(cuboids: [Cuboid; CUBOIDS], verbose: bool) {
     let square_caches = cuboids.map(SquareCache::new);
-    let (_, _, equivalence_classes) = equivalence_classes(&square_caches);
+    let (fixed_cuboid, fixed_class, equivalence_classes) = equivalence_classes(&square_caches);
+    println!(
+        "Fixed class: {} on {} cuboid",
+        fixed_class.index(),
+        cuboids[fixed_cuboid]
+    );
     println!("Equivalence classes:");
     for (i, class) in equivalence_classes.iter().enumerate() {
         print!("Class {}: {} members", i + 1, class.len());

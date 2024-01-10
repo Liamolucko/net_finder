@@ -1,5 +1,5 @@
 [package]
-name = "net_finder-fuzz"
+name = "net-finder-fuzz"
 version = "0.0.0"
 authors = ["Automatically generated"]
 publish = false
@@ -9,10 +9,12 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
+anyhow = "1.0.78"
 libfuzzer-sys = "0.4"
+net-finder-fpga-sim = { path = "../crates/fpga-sim" }
 pretty_assertions = "1.4.0"
 
-[dependencies.net_finder]
+[dependencies.net-finder]
 path = ".."
 
 # Prevent this from interfering with workspaces
@@ -28,5 +30,11 @@ doc = false
 [[bin]]
 name = "finder_info"
 path = "fuzz_targets/finder_info.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "core"
+path = "fuzz_targets/core.rs"
 test = false
 doc = false

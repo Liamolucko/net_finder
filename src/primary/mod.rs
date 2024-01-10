@@ -3,12 +3,12 @@
 use std::array;
 use std::cmp::Reverse;
 use std::collections::{HashSet, VecDeque};
-use std::fmt::{self, Display, Formatter, Write};
+use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter};
 use std::iter::zip;
-use std::num::NonZeroU8;
+use std::num::{NonZeroU8, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 #[cfg(feature = "no-trie")]
@@ -22,11 +22,9 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "no-trie")]
-use crate::Class;
 use crate::{
-    equivalence_classes, ClassMapping, ColoredNet, Cuboid, Cursor, Direction, Mapping, Net, Pos,
-    SkipSet, Square, SquareCache, Surface,
+    equivalence_classes, Class, ClassMapping, ColoredNet, Cuboid, Cursor, Direction, Mapping, Net,
+    Pos, SkipSet, Square, SquareCache, Surface,
 };
 
 mod cpu;
@@ -53,10 +51,15 @@ pub struct FinderCtx<const CUBOIDS: usize> {
 
     /// Square caches for the cuboids (`inner_cuboids`, specifically).
     square_caches: [SquareCache; CUBOIDS],
+    /// Square caches for the cuboids, in the order of `outer_cuboids`.
+    pub outer_square_caches: [SquareCache; CUBOIDS],
+    /// The index of the cuboid in `outer_cuboids` which we always use the same
+    /// starting point on; in other words, the index of `inner_cuboids[0]` in
+    /// `outer_cuboids`.
+    pub fixed_cuboid: usize,
     /// The cursor class on the first cuboid in `inner_cuboids` which we always
     /// use as the starting point on that cuboid.
-    #[cfg(feature = "no-trie")]
-    fixed_class: Class,
+    pub fixed_class: Class,
     /// A bitfield indicating whether each cursor on the first cuboid is in the
     /// same family of equivalence classes as `fixed_class`.
     #[cfg(feature = "no-trie")]
@@ -103,15 +106,19 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
             bail!("only cuboids with surface area <= 64 are currently supported");
         }
 
-        let mut square_caches = cuboids.map(SquareCache::new);
+        let outer_square_caches = cuboids.map(SquareCache::new);
 
         let (fixed_cuboid, fixed_class, mut equivalence_classes) =
-            equivalence_classes(&square_caches);
+            equivalence_classes(&outer_square_caches);
         // Move the fixed cuboid to the front of the list.
+        // Make sure the remaining cuboids stay in the same order, otherwise mapping
+        // indices won't compare the same way anymore (and there'll be a mismatch with
+        // the FPGA).
         let mut inner_cuboids = cuboids;
-        inner_cuboids.swap(0, fixed_cuboid);
+        inner_cuboids[..=fixed_cuboid].rotate_right(1);
         // Update the square caches to also be in the order of the inner cuboids.
-        square_caches.swap(0, fixed_cuboid);
+        let mut square_caches = outer_square_caches.clone();
+        square_caches[..=fixed_cuboid].rotate_right(1);
         // We leave the equivalence classes as is, since they get passed to
         // `Finder::new_blank` which expects things to be in the order of
         // `outer_cuboids` since it's exposed to the outside world (indirectly through
@@ -138,7 +145,8 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
             inner_cuboids,
             target_area: cuboids[0].surface_area(),
             square_caches,
-            #[cfg(feature = "no-trie")]
+            outer_square_caches,
+            fixed_cuboid,
             fixed_class,
             #[cfg(feature = "no-trie")]
             maybe_skipped_lookup,
@@ -150,22 +158,13 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
 
     /// Generates a list of `Finder`s to use for finding the common nets of this
     /// `FinderCtx`'s cuboids.
-    fn gen_finders(&self) -> Vec<Finder<CUBOIDS>> {
+    pub fn gen_finders(&self) -> Vec<Finder<CUBOIDS>> {
         // A `SkipSet` containing all of the previous equivalence classes.
         let mut prev_classes = SkipSet::new(self.inner_cuboids);
 
         self.equivalence_classes
             .iter()
             .map(|class| {
-                // We start from the mapping with the smallest index, since `skip` relies on it.
-                //
-                // Note that the one with the smallest index always uses the correct fixed class
-                // since we always pick the root of the family to be the fixed class.
-                let start_class_mapping = *class
-                    .iter()
-                    .min_by_key(|&&mapping| self.to_inner(mapping).index())
-                    .unwrap();
-
                 // We want to skip all the equivalence classes prior to this one.
                 let skip = prev_classes.clone();
                 // Then add this equivalence class to the set of previous ones.
@@ -176,7 +175,11 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
                     );
                 }
 
-                Finder::new_blank(self, start_class_mapping, skip)
+                let mut finder = Finder::new_blank(self, class, skip);
+                // Make it so that the first instruction is always run.
+                finder.handle_instruction(self);
+                finder.base_index = 1;
+                finder
             })
             .collect()
     }
@@ -216,7 +219,7 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Finder<const CUBOIDS: usize> {
     /// Mappings that we should skip over because they're the responsibility of
     /// another `Finder`.
@@ -316,7 +319,13 @@ pub struct FinderInfo<const CUBOIDS: usize> {
     pub decisions: Vec<bool>,
     /// The index of the first decision in `decisions` that it's this finder's
     /// job to try both options of.
-    pub base_decision: usize,
+    ///
+    /// This can't be 0 because there'd be no reason to ever do that: if you
+    /// don't run the first instruction that's it, there's nothing else to run
+    /// and so you certainly aren't going to get a solution.
+    ///
+    /// Enforcing that gets rid of some annoying edge cases on the FPGA.
+    pub base_decision: NonZeroUsize,
 }
 
 impl<'a, const CUBOIDS: usize> Arbitrary<'a> for FinderInfo<CUBOIDS> {
@@ -332,13 +341,13 @@ impl<'a, const CUBOIDS: usize> Arbitrary<'a> for FinderInfo<CUBOIDS> {
         // specified and it just so happens that nothing's been run past there yet. But
         // if it's any further than that, the fixed part isn't fully specified and it's
         // invalid.
-        if res.base_decision > res.decisions.len() {
+        if res.base_decision.get() > res.decisions.len() {
             return Err(arbitrary::Error::IncorrectFormat);
         }
 
         // The base decision should always be a 1; if it's a 0, it may as well be moved
         // to the next decision since it can't be backtracked again anyway.
-        if res.decisions.get(res.base_decision) == Some(&false) {
+        if res.decisions.get(res.base_decision.get()) == Some(&false) {
             return Err(arbitrary::Error::IncorrectFormat);
         }
 
@@ -405,10 +414,11 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     ///
     /// Returns an `Err` if the `FinderInfo` is invalid.
     pub fn new(ctx: &FinderCtx<CUBOIDS>, info: &FinderInfo<CUBOIDS>) -> anyhow::Result<Self> {
-        let class_index = ctx
+        let (class_index, class) = ctx
             .equivalence_classes
             .iter()
-            .position(|class| class.contains(&info.start_mapping))
+            .enumerate()
+            .find(|(_, class)| class.contains(&info.start_mapping))
             // This will also catch situations where the classes of `info.start_mapping` are out of
             // range.
             .context("invalid start_mapping")?;
@@ -423,7 +433,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             }
         }
 
-        let mut this = Finder::new_blank(ctx, info.start_mapping, skip);
+        let mut this = Finder::new_blank(ctx, class, skip);
 
         let mut decision_index = 0;
         let mut base_index = None;
@@ -443,7 +453,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                     this.base_index = 0;
                     assert!(this.backtrack());
                 }
-                if decision_index == info.base_decision {
+                if decision_index == info.base_decision.get() {
                     // We've just found what index in the queue `base_decision` corresponds to; set
                     // `base_index` to that.
                     base_index = Some(index);
@@ -463,7 +473,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         Ok(this)
     }
 
-    /// Creates a new, blank `Finder` from a `SkipSet` and starting mapping.
+    /// Creates a new, blank `Finder` from a `SkipSet` and an equivalence class
+    /// of mappings to pick its starting position from.
     ///
     /// The `SkipSet` is an optimisation, it takes a while to construct them and
     /// it's significantly faster to build up one `SkipSet` that we repeatedly
@@ -471,7 +482,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     /// `Finder`.
     fn new_blank(
         ctx: &FinderCtx<CUBOIDS>,
-        start_class_mapping: ClassMapping<CUBOIDS>,
+        class: &FxHashSet<ClassMapping<CUBOIDS>>,
         skip: SkipSet<CUBOIDS>,
     ) -> Self {
         let start_pos = Pos {
@@ -479,7 +490,16 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             y: ctx.inner_cuboids[0].surface_area().try_into().unwrap(),
         };
 
-        // `FinderInfo` uses the outer order of cuboids, so we need to translate.
+        // We start from the mapping with the smallest index, since `skip` relies on it.
+        //
+        // Note that the one with the smallest index always uses the correct fixed class
+        // since we always pick the root of the family to be the fixed class.
+        let start_class_mapping = *class
+            .iter()
+            .min_by_key(|&&mapping| ctx.to_inner(mapping).index())
+            .unwrap();
+        // `equivalence_classes` uses the outer order of cuboids, so we need to
+        // translate.
         let inner_start_class_mapping = ctx.to_inner(start_class_mapping);
         let start_mapping = inner_start_class_mapping.sample(&ctx.square_caches);
 
@@ -581,23 +601,30 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             // past the end of the list of decisions, meaning that all the current decisions are
             // fixed and the only thing the finder can do is add more. In this case, it turns out it
             // actually can't add more but there's no way nor need to encode that.
-            base_decision: base_decision.unwrap_or(decisions.len()),
+            base_decision: base_decision
+                .unwrap_or(decisions.len())
+                .try_into()
+                .expect("finder with base_index 0"),
             decisions: decisions.into(),
         }
     }
 
-    /// Advances this `Finder` forwards by a step. In other words, calls either
-    /// `handle_instruction` or `backtrack`, whichever is appropriate.
+    /// Runs this `Finder` until its decisions have changed.
     ///
     /// Returns whether stepping was successful; if this returns `false`, the
     /// finder is done.
     pub fn step(&mut self, ctx: &FinderCtx<CUBOIDS>) -> bool {
-        if self.index < self.queue.len() {
-            self.handle_instruction(ctx);
-            true
-        } else {
-            self.backtrack()
+        let start_area = self.area();
+        while self.area() == start_area {
+            if self.index < self.queue.len() {
+                self.handle_instruction(ctx);
+            } else {
+                if !self.backtrack() {
+                    return false;
+                }
+            }
         }
+        true
     }
 
     /// Returns the number of instructions in the queue that are currently run;
@@ -909,6 +936,34 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     #[cfg(not(feature = "no-trie"))]
     fn skip(&self, _ctx: &FinderCtx<CUBOIDS>, mapping: Mapping<CUBOIDS>) -> bool {
         self.skip.contains(mapping)
+    }
+}
+
+impl<const CUBOIDS: usize> Debug for Finder<CUBOIDS> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        struct QueueDebug<'a, const CUBOIDS: usize>(&'a Finder<CUBOIDS>);
+        impl<const CUBOIDS: usize> Debug for QueueDebug<'_, CUBOIDS> {
+            fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+                let mut d = f.debug_list();
+                for (index, instruction) in self.0.queue.iter().enumerate() {
+                    let base_char = if index == self.0.base_index { 'b' } else { ' ' };
+                    let target_char = if index == self.0.index { '>' } else { ' ' };
+                    let pos = instruction.net_pos;
+                    let mapping = instruction.mapping;
+                    let followup = instruction
+                        .followup_index
+                        .map_or(String::new(), |index| format!(" fu {index}"));
+                    d.entry(&format_args!(
+                        "{base_char}{target_char} {index}: {pos} -> {mapping}{followup}"
+                    ));
+                }
+                d.finish()
+            }
+        }
+
+        f.debug_struct("Finder")
+            .field("queue", &QueueDebug(self))
+            .finish()
     }
 }
 

@@ -1,0 +1,16 @@
+[package]
+name = "net-finder-fpga-sim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+net-finder = { path = "../..", features = ["no-trie"] }
+
+# Dependencies only used by the bin target.
+anyhow = "1.0.79"
+clap = { version = "4.4.12", features = ["derive"] }
+pretty_assertions = "1.4.0"
+
+[build-dependencies]
+anyhow = "1.0.79"
+cc = "1.0.83"

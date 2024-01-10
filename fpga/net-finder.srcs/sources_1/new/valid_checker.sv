@@ -78,6 +78,12 @@ module valid_checker (
     // whether it's skipped never changes.
     output logic instruction_valid,
 
+    // When backtracking, which neighbours of `instruction` were valid at the time
+    // it was run.
+    //
+    // In other words, which ones we have to unset the bits for on the net.
+    input logic [3:0] neighbours_valid_in,
+
     // Whether each of `instruction`'s cursors are filled on the surfaces. Needed
     // for `CHECK` state.
     output logic [CUBOIDS-1:0] instruction_cursors_filled,
@@ -166,7 +172,10 @@ module valid_checker (
           .addr(clear_mode ? clear_index : {
             neighbours[neighbour].pos.x[COORD_BITS-1:2], neighbours[neighbour].pos.y
           }),
-          .wr_en(clear_mode ? 1 : (run | backtrack) & neighbours_valid[neighbour]),
+          .wr_en(
+            clear_mode ? 1
+            : (run & neighbours_valid[neighbour]) | (backtrack & neighbours_valid_in[neighbour])
+          ),
           .wr_data(clear_mode ? 0 : run),
           .rd_data(shard_values[shard])
       );
@@ -210,10 +219,14 @@ module valid_checker (
 
   generate
     for (direction = 0; direction < 4; direction++) begin : gen_skipped
-      mapping_index_t index;
+      mapping_index_lookup lookup (
+          .mapping(neighbours[direction].mapping),
+          .index(),
+          .uses_fixed_class()
+      );
       always_comb begin
-        if (mapping_index_lookup(neighbours[direction].mapping, index)) begin
-          skipped[direction] = index < start_mapping_index;
+        if (lookup.uses_fixed_class) begin
+          skipped[direction] = lookup.index < start_mapping_index;
         end else begin
           skipped[direction] = 0;
         end

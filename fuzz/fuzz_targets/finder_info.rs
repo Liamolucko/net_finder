@@ -56,40 +56,22 @@ fn main_inner<const CUBOIDS: usize>(
     })?;
 
     // This will catch it if `info` is invalid.
-    let finder = Finder::new(&ctx, &info).map_err(|_| arbitrary::Error::IncorrectFormat)?;
+    let mut finder = Finder::new(&ctx, &info).map_err(|_| arbitrary::Error::IncorrectFormat)?;
 
     // Make sure we get the same `FinderInfo` back from `Finder::info` that we
     // started with.
     assert_eq!(finder.clone().into_info(&ctx), info);
 
-    // Make sure that after running the `Finder` for a bit, it can still be
+    // Make sure that after running the `Finder` for a step, it can still be
     // round-tripped through a `FinderInfo` without changing anything.
-    //
-    // Specifically, we run until the decisions change, which is signalled by a
-    // change in area. Up until that point, `stepped_finder` will keep giving the
-    // same `FinderInfo` as `Finder`, since instructions run after a decision aren't
-    // taken into account.
-    let mut stepped_finder = finder.clone();
-    while stepped_finder.area() == finder.area() {
-        if !stepped_finder.step(&ctx) {
-            // Stop early if the finder finishes.
-            break;
-        }
+    finder.step(&ctx);
+    assert_eq!(
+        Finder::new(&ctx, &finder.clone().into_info(&ctx)).unwrap(),
+        finder
+    );
 
-        assert_eq!(
-            &Finder::new(&ctx, &stepped_finder.clone().into_info(&ctx)).unwrap(),
-            if stepped_finder.area() != finder.area() {
-                // If the area's changed the decisions have changed.
-                &stepped_finder
-            } else {
-                // Otherwise they haven't and so this step won't be included.
-                &finder
-            }
-        );
-    }
-
-    // And now by induction, any `Finder` created from a `FinderInfo` and then run
-    // until just after a decision happens can be represented losslessly by a
+    // And now by induction, any `Finder` which was created from a `FinderInfo` and
+    // then run for any number of steps can be represented losslessly by a
     // `FinderInfo`.
     Ok(())
 }

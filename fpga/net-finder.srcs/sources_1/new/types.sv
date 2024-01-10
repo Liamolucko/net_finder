@@ -1,7 +1,7 @@
 `include "generated.sv"
 
 // Round the size of the net up to the nearest multiple of 4 so that our tiling works properly.
-parameter int NET_SIZE = 4 * int'($ceil(AREA / 4));
+parameter int NET_SIZE = 4 * int'($ceil($itor(AREA) / 4));
 parameter int COORD_BITS = $clog2(NET_SIZE);
 parameter int NET_LEN = NET_SIZE << COORD_BITS;
 
