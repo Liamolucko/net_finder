@@ -1,5 +1,6 @@
 #![no_main]
 use std::env;
+use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -80,11 +81,26 @@ fn main(
         }
 
         let (solution, finder_success) = finder.step(ctx);
-        if let Some(solution) = solution {
-            assert_eq!(
-                cached_event.unwrap_or_else(|| core.event(ctx)),
-                Event::Solution(solution)
-            )
+        if let Some(mut finder_solution) = solution {
+            let event = cached_event.unwrap_or_else(|| core.event(ctx));
+            let Event::Solution(mut core_solution) = event else {
+                panic!("expected Event::Solution but got {event:#?}")
+            };
+
+            // We don't care what the `base_decision`s of the solutions are, since they only
+            // affect backtracking which we don't need to do when processing solutions.
+            //
+            // The reason they can differ is because in the event that we happen to split
+            // right as a solution is found (i.e., right after the step that runs the last
+            // instruction in the queue), the core will emit the solution before it notices
+            // the request to split whereas the `Finder` will split first.
+            //
+            // This means that the core's solution will have the `base_decision` from before
+            // splitting, and the `Finder`'s one will have the `base_decision` from after.
+            core_solution.base_decision = NonZeroUsize::new(1).unwrap();
+            finder_solution.base_decision = NonZeroUsize::new(1).unwrap();
+
+            assert_eq!(core_solution, finder_solution)
         }
 
         if finder_success {
