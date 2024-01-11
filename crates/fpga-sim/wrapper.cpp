@@ -1,6 +1,7 @@
 #include <stdbool.h>
 
 #include "Vcore.h"
+#include "verilated_fst_c.h"
 
 struct core_inner {
     void *ptr;
@@ -35,6 +36,11 @@ void *verilated_context_new(bool trace) {
     return (void *)context;
 }
 
+uint64_t verilated_context_time(void *ptr) {
+    VerilatedContext *context = (VerilatedContext *)ptr;
+    return context->time();
+}
+
 void verilated_context_time_inc(void *ptr, uint64_t add) {
     VerilatedContext *context = (VerilatedContext *)ptr;
     context->timeInc(add);
@@ -43,6 +49,26 @@ void verilated_context_time_inc(void *ptr, uint64_t add) {
 void verilated_context_free(void *ptr) {
     VerilatedContext *context = (VerilatedContext *)ptr;
     delete context;
+}
+
+void *verilated_fst_new() {
+    return (void *)new VerilatedFstC();
+}
+
+void verilated_fst_open(void *ptr, const char *filename) {
+    VerilatedFstC *trace = (VerilatedFstC *)ptr;
+    trace->open(filename);
+}
+
+void verilated_fst_dump(void *ptr, uint64_t timeui) {
+    VerilatedFstC *trace = (VerilatedFstC *)ptr;
+    trace->dump(timeui);
+}
+
+void verilated_fst_free(void *ptr) {
+    VerilatedFstC *trace = (VerilatedFstC *)ptr;
+    trace->close();
+    delete trace;
 }
 
 struct core_inner core_new(void *context_ptr) {
@@ -73,6 +99,13 @@ struct core_inner core_new(void *context_ptr) {
 void core_update(void *ptr) {
     Vcore *core = (Vcore *)ptr;
     core->eval();
+}
+
+void core_trace(void *ptr, void *trace_ptr) {
+    Vcore *core = (Vcore *)ptr;
+    // `levels` and `options` don't seem to do anything, so don't bother
+    // exposing them.
+    core->trace((VerilatedFstC *)trace_ptr, 0);
 }
 
 void core_free(void *ptr) {

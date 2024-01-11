@@ -1,3 +1,4 @@
+use std::ffi::CStr;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -15,7 +16,10 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let core_ctx = VerilatedContext::new(true);
-    let mut core = Core::new(&core_ctx);
+    let mut core = Core::new(
+        &core_ctx,
+        Some(CStr::from_bytes_with_nul(b"core.fst\0").unwrap()),
+    );
     core.reset();
 
     let info = FinderInfo {

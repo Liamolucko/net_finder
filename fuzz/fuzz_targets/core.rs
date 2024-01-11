@@ -37,7 +37,7 @@ fn main(
     // Create the `Finder` first, since it'll validate the `FinderInfo`.
     let mut finder = Finder::new(&ctx, &info)?;
     // Then create the `Core` and load the `FinderInfo` into it.
-    let mut core = Core::new(&core_ctx);
+    let mut core = Core::new(&core_ctx, None);
     core.reset();
     core.load_finder(&ctx, &info);
 

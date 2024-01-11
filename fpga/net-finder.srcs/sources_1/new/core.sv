@@ -926,14 +926,4 @@ module core (
       end
     end
   end
-
-  // TODO: replace this with Rust code that does tracing (lets you configure the
-  // file name, etc.) instead of having to uncomment this whenever running
-  // `net-finder-fpga-sim`'s bin target instead of the fuzz target.
-  // See option B at https://verilator.org/guide/latest/faq.html#how-do-i-generate-waveforms-traces-in-c
-  // for how.
-  // initial begin
-  //   $dumpfile("core.fst");
-  //   $dumpvars();
-  // end
 endmodule

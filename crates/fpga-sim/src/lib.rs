@@ -1,5 +1,5 @@
 use std::array;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CStr};
 use std::fmt::Debug;
 
 use net_finder::{Cuboid, Cursor, FinderCtx, FinderInfo, Mapping};
@@ -41,12 +41,21 @@ struct CoreInner {
 }
 
 extern "C" {
+    // TODO: it doesn't look like Verilator uses C++ exceptions but it might not
+    // hurt to make sure, because unwinding over FFI is UB.
     fn verilated_context_new(trace: bool) -> *mut c_void;
+    fn verilated_context_time(this: *mut c_void) -> u64;
     fn verilated_context_time_inc(this: *mut c_void, add: u64);
     fn verilated_context_free(this: *mut c_void);
 
+    fn verilated_fst_new() -> *mut c_void;
+    fn verilated_fst_open(this: *mut c_void, filename: *const c_char);
+    fn verilated_fst_dump(this: *mut c_void, time: u64);
+    fn verilated_fst_free(this: *mut c_void);
+
     fn core_new(context: *mut c_void) -> CoreInner;
     fn core_update(this: *mut c_void);
+    fn core_trace(this: *mut c_void, trace: *mut c_void);
     fn core_free(this: *mut c_void);
 }
 
@@ -59,6 +68,10 @@ impl VerilatedContext {
         Self {
             ptr: unsafe { verilated_context_new(trace) },
         }
+    }
+
+    pub fn time(&self) -> u64 {
+        unsafe { verilated_context_time(self.ptr) }
     }
 
     pub fn time_inc(&self, add: u64) {
@@ -74,6 +87,7 @@ impl Drop for VerilatedContext {
 
 pub struct Core<'a> {
     inner: CoreInner,
+    fst: Option<*mut c_void>,
     // This can be retrieved via `VerilatedModel::contextp`, but that gives a pointer to the
     // underlying `VerilatedContext` when `&VerilatedContext` in Rust is actually a pointer to a
     // pointer. So we'd probably have to add a `VerilatedContextRef`, and so on... this is easier.
@@ -83,12 +97,20 @@ pub struct Core<'a> {
 /// A simulated instance of `core`.
 impl<'a> Core<'a> {
     /// Creates a new simulated instance of `core`.
+    ///
+    /// You can optionally provide the name of a file to write an FST trace of
+    /// the simulation to.
     // TODO: I'm pretty sure it's ok for this to be a shared reference but idk.
-    pub fn new(ctx: &'a VerilatedContext) -> Self {
-        let mut this = Self {
-            inner: unsafe { core_new(ctx.ptr) },
-            ctx,
-        };
+    pub fn new(ctx: &'a VerilatedContext, trace_file: Option<&CStr>) -> Self {
+        let inner = unsafe { core_new(ctx.ptr) };
+        let fst = trace_file.map(|filename| unsafe {
+            let ptr = verilated_fst_new();
+            core_trace(inner.ptr, ptr);
+            verilated_fst_open(ptr, filename.as_ptr());
+            ptr
+        });
+
+        let mut this = Self { inner, fst, ctx };
 
         // Initialise all the `core`'s inputs low.
         *this.clk() = false;
@@ -115,7 +137,12 @@ impl<'a> Core<'a> {
     /// that; the clock is just another input.
     pub fn update(&mut self) {
         self.ctx.time_inc(1);
-        unsafe { core_update(self.inner.ptr) }
+        unsafe {
+            core_update(self.inner.ptr);
+            if let Some(ptr) = self.fst {
+                verilated_fst_dump(ptr, self.ctx.time());
+            }
+        }
     }
 
     fn clk(&mut self) -> &mut bool {
@@ -398,7 +425,13 @@ impl<'a> Core<'a> {
 
 impl Drop for Core<'_> {
     fn drop(&mut self) {
-        unsafe { core_free(self.inner.ptr) }
+        unsafe {
+            // Make sure to drop the `VerilatedFstC` first.
+            if let Some(ptr) = self.fst {
+                verilated_fst_free(ptr);
+            }
+            core_free(self.inner.ptr);
+        }
     }
 }
 
