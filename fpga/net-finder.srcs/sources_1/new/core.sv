@@ -174,10 +174,6 @@ module core (
   // Whether to backtrack the last instruction in the run stack (which must be
   // `target_parent`).
   logic backtrack;
-  // Whether to update `prefix.base_decision` to `next_base`.
-  logic update_base;
-  // Whether to update `next_base` to `decision_index + 1`.
-  logic update_next_base;
   // Whether to add 1 to `decision_index`.
   logic inc_decision_index;
   // Whether we're currently sending `prefix`/`decisions`, as opposed to receiving
@@ -198,14 +194,22 @@ module core (
     // The index in the list of decisions of the first decision it's this finder's
     // job to try both options of.
     //
+    // The decision at this index is always a 1, since when `base_decision` points
+    // to a 0 it's the same as if it pointed to the next 1 - you can't backtrack the
+    // 0 anyway so what's the point of saying you're allowed to?
+    //
     // Unlike the rest of the data here this can actually be mutated over time (when
-    // splitting).
+    // splitting and when the decision at this index becomes a 0).
     decision_index_t base_decision;
   } prefix_t;
 
   // Collect that metadata into a shift register.
   prefix_t prefix;
   logic [$clog2($bits(prefix)+1)-1:0] prefix_bits_left;
+
+  // What we're going to set `prefix.base_decision` to next clock cycle (if
+  // `prefix` isn't currently halfway through being shifted in/out of the core).
+  decision_index_t next_base_decision;
 
   always_ff @(posedge clk or posedge reset) begin
     if (reset | sync_reset | reset_prefix_bits) begin
@@ -215,50 +219,18 @@ module core (
       | (sending & out_valid & out_ready)
     )) begin
       prefix_bits_left <= prefix_bits_left - 1;
-      prefix <= {prefix[$bits(prefix)-2:0], sending ? prefix[$bits(prefix)-1] : in_data};
-    end else if (backtrack & target_parent.decision_index == prefix.base_decision) begin
-      // The base decision is being backtracked, and so it doesn't really make sense
-      // to call it the base decision anymore. What being the base decision means is
-      // that it's the earliest decision that we need to backtrack; but we've just
-      // backtracked it, so its role has been fulfilled.
-      //
-      // Increment `base_decision`, which should result in it being 1 past the end of
-      // `decisions`.
-      prefix.base_decision <= prefix.base_decision + 1;
-    end else if (prefix_bits_left == 0 & update_base) begin
-      prefix.base_decision <= decision_index + 1;
     end
   end
 
-  // Keep track of what we're going to set `base_decision` to if we split, since
-  // we need to send it as part of the prefix before we've started iterating
-  // through the decisions.
-  //
-  // More precisely, this is the index of the first 1 in
-  // `decisions[prefix.base_decision:]`.
-  decision_index_t next_base;
-  // `decisions[prefix.base_decision:]` might be all 0s though; this variable
-  // stores whether or not `next_base` is currently valid. If this is 0 that means
-  // we aren't currently capable of splitting and `req_split` is ignored.
-  logic next_base_valid;
-
-  always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset) begin
-      // We don't need to bother setting `next_base` here since it's invalid anyway.
-      next_base_valid <= 0;
-    end else if (update_next_base) begin
-      next_base <= decision_index + 1;
-    end else if (!next_base_valid & run) begin
-      // An instruction's being run, which means a 1's being added to the list of
-      // decisions. If `next_base_valid` is 0, that means that everything from
-      // `base_decision` onwards is all 0s, and so this is our new base decision.
-      next_base <= decisions_len;
-      next_base_valid <= 1;
-    end else if (backtrack & target_parent.decision_index == next_base) begin
-      // `next_base` was just changed to a 0, so it's no longer valid. The fact that
-      // we're backtracking it also means that it was the last 1 in the list of
-      // decisions, so there's no later 1 to replace it.
-      next_base_valid <= 0;
+  always_ff @(posedge clk) begin
+    // We don't bother clearing `prefix` on reset since it's bogus anyway.
+    if (prefix_bits_left > 0 & (
+      (!sending & in_valid & in_ready)
+      | (sending & out_valid & out_ready)
+    )) begin
+      prefix <= {prefix[$bits(prefix)-2:0], sending ? prefix[$bits(prefix)-1] : in_data};
+    end else if (prefix_bits_left == 0) begin
+      prefix.base_decision <= next_base_decision;
     end
   end
 
@@ -333,7 +305,7 @@ module core (
   // The index of the current decision we're sending.
   decision_index_t decision_index;
   always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset | !sending) begin
+    if (reset | sync_reset | (state != SOLUTION & state != SPLIT & state != PAUSE)) begin
       // Set this to 0 whenever we aren't using it so that way it'll always be 0 when
       // we start to.
       decision_index <= 0;
@@ -419,7 +391,7 @@ module core (
       last_child = 'x;
     end else begin
       // Find the direction of the last valid child.
-      assert (target_parent.children != 'b0000);
+      assert (run_stack_len == 0 | target_parent.children != 'b0000);
       last_valid_direction = 'x;
       for (int direction = 3; direction >= 0; direction--) begin
         if (target_parent.children[direction]) begin
@@ -602,7 +574,7 @@ module core (
           // Otherwise we always want to write 0s (as long as the address is valid).
           .rw_wr_en(
             state == CLEAR ? int'(clear_index) < AREA
-            : state == CHECK ? !vc.instruction_cursors_filled[cuboid]
+            : state == CHECK ? vc.instruction_valid & !vc.instruction_cursors_filled[cuboid]
             : int'(potential_surfaces_clear_index) < AREA
           )
       );
@@ -626,6 +598,15 @@ module core (
   // verilator lint_on ASSIGNIN
   // verilator lint_on PINMISSING
 
+  // When in SPLIT state, whether we were in BACKTRACK state before switching to
+  // SPLIT state.
+  logic was_backtrack;
+  always_ff @(posedge clk) begin
+    if (state != SPLIT & next_state == SPLIT) begin
+      was_backtrack <= state == BACKTRACK;
+    end
+  end
+
   assign out_valid = sending;
 
   // Use one big `always_comb` for most of our logic so that later steps can rely
@@ -641,12 +622,12 @@ module core (
     advance = 0;
     run = 0;
     backtrack = 0;
-    update_base = 0;
     sending = 0;
     reset_prefix_bits = 0;
 
     // By default, stay in the current state.
     next_state = state;
+    next_base_decision = prefix.base_decision;
 
     case (state)
       CLEAR: begin
@@ -691,13 +672,21 @@ module core (
           // We always pause immediately upon request.
           reset_prefix_bits = 1;
           next_state = PAUSE;
-        end else if (req_split & next_base_valid) begin
-          // We only split if `next_base` is valid. If it isn't, we continue until either:
-          // - An instruction is run, at which point we split on that.
-          // - We get to the end of the queue; the fact that `next_base` is invalid means
-          //   that the last run decision is before `base_decision`, and so we're done.
+        end else if (req_split & prefix.base_decision < decisions_len) begin
+          // We only split if `base_decision` is within `decisions`, since we need to
+          // split on it. If it isn't, we continue until either:
+          // - An instruction is run, at which point `base_decision` now points to the
+          //   decision to do so and we can split on it.
+          // - We get to the end of the queue without running anything; that means
+          //   `base_decision` is still 1 past the end of `decisions`, and thus there are
+          //   no decisions we're allowed to backtrack and we're done.
           reset_prefix_bits = 1;
-          update_base = 1;
+          // Increment `base_decision` now, since we immediately start sending `prefix`
+          // and need it to be correct.
+          //
+          // This isn't necessarily what we actually want the new `prefix.base_decision`
+          // to be, but we correct that later.
+          next_base_decision = prefix.base_decision + 1;
           next_state = SPLIT;
         end else begin
           // We always want to try and advance; but if it turns out we need to backtrack,
@@ -721,13 +710,9 @@ module core (
           // We always pause immediately upon request.
           reset_prefix_bits = 1;
           next_state = PAUSE;
-        end else if (req_split & next_base_valid) begin
-          // We only split if `next_base` is valid. If it isn't, we continue until either:
-          // - An instruction is run, at which point we split on that.
-          // - We get to the end of the queue; the fact that `next_base` is invalid means
-          //   that the last run decision is before `base_decision`, and so we're done.
+        end else if (req_split & prefix.base_decision < decisions_len) begin
           reset_prefix_bits = 1;
-          update_base = 1;
+          next_base_decision = prefix.base_decision + 1;
           next_state = SPLIT;
         end else begin
           if (target_parent.decision_index < prefix.base_decision) begin
@@ -737,6 +722,14 @@ module core (
           end else begin
             backtrack  = 1;
             next_state = RUN;
+
+            if (target_parent.decision_index == prefix.base_decision) begin
+              // The base decision is being backtracked, and so it doesn't really make sense
+              // to call it the base decision anymore. What being the base decision means is
+              // that it's the earliest decision that we need to backtrack; but we've just
+              // backtracked it, so its role has been fulfilled.
+              next_base_decision = prefix.base_decision + 1;
+            end
           end
         end
       end
@@ -760,12 +753,14 @@ module core (
       end
 
       SOLUTION: begin
+        // `decisions` is always meant to contain at least one 1 at the start for
+        // running the first instruction, and so `decisions_len` should only ever be 0
+        // while we're receiving.
+        assert (decisions_len != 0);
+
         sending = 1;
         inc_decision_index = prefix_bits_left == 0;
-        if (
-          (prefix_bits_left == 0 & decision_index == decisions_len - 1)
-          | (prefix_bits_left == 1 & decisions_len == 0)
-        ) begin
+        if (prefix_bits_left == 0 & decision_index == decisions_len - 1) begin
           // We've just written out the last decision (if it was a decision in the first
           // place), and so we can go back to running.
           out_last   = 1;
@@ -774,46 +769,47 @@ module core (
       end
 
       SPLIT: begin
-        if (prefix_bits_left > 0 | decision_index < prefix.base_decision) begin
-          sending = 1;
-          inc_decision_index = prefix_bits_left == 0;
-          if (prefix_bits_left == 0 & decision_index == prefix.base_decision - 1) begin
-            // Aha, here's the decision we're splitting on.
+        assert (decisions_len != 0);
+        inc_decision_index = prefix_bits_left == 0;
+        sending = prefix_bits_left > 0 | decision_index < prefix.base_decision;
+
+        if (prefix_bits_left == 0) begin
+          if (decision_index == prefix.base_decision - 1) begin
+            // Aha, here's the decision we're splitting on (the old `prefix.base_decision`;
+            // we incremented it before entering SPLIT state).
+            //
             // Change it to 0 for the new finder, and then leave it to try all the
             // combinations of the rest of the decisions.
             out_data = 0;
             out_last = 1;
-            // We just set `prefix.base_decision` to `next_base`, which should be the index
-            // of a 1.
-            assert (decisions.rd_data == 1);
-          end
-        end else begin
-          // We've already finished sending, but we need to go through the rest of the
-          // decisions to find out what the new `next_base` is (if any).
-          inc_decision_index = 1;
-          if (decisions.rd_data == 1) begin
-            // Great, we found it. Stop here.
-            update_next_base = 1;
-            inc_decision_index = 0;
-            next_state = RUN;
-          end
-        end
 
-        // No matter what, if we reach the end of the list of decisions we're done.
-        if (prefix_bits_left == 0 & decision_index == decisions_len - 1) begin
-          // It's a bit sketchy to increment `decision_index` past the end of `decisions`.
-          inc_decision_index = 0;
-          next_state = RUN;
+            // We don't stop yet though, because `prefix.base_decision` might not point to a
+            // 1 and so we need to keep going until we find one.
+          end
+
+          if (decision_index >= prefix.base_decision & decisions.rd_data == 1) begin
+            // Great, we've found a 1 to set `base_decision` to. Stop here.
+            next_base_decision = decision_index;
+            next_state = was_backtrack ? BACKTRACK : RUN;
+          end else if (decision_index == decisions_len - 1) begin
+            // We've gone through all the decisions without finding any 1s to make
+            // `prefix.base_decision` point to, which means it needs to be 1 past the end of
+            // `decisions`.
+            next_base_decision = decisions_len;
+
+            // It's a bit sketchy to increment `decision_index` past the end of `decisions`.
+            inc_decision_index = 0;
+            next_state = was_backtrack ? BACKTRACK : RUN;
+          end
         end
       end
 
       PAUSE: begin
+        assert (decisions_len != 0);
+
         sending = 1;
         inc_decision_index = prefix_bits_left == 0;
-        if (
-          (prefix_bits_left == 0 & decision_index == decisions_len - 1)
-          | (prefix_bits_left == 1 & decisions_len == 0)
-        ) begin
+        if (prefix_bits_left == 0 & decision_index == decisions_len - 1) begin
           // We've just written out the last decision (if it was a decision in the first
           // place), and so now it's time to clear everything out ready for the next
           // finder.
@@ -860,6 +856,9 @@ module core (
     if (next_state == RUN & next_target_ref.parent >= next_run_stack_len) begin
       // Hang on a minute, we can't go into RUN state - we'd be trying to run an
       // instruction past the end of the queue.
+      //
+      // Stop `target_ref` from becoming invalid.
+      next_target_ref = target_ref;
       if (int'(run_stack_len) + int'(next_potential_len) >= AREA) begin
         // This has passed the first test for being a solution (there's enough run +
         // potential instructions to possibly cover the surfaces), so now we start the

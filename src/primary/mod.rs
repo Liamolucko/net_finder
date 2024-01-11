@@ -274,6 +274,9 @@ pub struct Finder<const CUBOIDS: usize> {
     /// `Finder` has its `base_index` incremented by one, and it's the new
     /// `Finder`'s job to explore all the possibilities where that
     /// instruction isn't run.
+    ///
+    /// Invariant: self.queue[self.base_index] either is past the end of the
+    /// queue, hasn't been processed yet, or has been run.
     base_index: usize,
 }
 
@@ -611,20 +614,30 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
 
     /// Runs this `Finder` until its decisions have changed.
     ///
-    /// Returns whether stepping was successful; if this returns `false`, the
-    /// finder is done.
-    pub fn step(&mut self, ctx: &FinderCtx<CUBOIDS>) -> bool {
+    /// Returns a tuple of `(solution, success)`.
+    ///
+    /// If backtracking was the cause of the change in decisions, `solution` is
+    /// a `FinderInfo` of the finder's state prior to backtracking if that state
+    /// was a possible solution. Otherwise, it's `None`.
+    ///
+    /// `success` indicates whether stepping was successful; if it's `false`,
+    /// the finder is done.
+    pub fn step(&mut self, ctx: &FinderCtx<CUBOIDS>) -> (Option<FinderInfo<CUBOIDS>>, bool) {
         let start_area = self.area();
+        let mut solution = None;
         while self.area() == start_area {
             if self.index < self.queue.len() {
                 self.handle_instruction(ctx);
             } else {
+                solution = self
+                    .possible_solution(ctx)
+                    .then(|| self.clone().into_info(ctx));
                 if !self.backtrack() {
-                    return false;
+                    return (solution, false);
                 }
             }
         }
-        true
+        (solution, true)
     }
 
     /// Returns the number of instructions in the queue that are currently run;
@@ -784,18 +797,16 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         }
     }
 
-    /// This method, which should be called when the end of the queue is
-    /// reached, goes through all of the unrun instructions to find which ones
-    /// are valid, and figures out which combinations of them result in a valid
-    /// net.
+    /// Returns whether taking the current state of this `Finder` and possibly
+    /// running some of its potential instructions might lead to a solution.
     ///
-    /// It also takes a `search_time` to be inserted into any `Solution`s it
-    /// yields.
-    fn finalize<'a>(&self, ctx: &'a FinderCtx<CUBOIDS>) -> Finalize<'a, CUBOIDS> {
+    /// It's not guaranteed this being `true` means there'll be a solution, but
+    /// it returns `false` in all the most common cases of there not being.
+    pub fn possible_solution(&self, ctx: &FinderCtx<CUBOIDS>) -> bool {
         if self.area() as usize + self.potential.len() < ctx.target_area {
             // If there aren't at least as many potential instructions as the number of
             // squares left to fill, there's no way that this could produce a valid net.
-            return Finalize::Known(None);
+            return false;
         }
 
         // First we make sure that there's at least one potential square that sets every
@@ -818,6 +829,21 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             .into_iter()
             .any(|filled| filled.num_filled() != u32::try_from(ctx.target_area).unwrap())
         {
+            return false;
+        }
+
+        true
+    }
+
+    /// This method, which should be called when the end of the queue is
+    /// reached, goes through all of the unrun instructions to find which ones
+    /// are valid, and figures out which combinations of them result in a valid
+    /// net.
+    ///
+    /// It also takes a `search_time` to be inserted into any `Solution`s it
+    /// yields.
+    fn finalize<'a>(&self, ctx: &'a FinderCtx<CUBOIDS>) -> Finalize<'a, CUBOIDS> {
+        if !self.possible_solution(ctx) {
             return Finalize::Known(None);
         }
 
@@ -847,46 +873,43 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     ///
     /// Returns `None` if this can't be done. However, this only happens if
     /// `self` is finished.
-    fn split(&mut self, ctx: &FinderCtx<CUBOIDS>) -> Option<Self> {
-        // Advance `self` to the end of its queue so that every instruction that can be
-        // completed is completed, and we can try to split on them.
-        while self.index < self.queue.len() {
+    pub fn split(&mut self, ctx: &FinderCtx<CUBOIDS>) -> Option<Self> {
+        // Try and run the instruction at `self.base_index` so that we can split on it.
+        while self.index <= self.base_index && self.index < self.queue.len() {
+            // Note that this will also increment `self.base_index` if that instruction
+            // happens to be invalid.
             self.handle_instruction(ctx);
         }
 
-        let mut new_base_index = self.base_index + 1;
-        // Find the first instruction that this `Finder` controls which has been run,
-        // since that's what gets tried first and so that means that the other
-        // possibility hasn't been tried yet.
-        while self
-            .queue
-            // Remember, the base index is the index of the first instruction _after_ the ones that
-            // are fixed, so the one we're attempting to fix is the one _before_ the base index.
-            .get(new_base_index - 1)
-            .is_some_and(|instruction| instruction.followup_index.is_none())
-        {
-            new_base_index += 1;
-        }
-        if new_base_index - 1 >= self.queue.len() {
-            // We couldn't find one, so this can't be split.
+        if self.base_index >= self.queue.len() {
+            // `self.base_index` is past the end of the queue, so we can't split on it.
             None
         } else {
             // Create the new `Finder` by backtracking this one until the instruction at
-            // `new_base_index - 1` hasn't been run.
+            // `self.base_index` hasn't been run.
             let mut new_finder = self.clone();
-            while new_finder.queue[new_base_index - 1]
-                .followup_index
-                .is_some()
-            {
+            while new_finder.queue[self.base_index].followup_index.is_some() {
                 new_finder.backtrack();
             }
 
-            self.base_index = new_base_index;
-            new_finder.base_index = new_base_index;
+            debug_assert_eq!(new_finder.index, self.base_index + 1);
+            new_finder.base_index = self.base_index + 1;
 
-            // Now `self` is responsible for the case where the instruction at
-            // `new_base_index` is run, and `new_finder` is responsible for the case where
-            // it isn't.
+            // Move `self.base_index` forwards to the first run instruction in
+            // `self.queue[self.base_index + 1..]`.
+            self.base_index = self
+                .queue
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i > self.base_index)
+                .find(|(_, instruction)| instruction.followup_index.is_some())
+                .map(|(i, _)| i)
+                // Or if there isn't one, the instruction we're going to process next.
+                .unwrap_or(self.index);
+
+            // Now `self` is responsible for the case where the instruction at the old value
+            // of `self.base_index` is run, and `new_finder` is responsible for the case
+            // where it isn't.
             Some(new_finder)
         }
     }

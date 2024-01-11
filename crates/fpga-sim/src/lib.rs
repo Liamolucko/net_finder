@@ -113,7 +113,7 @@ impl<'a> Core<'a> {
     ///
     /// Note that this doesn't create an implicit clock edge or anything like
     /// that; the clock is just another input.
-    fn update(&mut self) {
+    pub fn update(&mut self) {
         self.ctx.time_inc(1);
         unsafe { core_update(self.inner.ptr) }
     }
@@ -189,6 +189,8 @@ impl<'a> Core<'a> {
     ///
     /// Alternatively, it'll return if the core finishes running its finder, in
     /// which case this returns `false`.
+    ///
+    /// This will ignore any solutions the finder produces along the way.
     pub fn step(&mut self) -> bool {
         loop {
             if self.in_ready() {
@@ -271,20 +273,9 @@ impl<'a> Core<'a> {
         self.update();
     }
 
-    pub fn pause(&mut self, ctx: &FinderCtx<NUM_CUBOIDS>) -> Option<FinderInfo<NUM_CUBOIDS>> {
-        *self.req_pause() = true;
-        self.update();
-
-        // Wait until the core responds to our request to pause.
-        while !self.out_pause() {
-            if self.in_ready() {
-                // The core's in RECEIVE state, so it's never going to respond.
-                return None;
-            }
-            self.clock();
-        }
-
-        // Then read the bits it sends.
+    /// Receives a finder from the core.
+    fn recv_finder(&mut self, ctx: &FinderCtx<NUM_CUBOIDS>) -> FinderInfo<NUM_CUBOIDS> {
+        // First, receive the raw bits from the core.
         let mut finder_bits = Vec::new();
         *self.out_ready() = true;
         self.update();
@@ -338,11 +329,70 @@ impl<'a> Core<'a> {
                 .sum(),
         );
 
-        Some(FinderInfo {
+        FinderInfo {
             start_mapping: start_mapping.to_classes(&ctx.outer_square_caches),
             base_decision: take_bits(&mut finder_bits, clog2(4 * AREA)),
             decisions: finder_bits.collect(),
-        })
+        }
+    }
+
+    /// Waits for an 'event' to occur in the core, and returns it.
+    pub fn event(&mut self, ctx: &FinderCtx<NUM_CUBOIDS>) -> Event {
+        loop {
+            match (
+                self.stepping(),
+                self.out_solution(),
+                self.out_split(),
+                self.out_pause(),
+                self.in_ready(),
+            ) {
+                (false, false, false, false, false) => {
+                    // Nothing's happened, wait another clock cycle.
+                    self.clock();
+                }
+                (true, false, false, false, false) => {
+                    // A step has occured.
+                    self.clock();
+                    return Event::Step;
+                }
+                (false, true, false, false, false) => {
+                    // The core's outputting a solution, receive and return it.
+                    return Event::Solution(self.recv_finder(ctx));
+                }
+                (false, false, true, false, false) => {
+                    // The core's splitting its finder in half, receive the second half and return
+                    // it.
+                    return Event::Split(self.recv_finder(ctx));
+                }
+                (false, false, false, true, false) => {
+                    // The core's pausing, receive its finder and return it.
+                    return Event::Pause(self.recv_finder(ctx));
+                }
+                (false, false, false, false, true) => {
+                    // The core's stopped (or had already stopped).
+                    return Event::Receiving;
+                }
+                _ => unreachable!("more than one event happening simultaneously"),
+            }
+        }
+    }
+
+    /// Pauses this `core` and returns the finder it was running, or `None` if
+    /// it wasn't running anything.
+    ///
+    /// Any solutions the `core` produces before pausing are ignored.
+    pub fn pause(&mut self, ctx: &FinderCtx<NUM_CUBOIDS>) -> Option<FinderInfo<NUM_CUBOIDS>> {
+        *self.req_pause() = true;
+        self.update();
+
+        loop {
+            match self.event(ctx) {
+                Event::Step | Event::Solution(_) => {}
+                Event::Split(_) => unreachable!("core splitted unprompted"),
+                Event::Pause(info) => return Some(info),
+                Event::Receiving => return None,
+            }
+        }
     }
 }
 
@@ -350,6 +400,24 @@ impl Drop for Core<'_> {
     fn drop(&mut self) {
         unsafe { core_free(self.inner.ptr) }
     }
+}
+
+/// An event returned by `Core::event`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Event {
+    /// The core's list of decisions has changed.
+    Step,
+    /// The core's found a possible solution; the state where it found that
+    /// solution is given here.
+    Solution(FinderInfo<NUM_CUBOIDS>),
+    /// The core's split its finder in two; it's continuing to run one half, and
+    /// the other half is given here.
+    Split(FinderInfo<NUM_CUBOIDS>),
+    /// The core's paused itself; it had the contained state when it did so.
+    Pause(FinderInfo<NUM_CUBOIDS>),
+    /// The core's finished running anything it was running and is now waiting
+    /// to receive a new finder.
+    Receiving,
 }
 
 fn clog2(x: usize) -> u32 {

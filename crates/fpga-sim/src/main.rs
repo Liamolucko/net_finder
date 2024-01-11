@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use net_finder::{Class, ClassMapping, Finder, FinderCtx, FinderInfo};
-use net_finder_fpga_sim::{Core, VerilatedContext, CUBOIDS};
+use net_finder_fpga_sim::{Core, Event, VerilatedContext, CUBOIDS};
 use pretty_assertions::assert_eq;
 
 #[derive(Parser)]
@@ -19,17 +19,28 @@ fn main() -> anyhow::Result<()> {
     core.reset();
 
     let info = FinderInfo {
-        start_mapping: ClassMapping::new([Class(143), Class(201), Class(200)]),
-        decisions: vec![true, false, false, true, false, false, false, false],
-        base_decision: NonZeroUsize::new(8).unwrap(),
+        start_mapping: ClassMapping::new([Class(132), Class(203), Class(200)]),
+        decisions: vec![true, true, true, true, false, true, true, true, true],
+        base_decision: NonZeroUsize::new(1).unwrap(),
     };
 
     let ctx = FinderCtx::new(CUBOIDS, Duration::ZERO)?;
     let mut finder = Finder::new(&ctx, &info)?;
 
     core.load_finder(&ctx, &info);
-    for _ in 0..args.steps {
-        let finder_success = finder.step(&ctx);
+
+    for step in 0..args.steps {
+        if step == 0 {
+            *core.req_split() = true;
+            core.update();
+            while !matches!(core.event(&ctx), Event::Split(_)) {}
+            *core.req_split() = false;
+            core.update();
+
+            finder.split(&ctx);
+        }
+
+        let (_, finder_success) = finder.step(&ctx);
 
         *core.out_ready() = true;
         let core_success = core.step();
@@ -75,7 +86,7 @@ fn main() -> anyhow::Result<()> {
 
         assert_eq!(core_info, finder_info);
     } else {
-        assert!(!finder.step(&ctx));
+        assert!(!finder.step(&ctx).1);
     }
 
     Ok(())

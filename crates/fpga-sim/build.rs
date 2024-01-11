@@ -14,6 +14,7 @@ fn main() -> anyhow::Result<()> {
         .arg(&out_dir)
         .arg("--relative-includes")
         .arg("--trace-fst")
+        .arg("--assert")
         .arg("-Wno-fatal");
     if env::var_os("CARGO_CFG_FUZZING").is_some() {
         // Mimic the flags `cargo fuzz` passes to `rustc`:
