@@ -449,16 +449,19 @@ module core (
 
   always_ff @(posedge clk or posedge reset) begin
     if (reset | sync_reset) begin
-      potential_len <= 0;
+      potential_len   <= 0;
       potential_index <= 0;
     end else begin
-      if (advance & vc.instruction_valid & !(|vc.neighbours_valid)) begin
-        // We're advancing, and the instruction is valid but none of its neighbours are;
-        // that means this is a potential instruction. Add it to the list.
-        potential_buf[potential_len] <= target_ref;
-      end
       potential_len   <= next_potential_len;
       potential_index <= next_potential_index;
+    end
+  end
+
+  always_ff @(posedge clk) begin
+    if (advance & vc.instruction_valid & !(|vc.neighbours_valid)) begin
+      // We're advancing, and the instruction is valid but none of its neighbours are;
+      // that means this is a potential instruction. Add it to the list.
+      potential_buf[potential_len] <= target_ref;
     end
   end
 
