@@ -625,6 +625,7 @@ module core (
     advance = 0;
     run = 0;
     backtrack = 0;
+    inc_decision_index = 0;
     sending = 0;
     reset_prefix_bits = 0;
 
