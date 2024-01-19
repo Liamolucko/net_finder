@@ -59,6 +59,12 @@ module valid_checker (
 
     // The instruction to check the neighbours of.
     input instruction_t   instruction,
+    // What `instruction`'s (probably) going to be next clock cycle, so that part of
+    // next clock cycle's work can be precomputed using it.
+    //
+    // If this turns out to be wrong, `run` and `backtrack` must not be asserted on
+    // the next clock cycle.
+    input instruction_t   next_instruction,
     input mapping_index_t start_mapping_index,
 
     // Whether `instruction` is being run and this `valid_checker`'s state needs to
@@ -105,9 +111,13 @@ module valid_checker (
 
   // Find out what the neighbours of `instruction` in each direction are.
   instruction_t neighbours[4];
+  instruction_t next_neighbours[4];
+
+  always_ff @(posedge clk) neighbours <= next_neighbours;
+
   always_comb begin
     for (int direction = 0; direction < 4; direction++) begin
-      neighbours[direction] = instruction_neighbour(instruction, direction[1:0]);
+      next_neighbours[direction] = instruction_neighbour(next_instruction, direction[1:0]);
     end
   end
 
