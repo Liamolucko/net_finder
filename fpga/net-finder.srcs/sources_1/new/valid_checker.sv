@@ -121,8 +121,6 @@ module valid_checker (
     end
   end
 
-  // verilator lint_off ASSIGNIN
-  // verilator lint_off PINMISSING
   // Check whether each neighbour is already queued by seeing if its bit is set on the net.
   genvar direction, shard, cuboid;
   generate
@@ -203,6 +201,7 @@ module valid_checker (
     // the same reason as before (module instances are weird).
     logic [CUBOIDS-1:0] neighbour_cursors_filled[4];
     for (cuboid = 0; cuboid < CUBOIDS; cuboid++) begin : gen_surfaces
+      square_t rd_addrs[4];
       surface ram (
           .clk(clk),
 
@@ -210,11 +209,14 @@ module valid_checker (
           .rw_wr_en(clear_mode ? int'(clear_index) < AREA : run | backtrack),
           // We want to set this bit to 1 when running and 0 when backtracking.
           .rw_wr_data(clear_mode ? 0 : run),
-          .rw_rd_data(instruction_cursors_filled[cuboid])
+          .rw_rd_data(instruction_cursors_filled[cuboid]),
+
+          .rd_addrs(rd_addrs),
+          .rd_data ()
       );
 
       for (direction = 0; direction < 4; direction++) begin : gen_neighbour_cursors_filled
-        assign ram.rd_addrs[direction] = neighbours[direction].mapping[cuboid].square;
+        assign rd_addrs[direction] = neighbours[direction].mapping[cuboid].square;
         assign neighbour_cursors_filled[direction][cuboid] = ram.rd_data[direction];
       end
     end
@@ -243,8 +245,6 @@ module valid_checker (
       end
     end
   endgenerate
-  // verilator lint_on ASSIGNIN
-  // verilator lint_on PINMISSING
 
   assign neighbours_valid = ~queued & ~filled & ~skipped;
 endmodule

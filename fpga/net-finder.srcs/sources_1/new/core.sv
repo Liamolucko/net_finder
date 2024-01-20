@@ -533,9 +533,6 @@ module core (
       .clear_index(clear_index)
   );
 
-  // verilator lint_off ASSIGNIN
-  // verilator lint_off PINMISSING
-
   // Instantiate RAMs used for keeping track of which squares on the surfaces are
   // filled by potential instructions.
   //
@@ -596,12 +593,14 @@ module core (
           ),
           .rw_rd_data(potential_surface_rd_datas[cuboid]),
           .rw_wr_data(potential_surface_wr_datas[cuboid]),
-          .rw_wr_en(potential_surface_wr_ens[cuboid])
+          .rw_wr_en(potential_surface_wr_ens[cuboid]),
+
+          // We don't need the read ports.
+          .rd_addrs(),
+          .rd_data ()
       );
     end
   endgenerate
-  // verilator lint_on ASSIGNIN
-  // verilator lint_on PINMISSING
 
   // When in SPLIT state, whether we were in BACKTRACK state before switching to
   // SPLIT state.
@@ -615,22 +614,17 @@ module core (
   state_t next_saved_state;
   always_ff @(posedge clk) saved_state <= next_saved_state;
 
-  // Use one big `always_comb` for most of our logic so that later steps can rely
-  // on the results of earlier steps without re-triggering earlier steps and
-  // creating cycles.
+  logic interrupted;
   always_comb begin
-    // Whether `target_parent`+`target` are going to be wrong on the next clock
-    // cycle (usually because of `predicted_target_ref` being wrong).
-    automatic logic invalid_target;
-    // Whether that matters for the state we're transitioning into.
-    automatic logic target_matters;
-
-    automatic logic interrupted = 0;
+    interrupted = 0;
     if (state == RUN | state == BACKTRACK) begin
       if (req_pause) begin
         // We always pause immediately upon request.
         interrupted = 1;
-      end else if (req_split & base_decision < decisions_len) begin
+      end else if (req_split & base_decision != decisions_len) begin
+        // `base_decision` should always be <= decisions_len, so the above != is just a
+        // faster way of checking <.
+        assert (base_decision < decisions_len);
         // We only split if `base_decision` is within `decisions`, since we need to
         // split on it. If it isn't, we continue until either:
         // - An instruction is run, at which point `base_decision` now points to the
@@ -641,7 +635,9 @@ module core (
         interrupted = 1;
       end
     end
+  end
 
+  always_comb begin
     // Do this out here to make sure `advance`/`backtrack` don't depend on
     // `instruction_valid`/`neighbours_valid`.
     advance   = 0;
@@ -652,82 +648,141 @@ module core (
       BACKTRACK: backtrack = !interrupted & target_parent.decision_index >= base_decision;
       default: ;
     endcase
+  end
 
-    sending = state == SOLUTION | state == SPLIT | state == PAUSE;
+  assign sending = state == SOLUTION | state == SPLIT | state == PAUSE;
 
-    // In parallel with the main `comb_main` that uses the outputs of
-    // `valid_checker`, we run another one where they're just hardcoded to 0. That
-    // way it can calculate `predicted_target_ref` at the same time as
-    // `valid_checker` is running.
-    comb_main(.interrupted(interrupted), .in_data(in_data), .in_valid(in_valid), .in_last(in_last),
-              .req_pause(req_pause), .req_split(req_split), .state(state),
-              .prefix_bits_left(prefix_bits_left), .prefix_out(prefix_out),
-              .base_decision(base_decision), .decisions_len(decisions_len),
-              .decisions_rd_data(decisions_rd_data), .decision_index(decision_index),
-              .run_stack_len(run_stack_len), .target_ref(target_ref), .target_parent(target_parent),
-              .last_child(last_child), .potential_len(potential_len), .clear_index(clear_index),
-              .potential_surface_rd_datas(potential_surface_rd_datas),
-              .potential_surface_counts(potential_surface_counts),
-              .potential_surfaces_clear_index(potential_surfaces_clear_index),
-              .was_backtrack(was_backtrack), .saved_state(saved_state), .advance(advance),
-              .backtrack(backtrack),
-              //
-              .next_potential_index(next_potential_index),
-              .next_potential_target(next_potential_target),
-              //
-              .instruction_valid(0),
-              .neighbours_valid(0),
-              //
-              .next_state(predicted_state),
-              .next_target_ref(predicted_target_ref),
-              //
-              // All these outputs will be overriden by the real `comb_main` in a sec.
-              .next_base_decision(next_base_decision), .decisions_wr_data(decisions_wr_data),
-              .decisions_wr_en(decisions_wr_en), .next_decisions_len(next_decisions_len),
-              .next_run_stack_len(next_run_stack_len), .next_potential_len(next_potential_len),
-              .potential_surface_wr_datas(potential_surface_wr_datas),
-              .potential_surface_wr_ens(potential_surface_wr_ens),
-              .next_potential_surface_counts(next_potential_surface_counts),
-              .next_saved_state(next_saved_state),
-              //
-              .in_ready(in_ready), .out_data(out_data), .out_valid(out_valid), .out_last(out_last),
-              .sync_reset(sync_reset), .run(run), .inc_decision_index(inc_decision_index),
-              .reset_prefix_bits(reset_prefix_bits));
+  // In parallel with the main `comb_main` that uses the outputs of
+  // `valid_checker`, we run another one where they're just hardcoded to 0. That
+  // way it can calculate `predicted_target_ref` at the same time as
+  // `valid_checker` is running.
+  vc_dependent dep_fake (
+      .interrupted(interrupted),
+      .in_data(in_data),
+      .in_valid(in_valid),
+      .in_last(in_last),
+      .state(state),
+      .prefix_bits_left(prefix_bits_left),
+      .prefix_out(prefix_out),
+      .base_decision(base_decision),
+      .decisions_len(decisions_len),
+      .decisions_rd_data(decisions_rd_data),
+      .decision_index(decision_index),
+      .run_stack_len(run_stack_len),
+      .target_ref(target_ref),
+      .target_parent(target_parent),
+      .last_child(last_child),
+      .potential_len(potential_len),
+      .clear_index(clear_index),
+      .potential_surface_rd_datas(potential_surface_rd_datas),
+      .potential_surface_counts(potential_surface_counts),
+      .potential_surfaces_clear_index(potential_surfaces_clear_index),
+      .was_backtrack(was_backtrack),
+      .saved_state(saved_state),
+      .advance(advance),
+      .backtrack(backtrack),
 
-    // Then run the one which does it properly.
-    comb_main(.interrupted(interrupted), .in_data(in_data), .in_valid(in_valid), .in_last(in_last),
-              .req_pause(req_pause), .req_split(req_split), .state(state),
-              .prefix_bits_left(prefix_bits_left), .prefix_out(prefix_out),
-              .base_decision(base_decision), .decisions_len(decisions_len),
-              .decisions_rd_data(decisions_rd_data), .decision_index(decision_index),
-              .run_stack_len(run_stack_len), .target_ref(target_ref), .target_parent(target_parent),
-              .last_child(last_child), .potential_len(potential_len), .clear_index(clear_index),
-              .potential_surface_rd_datas(potential_surface_rd_datas),
-              .potential_surface_counts(potential_surface_counts),
-              .potential_surfaces_clear_index(potential_surfaces_clear_index),
-              .was_backtrack(was_backtrack), .saved_state(saved_state), .advance(advance),
-              .backtrack(backtrack),
-              //
-              .next_potential_index(next_potential_index),
-              .next_potential_target(next_potential_target),
-              //
-              .instruction_valid(vc.instruction_valid),
-              .neighbours_valid(vc.neighbours_valid),
-              //
-              .next_state(next_state),
-              .next_target_ref(next_target_ref),
-              //
-              .next_base_decision(next_base_decision), .decisions_wr_data(decisions_wr_data),
-              .decisions_wr_en(decisions_wr_en), .next_decisions_len(next_decisions_len),
-              .next_run_stack_len(next_run_stack_len), .next_potential_len(next_potential_len),
-              .potential_surface_wr_datas(potential_surface_wr_datas),
-              .potential_surface_wr_ens(potential_surface_wr_ens),
-              .next_potential_surface_counts(next_potential_surface_counts),
-              .next_saved_state(next_saved_state),
-              //
-              .in_ready(in_ready), .out_data(out_data), .out_valid(out_valid), .out_last(out_last),
-              .sync_reset(sync_reset), .run(run), .inc_decision_index(inc_decision_index),
-              .reset_prefix_bits(reset_prefix_bits));
+      .next_potential_index (next_potential_index),
+      .next_potential_target(next_potential_target),
+
+      .instruction_valid(0),
+      .neighbours_valid (0),
+
+      .next_state(predicted_state),
+      .next_target_ref(predicted_target_ref),
+
+      // All these outputs will be overriden by the real `comb_main` in a sec.
+      .next_base_decision(),
+      .decisions_wr_data(),
+      .decisions_wr_en(),
+      .next_decisions_len(),
+      .next_run_stack_len(),
+      .next_potential_len(),
+      .potential_surface_wr_datas(),
+      .potential_surface_wr_ens(),
+      .next_potential_surface_counts(),
+      .next_saved_state(),
+
+      .in_ready(),
+      .out_data(),
+      .out_valid(),
+      .out_last(),
+      .sync_reset(),
+      .run(),
+      .inc_decision_index(),
+      .reset_prefix_bits()
+  );
+
+  // Then run the one which does it properly.
+  vc_dependent dep_real (
+      .interrupted(interrupted),
+      .in_data(in_data),
+      .in_valid(in_valid),
+      .in_last(in_last),
+      .state(state),
+      .prefix_bits_left(prefix_bits_left),
+      .prefix_out(prefix_out),
+      .base_decision(base_decision),
+      .decisions_len(decisions_len),
+      .decisions_rd_data(decisions_rd_data),
+      .decision_index(decision_index),
+      .run_stack_len(run_stack_len),
+      .target_ref(target_ref),
+      .target_parent(target_parent),
+      .last_child(last_child),
+      .potential_len(potential_len),
+      .clear_index(clear_index),
+      .potential_surface_rd_datas(potential_surface_rd_datas),
+      .potential_surface_counts(potential_surface_counts),
+      .potential_surfaces_clear_index(potential_surfaces_clear_index),
+      .was_backtrack(was_backtrack),
+      .saved_state(saved_state),
+      .advance(advance),
+      .backtrack(backtrack),
+
+      .next_potential_index (next_potential_index),
+      .next_potential_target(next_potential_target),
+
+      .instruction_valid(vc.instruction_valid),
+      .neighbours_valid (vc.neighbours_valid),
+
+      // A couple of these are left out so they can be assigned then overriden inside
+      // the below `always_comb`.
+      .next_state(),
+      .next_target_ref(next_target_ref),
+
+      .next_base_decision(),
+      .decisions_wr_data(decisions_wr_data),
+      .decisions_wr_en(decisions_wr_en),
+      .next_decisions_len(next_decisions_len),
+      .next_run_stack_len(next_run_stack_len),
+      .next_potential_len(next_potential_len),
+      .potential_surface_wr_datas(potential_surface_wr_datas),
+      .potential_surface_wr_ens(potential_surface_wr_ens),
+      .next_potential_surface_counts(next_potential_surface_counts),
+      .next_saved_state(),
+
+      .in_ready(in_ready),
+      .out_data(out_data),
+      .out_valid(out_valid),
+      .out_last(out_last),
+      .sync_reset(sync_reset),
+      .run(run),
+      .inc_decision_index(inc_decision_index),
+      .reset_prefix_bits()
+  );
+
+  always_comb begin
+    // Whether `target_parent`+`target` are going to be wrong on the next clock
+    // cycle (usually because of `predicted_target_ref` being wrong).
+    automatic logic invalid_target;
+    // Whether that matters for the state we're transitioning into.
+    automatic logic target_matters;
+
+    next_state = dep_real.next_state;
+    next_base_decision = dep_real.next_base_decision;
+    next_saved_state = dep_real.next_saved_state;
+    reset_prefix_bits = dep_real.reset_prefix_bits;
 
     next_was_backtrack = was_backtrack;
     if (interrupted) begin
@@ -770,21 +825,30 @@ module core (
 endmodule
 
 // All of our combinational logic that might depend on the outputs of `valid_checker`.
-function automatic void comb_main(
+module vc_dependent (
     // Whether `req_pause` or `req_split` caused us to not advance/backtrack.
-    logic interrupted,
+    input logic interrupted,
     //
-    input logic in_data, input logic in_valid, input logic in_last, input logic req_pause,
-    input logic req_split, input state_t state,
-    input logic [$clog2($bits(prefix_t)+1)-1:0] prefix_bits_left, input logic prefix_out,
-    input decision_index_t base_decision, input logic [$clog2(4*AREA+1)-1:0] decisions_len,
-    input logic decisions_rd_data, input decision_index_t decision_index,
-    input logic [$clog2(AREA+1)-1:0] run_stack_len, input instruction_ref_t target_ref,
-    input run_stack_entry_t target_parent, input logic last_child,
-    input potential_index_t potential_len, input logic [2*COORD_BITS-3:0] clear_index,
+    input logic in_data,
+    input logic in_valid,
+    input logic in_last,
+    input state_t state,
+    input logic [$clog2($bits(prefix_t)+1)-1:0] prefix_bits_left,
+    input logic prefix_out,
+    input decision_index_t base_decision,
+    input logic [$clog2(4*AREA+1)-1:0] decisions_len,
+    input logic decisions_rd_data,
+    input decision_index_t decision_index,
+    input logic [$clog2(AREA+1)-1:0] run_stack_len,
+    input instruction_ref_t target_ref,
+    input run_stack_entry_t target_parent,
+    input logic last_child,
+    input potential_index_t potential_len,
+    input logic [2*COORD_BITS-3:0] clear_index,
     input logic [CUBOIDS-1:0] potential_surface_rd_datas,
     input logic [$clog2(AREA+1)-1:0] potential_surface_counts[CUBOIDS],
-    input square_t potential_surfaces_clear_index, input logic was_backtrack,
+    input square_t potential_surfaces_clear_index,
+    input logic was_backtrack,
     input state_t saved_state,
     input logic advance,
     input logic backtrack,
@@ -798,8 +862,10 @@ function automatic void comb_main(
     output state_t next_state,
     output instruction_ref_t next_target_ref,
     //
-    output decision_index_t next_base_decision, output logic decisions_wr_data,
-    output logic decisions_wr_en, output logic [$clog2(4*AREA+1)-1:0] next_decisions_len,
+    output decision_index_t next_base_decision,
+    output logic decisions_wr_data,
+    output logic decisions_wr_en,
+    output logic [$clog2(4*AREA+1)-1:0] next_decisions_len,
     output logic [$clog2(AREA+1)-1:0] next_run_stack_len,
     output potential_index_t next_potential_len,
     output logic [CUBOIDS-1:0] potential_surface_wr_datas,
@@ -807,370 +873,386 @@ function automatic void comb_main(
     output logic [$clog2(AREA+1)-1:0] next_potential_surface_counts[CUBOIDS],
     output state_t next_saved_state,
     //
-    output logic in_ready, output logic out_data, output logic out_valid, output logic out_last,
-    output logic sync_reset, output logic run, output logic inc_decision_index,
-    output logic reset_prefix_bits);
-  in_ready = 0;
-  // This is almost always what it should be set to, except when we override it to 0 during splitting.
-  out_data = prefix_bits_left > 0 ? prefix_out : decisions_rd_data;
-  out_valid = 0;
-  out_last = 0;
+    output logic in_ready,
+    output logic out_data,
+    output logic out_valid,
+    output logic out_last,
+    output logic sync_reset,
+    output logic run,
+    output logic inc_decision_index,
+    output logic reset_prefix_bits
+);
+  always_comb begin
+    automatic logic clearing = 'x;
+    automatic instruction_ref_t to_backtrack = 'x;
+    automatic decision_index_t last_run = 'x;
+    automatic logic maybe_solution = 'x;
 
-  sync_reset = 0;
-  run = 0;
-  inc_decision_index = 0;
-  reset_prefix_bits = 0;
+    in_ready = 0;
+    // This is almost always what it should be set to, except when we override it to 0 during splitting.
+    out_data = prefix_bits_left > 0 ? prefix_out : decisions_rd_data;
+    out_valid = 0;
+    out_last = 0;
 
-  // By default, stay in the current state.
-  next_state = state;
-  next_base_decision = base_decision;
-  next_saved_state = saved_state;
+    sync_reset = 0;
+    run = 0;
+    inc_decision_index = 0;
+    reset_prefix_bits = 0;
 
-  case (state)
-    CLEAR: begin
-      if (int'(clear_index) == NET_LEN / 4 - 1) begin
-        // We're about to clear the last bit of the net, in which case we're done clearing.
-        next_state = RECEIVE;
-      end
-    end
+    // By default, stay in the current state.
+    next_state = state;
+    next_base_decision = base_decision;
+    next_saved_state = saved_state;
 
-    RECEIVE: begin
-      if (prefix_bits_left == 0 & in_valid) begin
-        // We have a decision to process, so no matter what we'll be advancing past this
-        // instruction.
-        if (instruction_valid & |neighbours_valid) begin
-          // The instruction's valid and isn't a potential instruction, which means that
-          // whether we run it's a decision and we can consume one.
-          in_ready = 1;
-          run = in_data;
-        end
-      end else begin
-        // We always immediately read the prefix.
-        in_ready = 1;
-        // The finder shouldn't cut off partway through receiving the prefix.
-        assert (!(in_valid & in_last));
-      end
-
-      if (in_valid & in_ready & in_last) begin
-        // Note: this will get overridden later if there's no next instruction to run.
-        next_state = RUN;
-      end
-    end
-
-    RUN: begin
-      // Note: this is violated when running the first instruction, however that
-      // should always happen inside RECEIVE state not RUN state.
-      assert (target_ref.parent < run_stack_len);
-
-      if (!interrupted) begin
-        if (instruction_valid & |neighbours_valid) begin
-          // The instruction's valid and isn't a potential instruction, run it.
-          run = 1;
+    case (state)
+      CLEAR: begin
+        if (int'(clear_index) == NET_LEN / 4 - 1) begin
+          // We're about to clear the last bit of the net, in which case we're done clearing.
+          next_state = RECEIVE;
         end
       end
 
-      // No, we don't just stay in RUN state forever; there's some code later which
-      // overrides next_state from RUN to CHECK_WAIT/CHECK/BACKTRACK (or even issues a
-      // synchronous reset) if we're at the end of the queue.
-    end
-
-    BACKTRACK: begin
-      assert (target_ref.parent == run_stack_len - 1);
-
-      if (!interrupted) begin
-        if (target_parent.decision_index < base_decision) begin
-          // Hold up, we're about to try and backtrack an decision that it isn't this
-          // finder's job to try both options of. That means we're done!
-          sync_reset = 1;
+      RECEIVE: begin
+        if (prefix_bits_left == 0 & in_valid) begin
+          // We have a decision to process, so no matter what we'll be advancing past this
+          // instruction.
+          if (instruction_valid & |neighbours_valid) begin
+            // The instruction's valid and isn't a potential instruction, which means that
+            // whether we run it's a decision and we can consume one.
+            in_ready = 1;
+            run = in_data;
+          end
         end else begin
-          next_state = RUN;
+          // We always immediately read the prefix.
+          in_ready = 1;
+          // The finder shouldn't cut off partway through receiving the prefix.
+          assert (!(in_valid & in_last));
+        end
 
-          if (target_parent.decision_index == base_decision) begin
-            // The base decision is being backtracked, and so it doesn't really make sense
-            // to call it the base decision anymore. What being the base decision means is
-            // that it's the earliest decision that we need to backtrack; but we've just
-            // backtracked it, so its role has been fulfilled.
-            next_base_decision = base_decision + 1;
+        if (in_valid & in_ready & in_last) begin
+          // Note: this will get overridden later if there's no next instruction to run.
+          next_state = RUN;
+        end
+      end
+
+      RUN: begin
+        // Note: this is violated when running the first instruction, however that
+        // should always happen inside RECEIVE state not RUN state.
+        assert (target_ref.parent < run_stack_len);
+
+        if (!interrupted) begin
+          if (instruction_valid & |neighbours_valid) begin
+            // The instruction's valid and isn't a potential instruction, run it.
+            run = 1;
+          end
+        end
+
+        // No, we don't just stay in RUN state forever; there's some code later which
+        // overrides next_state from RUN to CHECK_WAIT/CHECK/BACKTRACK (or even issues a
+        // synchronous reset) if we're at the end of the queue.
+      end
+
+      BACKTRACK: begin
+        assert (target_ref.parent == run_stack_len - 1);
+
+        if (!interrupted) begin
+          if (target_parent.decision_index < base_decision) begin
+            // Hold up, we're about to try and backtrack an decision that it isn't this
+            // finder's job to try both options of. That means we're done!
+            sync_reset = 1;
+          end else begin
+            next_state = RUN;
+
+            if (target_parent.decision_index == base_decision) begin
+              // The base decision is being backtracked, and so it doesn't really make sense
+              // to call it the base decision anymore. What being the base decision means is
+              // that it's the earliest decision that we need to backtrack; but we've just
+              // backtracked it, so its role has been fulfilled.
+              next_base_decision = base_decision + 1;
+            end
           end
         end
       end
-    end
 
-    CHECK_WAIT: begin
-      automatic logic clearing = 0;
-      for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-        if (potential_surface_counts[cuboid] != 0) begin
-          clearing = 1;
+      CHECK_WAIT: begin
+        clearing = 0;
+        for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
+          if (potential_surface_counts[cuboid] != 0) begin
+            clearing = 1;
+          end
+        end
+
+        if (!clearing) begin
+          next_state = CHECK;
         end
       end
 
-      if (!clearing) begin
-        next_state = CHECK;
+      CHECK: begin
+        // All the actual logic for this state happens down below, when checking for
+        // `next_state == CHECK`.
+      end
+
+      SOLUTION: begin
+        // `decisions` is always meant to contain at least one 1 at the start for
+        // running the first instruction, and so `decisions_len` should only ever be 0
+        // while we're receiving.
+        assert (decisions_len != 0);
+
+        out_valid = 1;
+        inc_decision_index = prefix_bits_left == 0;
+        if (prefix_bits_left == 0 & decision_index == decisions_len - 1) begin
+          // We've just written out the last decision (if it was a decision in the first
+          // place), and so we can go back to running.
+          out_last   = 1;
+          next_state = BACKTRACK;
+        end
+      end
+
+      STALL: begin
+        next_state = saved_state;
+      end
+
+      SPLIT: begin
+        assert (decisions_len != 0);
+        inc_decision_index = prefix_bits_left == 0;
+        out_valid = prefix_bits_left > 0 | decision_index < base_decision;
+
+        if (prefix_bits_left == 0) begin
+          if (decision_index == base_decision - 1) begin
+            // Aha, here's the decision we're splitting on (the old `prefix.base_decision`;
+            // we incremented it before entering SPLIT state).
+            //
+            // Change it to 0 for the new finder, and then leave it to try all the
+            // combinations of the rest of the decisions.
+            out_data = 0;
+            out_last = 1;
+
+            // We don't stop yet though, because `prefix.base_decision` might not point to a
+            // 1 and so we need to keep going until we find one.
+          end
+
+          if (decision_index >= base_decision & decisions_rd_data == 1) begin
+            // Great, we've found a 1 to set `base_decision` to. Stop here.
+            next_base_decision = decision_index;
+            next_state = was_backtrack ? BACKTRACK : RUN;
+          end else if (decision_index == decisions_len - 1) begin
+            // We've gone through all the decisions without finding any 1s to make
+            // `prefix.base_decision` point to, which means it needs to be 1 past the end of
+            // `decisions`.
+            next_base_decision = decisions_len;
+
+            // It's a bit sketchy to increment `decision_index` past the end of `decisions`.
+            inc_decision_index = 0;
+            next_state = was_backtrack ? BACKTRACK : RUN;
+          end
+        end
+      end
+
+      PAUSE: begin
+        assert (decisions_len != 0);
+
+        out_valid = 1;
+        inc_decision_index = prefix_bits_left == 0;
+        if (prefix_bits_left == 0 & decision_index == decisions_len - 1) begin
+          // We've just written out the last decision (if it was a decision in the first
+          // place), and so now it's time to clear everything out ready for the next
+          // finder.
+          out_last   = 1;
+          sync_reset = 1;
+          // This is overriden by `sync_reset` but eh, may as well specify it anyway.
+          next_state = CLEAR;
+        end
+      end
+      default: ;
+    endcase
+
+    if (advance) begin
+      if (run_stack_len == 0) begin
+        // We're running the first instruction, and so the next one we should look at is
+        // its first child.
+        next_target_ref = '{parent: 0, child_index: 0};
+      end else if (last_child) begin
+        next_target_ref = '{parent: target_ref.parent + 1, child_index: 0};
+      end else begin
+        next_target_ref = '{parent: target_ref.parent, child_index: target_ref.child_index + 1};
+      end
+    end else if (backtrack) begin
+      // We want to backtrack the last instruction in the run stack (which should
+      // always be `target_parent` when backtracking), and then our next target is
+      // the instruction after it in the queue.
+      to_backtrack = target_parent.instruction_ref;
+      if (to_backtrack.child_index == 3) begin
+        // The instruction we're backtracking was the last child of its parent, and so
+        // the instruction after it that we want to try next is the first child of the
+        // next instruction.
+        next_target_ref = '{parent: to_backtrack.parent + 1, child_index: 0};
+      end else begin
+        // Otherwise it's the next child of the same parent.
+        next_target_ref = '{
+            parent: to_backtrack.parent,
+            child_index: to_backtrack.child_index + 1
+        };
+      end
+    end else begin
+      next_target_ref = target_ref;
+    end
+
+    if (state == SOLUTION | state == SPLIT | state == PAUSE) begin
+      // We're just reading from `decisions`.
+      decisions_wr_data = 'x;
+      decisions_wr_en = 0;
+      next_decisions_len = decisions_len;
+    end else if (backtrack) begin
+      // To backtrack, we find the last 1 in `decisions`, turn it into a 0, and get
+      // rid of all the decisions after it.
+      // The last 1 is just the decision associated with the last instruction we ran
+      // (which we always set `target_parent` when backtracking), and so we can
+      // retrieve its index from there.
+      last_run = target_parent.decision_index;
+      decisions_wr_data = 0;
+      decisions_wr_en = 1;
+      next_decisions_len = last_run + 1;
+    end else if (prefix_bits_left == 0 & in_valid & in_ready) begin
+      decisions_wr_data = in_data;
+      decisions_wr_en = 1;
+      next_decisions_len = decisions_len + 1;
+    end else if (advance & instruction_valid & |neighbours_valid) begin
+      // This instruction is valid to run and isn't a potential instruction, which
+      // means that whether or not we run it is a decision. Add it to the list.
+      // Note that the only scenario where we don't run it here is when receiving a
+      // finder.
+      decisions_wr_data = run;
+      decisions_wr_en = 1;
+      next_decisions_len = decisions_len + 1;
+    end else begin
+      decisions_wr_data = 'x;
+      decisions_wr_en = 0;
+      next_decisions_len = decisions_len;
+    end
+
+    if (run) begin
+      next_run_stack_len = run_stack_len + 1;
+    end else if (backtrack) begin
+      next_run_stack_len = run_stack_len - 1;
+    end else begin
+      next_run_stack_len = run_stack_len;
+    end
+
+    if (advance & instruction_valid & !(|neighbours_valid)) begin
+      // We're advancing, and the instruction is valid but none of its neighbours are;
+      // that means this is a potential instruction. Add it to the list.
+      next_potential_len = potential_len + 1;
+    end else if (backtrack) begin
+      // Reset `potential_len` to whatever it was when the instruction we're
+      // backtracking was run.
+      next_potential_len = target_parent.potential_len;
+    end else begin
+      next_potential_len = potential_len;
+    end
+
+    for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
+      automatic logic rd_data = potential_surface_rd_datas[cuboid];
+      automatic logic wr_data;
+      automatic logic wr_en;
+      if (state == CLEAR) begin
+        wr_data = 0;
+        wr_en   = int'(clear_index) < AREA;
+      end else if (state == CHECK) begin
+        wr_data = 1;
+        wr_en   = instruction_valid;
+      end else begin
+        wr_data = 0;
+        wr_en   = int'(potential_surfaces_clear_index) < AREA;
+      end
+
+      potential_surface_wr_datas[cuboid] = wr_data;
+      potential_surface_wr_ens[cuboid]   = wr_en;
+
+      if (state == CLEAR) begin
+        // Don't update the count when in `CLEAR` state because it's currently bogus.
+        // Just keep it as 0, which will eventually become correct once we're done
+        // clearing.
+        next_potential_surface_counts[cuboid] = 0;
+      end else if (rd_data == 0 & wr_data == 1 & wr_en) begin
+        next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid] + 1;
+      end else if (rd_data == 1 & wr_data == 0 & wr_en) begin
+        next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid] - 1;
+      end else begin
+        next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid];
       end
     end
 
-    CHECK: begin
-      // All the actual logic for this state happens down below, when checking for
-      // `next_state == CHECK`.
-    end
+    if (next_state == RUN & next_target_ref.parent >= next_run_stack_len) begin
+      // Hang on a minute, we can't go into RUN state - we'd be trying to run an
+      // instruction past the end of the queue.
+      //
+      // Stop `target_ref` from becoming invalid.
+      next_target_ref = target_ref;
+      if (int'(run_stack_len) + int'(next_potential_len) >= AREA) begin
+        // This has passed the first test for being a solution (there's enough run +
+        // potential instructions to possibly cover the surfaces), so now we start the
+        // next test of whether every square has at least 1 instruction that fills it.
 
-    SOLUTION: begin
-      // `decisions` is always meant to contain at least one 1 at the start for
-      // running the first instruction, and so `decisions_len` should only ever be 0
-      // while we're receiving.
-      assert (decisions_len != 0);
+        // Except if we're still clearing `potential_surfaces`. In that case we go into
+        // CHECK_WAIT state until we're done.
+        clearing = 0;
+        for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
+          if (potential_surface_counts[cuboid] != 0) begin
+            clearing = 1;
+          end
+        end
 
-      out_valid = 1;
-      inc_decision_index = prefix_bits_left == 0;
-      if (prefix_bits_left == 0 & decision_index == decisions_len - 1) begin
-        // We've just written out the last decision (if it was a decision in the first
-        // place), and so we can go back to running.
-        out_last   = 1;
+        if (clearing) begin
+          next_state = CHECK_WAIT;
+        end else begin
+          next_state = CHECK;
+        end
+      end else begin
         next_state = BACKTRACK;
       end
     end
 
-    STALL: begin
-      next_state = saved_state;
-    end
-
-    SPLIT: begin
-      assert (decisions_len != 0);
-      inc_decision_index = prefix_bits_left == 0;
-      out_valid = prefix_bits_left > 0 | decision_index < base_decision;
-
-      if (prefix_bits_left == 0) begin
-        if (decision_index == base_decision - 1) begin
-          // Aha, here's the decision we're splitting on (the old `prefix.base_decision`;
-          // we incremented it before entering SPLIT state).
-          //
-          // Change it to 0 for the new finder, and then leave it to try all the
-          // combinations of the rest of the decisions.
-          out_data = 0;
-          out_last = 1;
-
-          // We don't stop yet though, because `prefix.base_decision` might not point to a
-          // 1 and so we need to keep going until we find one.
+    // This goes here instead of when we're already in `CHECK` state so that we
+    // don't go into `CHECK` state when `potential_len == 0`.
+    if (next_state == CHECK) begin
+      if (next_potential_index >= next_potential_len) begin
+        // We're about to advance to an invalid index, so stop now.
+        maybe_solution = 1;
+        for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
+          // Use `next_potential_surface_counts` to make sure we take into account the
+          // last potential instruction.
+          if (int'(run_stack_len) + int'(next_potential_surface_counts[cuboid]) != AREA) begin
+            maybe_solution = 0;
+          end
         end
 
-        if (decision_index >= base_decision & decisions_rd_data == 1) begin
-          // Great, we've found a 1 to set `base_decision` to. Stop here.
-          next_base_decision = decision_index;
-          next_state = was_backtrack ? BACKTRACK : RUN;
-        end else if (decision_index == decisions_len - 1) begin
-          // We've gone through all the decisions without finding any 1s to make
-          // `prefix.base_decision` point to, which means it needs to be 1 past the end of
-          // `decisions`.
-          next_base_decision = decisions_len;
-
-          // It's a bit sketchy to increment `decision_index` past the end of `decisions`.
-          inc_decision_index = 0;
-          next_state = was_backtrack ? BACKTRACK : RUN;
+        if (maybe_solution) begin
+          reset_prefix_bits = 1;
+          next_state = SOLUTION;
+        end else begin
+          next_state = BACKTRACK;
+        end
+      end else begin
+        if (next_potential_index == potential_len) begin
+          // The potential instruction at `next_potential_index` is only being added to
+          // `potential_buf` on the next clock edge, so we can't get it from there;
+          // instead just set it to `target_ref` directly.
+          next_target_ref = target_ref;
+        end else begin
+          next_target_ref = next_potential_target;
         end
       end
     end
 
-    PAUSE: begin
-      assert (decisions_len != 0);
-
-      out_valid = 1;
-      inc_decision_index = prefix_bits_left == 0;
-      if (prefix_bits_left == 0 & decision_index == decisions_len - 1) begin
-        // We've just written out the last decision (if it was a decision in the first
-        // place), and so now it's time to clear everything out ready for the next
-        // finder.
-        out_last   = 1;
+    if (next_state == BACKTRACK) begin
+      if (next_run_stack_len == 0) begin
+        // We're trying to backtrack when there are no instructions left to backtrack;
+        // that means we're done.
         sync_reset = 1;
-        // This is overriden by `sync_reset` but eh, may as well specify it anyway.
-        next_state = CLEAR;
-      end
-    end
-    default: ;
-  endcase
-
-  if (advance) begin
-    if (run_stack_len == 0) begin
-      // We're running the first instruction, and so the next one we should look at is
-      // its first child.
-      next_target_ref = '{parent: 0, child_index: 0};
-    end else if (last_child) begin
-      next_target_ref = '{parent: target_ref.parent + 1, child_index: 0};
-    end else begin
-      next_target_ref = '{parent: target_ref.parent, child_index: target_ref.child_index + 1};
-    end
-  end else if (backtrack) begin
-    // We want to backtrack the last instruction in the run stack (which should
-    // always be `target_parent` when backtracking), and then our next target is
-    // the instruction after it in the queue.
-    automatic instruction_ref_t to_backtrack = target_parent.instruction_ref;
-    if (to_backtrack.child_index == 3) begin
-      // The instruction we're backtracking was the last child of its parent, and so
-      // the instruction after it that we want to try next is the first child of the
-      // next instruction.
-      next_target_ref = '{parent: to_backtrack.parent + 1, child_index: 0};
-    end else begin
-      // Otherwise it's the next child of the same parent.
-      next_target_ref = '{parent: to_backtrack.parent, child_index: to_backtrack.child_index + 1};
-    end
-  end else begin
-    next_target_ref = target_ref;
-  end
-
-  if (state == SOLUTION | state == SPLIT | state == PAUSE) begin
-    // We're just reading from `decisions`.
-    decisions_wr_data = 'x;
-    decisions_wr_en = 0;
-    next_decisions_len = decisions_len;
-  end else if (backtrack) begin
-    // To backtrack, we find the last 1 in `decisions`, turn it into a 0, and get
-    // rid of all the decisions after it.
-    // The last 1 is just the decision associated with the last instruction we ran
-    // (which we always set `target_parent` when backtracking), and so we can
-    // retrieve its index from there.
-    automatic decision_index_t last_run = target_parent.decision_index;
-    decisions_wr_data = 0;
-    decisions_wr_en = 1;
-    next_decisions_len = last_run + 1;
-  end else if (prefix_bits_left == 0 & in_valid & in_ready) begin
-    decisions_wr_data = in_data;
-    decisions_wr_en = 1;
-    next_decisions_len = decisions_len + 1;
-  end else if (advance & instruction_valid & |neighbours_valid) begin
-    // This instruction is valid to run and isn't a potential instruction, which
-    // means that whether or not we run it is a decision. Add it to the list.
-    // Note that the only scenario where we don't run it here is when receiving a
-    // finder.
-    decisions_wr_data = run;
-    decisions_wr_en = 1;
-    next_decisions_len = decisions_len + 1;
-  end else begin
-    decisions_wr_data = 'x;
-    decisions_wr_en = 0;
-    next_decisions_len = decisions_len;
-  end
-
-  if (run) begin
-    next_run_stack_len = run_stack_len + 1;
-  end else if (backtrack) begin
-    next_run_stack_len = run_stack_len - 1;
-  end else begin
-    next_run_stack_len = run_stack_len;
-  end
-
-  if (advance & instruction_valid & !(|neighbours_valid)) begin
-    // We're advancing, and the instruction is valid but none of its neighbours are;
-    // that means this is a potential instruction. Add it to the list.
-    next_potential_len = potential_len + 1;
-  end else if (backtrack) begin
-    // Reset `potential_len` to whatever it was when the instruction we're
-    // backtracking was run.
-    next_potential_len = target_parent.potential_len;
-  end else begin
-    next_potential_len = potential_len;
-  end
-
-  for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-    automatic logic rd_data = potential_surface_rd_datas[cuboid];
-    automatic logic wr_data;
-    automatic logic wr_en;
-    if (state == CLEAR) begin
-      wr_data = 0;
-      wr_en   = int'(clear_index) < AREA;
-    end else if (state == CHECK) begin
-      wr_data = 1;
-      wr_en   = instruction_valid;
-    end else begin
-      wr_data = 0;
-      wr_en   = int'(potential_surfaces_clear_index) < AREA;
-    end
-
-    potential_surface_wr_datas[cuboid] = wr_data;
-    potential_surface_wr_ens[cuboid]   = wr_en;
-
-    if (state == CLEAR) begin
-      // Don't update the count when in `CLEAR` state because it's currently bogus.
-      // Just keep it as 0, which will eventually become correct once we're done
-      // clearing.
-      next_potential_surface_counts[cuboid] = 0;
-    end else if (rd_data == 0 & wr_data == 1 & wr_en) begin
-      next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid] + 1;
-    end else if (rd_data == 1 & wr_data == 0 & wr_en) begin
-      next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid] - 1;
-    end else begin
-      next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid];
-    end
-  end
-
-  if (next_state == RUN & next_target_ref.parent >= next_run_stack_len) begin
-    // Hang on a minute, we can't go into RUN state - we'd be trying to run an
-    // instruction past the end of the queue.
-    //
-    // Stop `target_ref` from becoming invalid.
-    next_target_ref = target_ref;
-    if (int'(run_stack_len) + int'(next_potential_len) >= AREA) begin
-      // This has passed the first test for being a solution (there's enough run +
-      // potential instructions to possibly cover the surfaces), so now we start the
-      // next test of whether every square has at least 1 instruction that fills it.
-
-      // Except if we're still clearing `potential_surfaces`. In that case we go into
-      // CHECK_WAIT state until we're done.
-      automatic logic clearing = 0;
-      for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-        if (potential_surface_counts[cuboid] != 0) begin
-          clearing = 1;
-        end
-      end
-
-      if (clearing) begin
-        next_state = CHECK_WAIT;
       end else begin
-        next_state = CHECK;
-      end
-    end else begin
-      next_state = BACKTRACK;
-    end
-  end
-
-  // This goes here instead of when we're already in `CHECK` state so that we
-  // don't go into `CHECK` state when `potential_len == 0`.
-  if (next_state == CHECK) begin
-    if (next_potential_index >= next_potential_len) begin
-      // We're about to advance to an invalid index, so stop now.
-      automatic logic maybe_solution = 1;
-      for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-        // Use `next_potential_surface_counts` to make sure we take into account the
-        // last potential instruction.
-        if (int'(run_stack_len) + int'(next_potential_surface_counts[cuboid]) != AREA) begin
-          maybe_solution = 0;
-        end
-      end
-
-      if (maybe_solution) begin
-        reset_prefix_bits = 1;
-        next_state = SOLUTION;
-      end else begin
-        next_state = BACKTRACK;
-      end
-    end else begin
-      if (next_potential_index == potential_len) begin
-        // The potential instruction at `next_potential_index` is only being added to
-        // `potential_buf` on the next clock edge, so we can't get it from there;
-        // instead just set it to `target_ref` directly.
-        next_target_ref = target_ref;
-      end else begin
-        next_target_ref = next_potential_target;
+        // Make sure `target_parent` will be set to the last entry in the run stack.
+        next_target_ref = '{parent: next_run_stack_len - 1, child_index: 'x};
       end
     end
   end
-
-  if (next_state == BACKTRACK) begin
-    if (next_run_stack_len == 0) begin
-      // We're trying to backtrack when there are no instructions left to backtrack;
-      // that means we're done.
-      sync_reset = 1;
-    end else begin
-      // Make sure `target_parent` will be set to the last entry in the run stack.
-      next_target_ref = '{parent: next_run_stack_len - 1, child_index: 'x};
-    end
-  end
-endfunction
+endmodule

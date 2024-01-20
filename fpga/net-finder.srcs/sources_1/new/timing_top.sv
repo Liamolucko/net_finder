@@ -33,22 +33,34 @@ module timing_top (
     input  logic req_split,
     output logic stepping
 );
-  // verilator lint_off ASSIGNIN
-  // verilator lint_off PINMISSING
   core c (
-      .clk  (clk),
-      .reset(reset)
+      .clk(clk),
+      .reset(reset),
+      .in_data(in_data_ff.q),
+      .in_valid(in_valid_ff.q),
+      .in_ready(),
+      .in_last(in_last_ff.q),
+      .out_data(),
+      .out_valid(),
+      .out_ready(out_ready_ff.q),
+      .out_last(),
+      .out_solution(),
+      .out_split(),
+      .out_pause(),
+      .req_pause(req_pause_ff.q),
+      .req_split(req_split_ff.q),
+      .stepping()
   );
 
   dff in_data_ff (
       .clk(clk),
       .d  (in_data),
-      .q  (c.in_data)
+      .q  ()
   );
   dff in_valid_ff (
       .clk(clk),
       .d  (in_valid),
-      .q  (c.in_valid)
+      .q  ()
   );
   dff in_ready_ff (
       .clk(clk),
@@ -58,7 +70,7 @@ module timing_top (
   dff in_last_ff (
       .clk(clk),
       .d  (in_last),
-      .q  (c.in_last)
+      .q  ()
   );
   dff out_data_ff (
       .clk(clk),
@@ -73,7 +85,7 @@ module timing_top (
   dff out_ready_ff (
       .clk(clk),
       .d  (out_ready),
-      .q  (c.out_ready)
+      .q  ()
   );
   dff out_last_ff (
       .clk(clk),
@@ -98,18 +110,16 @@ module timing_top (
   dff req_pause_ff (
       .clk(clk),
       .d  (req_pause),
-      .q  (c.req_pause)
+      .q  ()
   );
   dff req_split_ff (
       .clk(clk),
       .d  (req_split),
-      .q  (c.req_split)
+      .q  ()
   );
   dff stepping_ff (
       .clk(clk),
       .d  (c.stepping),
       .q  (stepping)
   );
-  // verilator lint_on ASSIGNIN
-  // verilator lint_on PINMISSING
 endmodule
