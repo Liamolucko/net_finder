@@ -33,24 +33,16 @@ typedef struct packed {
   decision_index_t decision_index;
 } run_stack_entry_t;
 
-// If you don't specify the type here it's inferred as `int`; I wouldn't have
-// thought that mattered since the synthesiser should be able to clearly see
-// that the upper bits are always unused, but it seems like it can't.
-//
-// TODO: maybe it's because we set `next_state = state`? And so since `state` is
-// a register it can theoretically have invalid values which have to be handled
-// anyway?
-//
-// Maybe we could add a `sanitize_state` function which just returns `'x` if an
-// invalid state is passed in.
-typedef enum logic [3:0] {
+// This should really be an enum, but my FSM is structured too weirdly for
+// Vivado to detect it and so I have to manually convert it to be one-hot.
+typedef struct packed {
   // The core is currently clearing out all its internal memory after a reset.
-  CLEAR,
+  logic clear;
   // The core is currently receiving or waiting to receive a finder to run, and
   // filling in its state.
-  RECEIVE,
+  logic receive;
   // The core is actively attempting to run instructions.
-  RUN,
+  logic run;
   // The core is backtracking the last instruction in the run stack.
   //
   // This only just barely requires it's own state: the other way to do this would
@@ -63,24 +55,35 @@ typedef enum logic [3:0] {
   // queue in order to check if any of them are valid (and thus whether that last
   // instruction is a potential instruction), and then look up the neighbours of
   // the instruction to backtrack so their bits can be unset on the net.
-  BACKTRACK,
+  logic backtrack;
   // The core is waiting for its leftover state from the last `CHECK` to be
   // cleared out before switching into `CHECK` state.
-  CHECK_WAIT,
+  logic check_wait;
   // The core is checking if its current solution is valid.
-  CHECK,
+  logic check;
   // The core is outputting a potential solution.
-  SOLUTION,
+  logic solution;
   // The core incorrectly predicted what the next `target_ref` would be and has to
   // correct the value of `target`.
-  STALL,
+  logic stall;
   // The core has split its finder in half and is currently outputting one of
   // those halves.
-  SPLIT,
+  logic split;
   // The core is being paused; it's currently writing out the state of its finder.
   // Once it's done, it'll switch to `receive` state.
-  PAUSE
+  logic pause;
 } state_t;
+
+parameter state_t CLEAR = '{clear: 1, default: 0};
+parameter state_t RECEIVE = '{receive: 1, default: 0};
+parameter state_t RUN = '{run: 1, default: 0};
+parameter state_t BACKTRACK = '{backtrack: 1, default: 0};
+parameter state_t CHECK_WAIT = '{check_wait: 1, default: 0};
+parameter state_t CHECK = '{check: 1, default: 0};
+parameter state_t SOLUTION = '{solution: 1, default: 0};
+parameter state_t STALL = '{stall: 1, default: 0};
+parameter state_t SPLIT = '{split: 1, default: 0};
+parameter state_t PAUSE = '{pause: 1, default: 0};
 
 // All the metadata about a finder that gets sent prior to the list of
 // decisions.
@@ -187,9 +190,9 @@ module core (
     end
   end
 
-  assign out_solution = out_valid & state == SOLUTION;
-  assign out_split = out_valid & state == SPLIT;
-  assign out_pause = out_valid & state == PAUSE;
+  assign out_solution = out_valid & state.solution;
+  assign out_split = out_valid & state.split;
+  assign out_pause = out_valid & state.pause;
 
   // Control signals.
   // Whether to do a synchronous reset on the next clock edge.
@@ -244,7 +247,7 @@ module core (
   always_comb begin
     next_prefix = prefix;
     next_prefix_bits_left = prefix_bits_left;
-    if (prefix_bits_left > 0 & ((state == RECEIVE & in_valid) | (sending & out_ready))) begin
+    if (prefix_bits_left > 0 & ((state.receive & in_valid) | (sending & out_ready))) begin
       next_prefix = {prefix[$bits(prefix)-2:0], sending ? prefix[$bits(prefix)-1] : in_data};
       next_prefix_bits_left = prefix_bits_left - 1;
     end else if (prefix_bits_left == 0) begin
@@ -288,7 +291,7 @@ module core (
   always_comb begin
     automatic decision_index_t last_run = 'x;
 
-    if (state == SOLUTION | state == SPLIT | state == PAUSE) begin
+    if (state.solution | state.split | state.pause) begin
       // We're reading from the current index.
       decisions_addr = decision_index;
     end else if (backtrack) begin
@@ -304,7 +307,7 @@ module core (
   // The index of the current decision we're sending.
   decision_index_t decision_index;
   always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset | (state != SOLUTION & state != SPLIT & state != PAUSE)) begin
+    if (reset | sync_reset | (!state.solution & !state.split & !state.pause)) begin
       // Set this to 0 whenever we aren't using it so that way it'll always be 0 when
       // we start to.
       decision_index <= 0;
@@ -386,8 +389,8 @@ module core (
   assert property (@(posedge clk) next_target_parent.children == 'b0000 |->
   // `target_ref` is going to be garbage, so we need to be entering a state where
   // we don't care about that.
-  next_run_stack_len == 0 | next_state == CLEAR | next_state == CHECK_WAIT | next_state == SOLUTION
-    | next_state == STALL | next_state == SPLIT | next_state == PAUSE
+  next_run_stack_len == 0 | next_state.clear | next_state.check_wait | next_state.solution
+    | next_state.stall | next_state.split | next_state.pause
   );
   always_comb begin
     automatic logic [1:0] last_valid_direction = 'x;
@@ -483,7 +486,7 @@ module core (
   instruction_ref_t next_potential_target;
 
   always_comb begin
-    if (state == CHECK) begin
+    if (state.check) begin
       next_potential_index = potential_index + 1;
     end else begin
       next_potential_index = 0;
@@ -495,7 +498,7 @@ module core (
   // When in `CLEAR` state, the index in the net/surface we're currently clearing.
   logic [2*COORD_BITS-3:0] clear_index;
   always_ff @(posedge clk, posedge reset) begin
-    if (reset | sync_reset | state != CLEAR) begin
+    if (reset | sync_reset | !state.clear) begin
       // Reset this to 0 whenever we aren't in `CLEAR` state. That way, it'll always
       // be 0 on the first clock cycle of clearing.
       clear_index <= 0;
@@ -516,7 +519,7 @@ module core (
       // In the case that `predicted_state` is wrong, it won't matter since we'll
       // STALL and fix it (even if `predicted_target_ref` happened to be correct, we
       // have a special case for this).
-      .next_instruction(predicted_state == BACKTRACK ? next_target_parent.instruction : next_target),
+      .next_instruction(predicted_state.backtrack ? next_target_parent.instruction : next_target),
       .start_mapping_index(prefix.start_mapping_index),
 
       .run(run),
@@ -529,7 +532,7 @@ module core (
 
       .instruction_cursors_filled(),
 
-      .clear_mode (state == CLEAR),
+      .clear_mode (state.clear),
       .clear_index(clear_index)
   );
 
@@ -561,7 +564,7 @@ module core (
   // in doing so.
   square_t potential_surfaces_clear_index;
   always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset | state == CHECK) begin
+    if (reset | sync_reset | state.check) begin
       potential_surfaces_clear_index <= 0;
     end else begin
       potential_surfaces_clear_index <= potential_surfaces_clear_index + 1;
@@ -587,8 +590,8 @@ module core (
           // `valid_checker` and so the two calls won't differ, but I want to realise it
           // if they ever do.
           .rw_addr(
-            state == CLEAR ? square_t'(clear_index)
-            : state == CHECK ? target.mapping[cuboid].square
+            state.clear ? square_t'(clear_index)
+            : state.check ? target.mapping[cuboid].square
             : potential_surfaces_clear_index
           ),
           .rw_rd_data(potential_surface_rd_datas[cuboid]),
@@ -617,7 +620,7 @@ module core (
   logic interrupted;
   always_comb begin
     interrupted = 0;
-    if (state == RUN | state == BACKTRACK) begin
+    if (state.run | state.backtrack) begin
       if (req_pause) begin
         // We always pause immediately upon request.
         interrupted = 1;
@@ -643,14 +646,21 @@ module core (
     advance   = 0;
     backtrack = 0;
     case (state)
+      CLEAR | CHECK_WAIT | CHECK | SOLUTION | STALL | SPLIT | PAUSE: begin
+        advance   = 0;
+        backtrack = 0;
+      end
       RECEIVE: advance = prefix_bits_left == 0 & in_valid;
       RUN: advance = !interrupted;
       BACKTRACK: backtrack = !interrupted & target_parent.decision_index >= base_decision;
-      default: ;
+      default: begin
+        advance   = 'x;
+        backtrack = 'x;
+      end
     endcase
   end
 
-  assign sending = state == SOLUTION | state == SPLIT | state == PAUSE;
+  assign sending = state.solution | state.split | state.pause;
 
   // In parallel with the main `comb_main` that uses the outputs of
   // `valid_checker`, we run another one where they're just hardcoded to 0. That
@@ -799,7 +809,7 @@ module core (
         // to be, but we correct that later.
         next_base_decision = base_decision + 1;
         // Save whether we need to switch to RUN or BACKTRACK state after splitting.
-        next_was_backtrack = state == BACKTRACK;
+        next_was_backtrack = state.backtrack;
         next_state = SPLIT;
       end
     end
@@ -810,10 +820,10 @@ module core (
     // `target_parent` is set. So, STALL.
     | (next_run_stack_len != 0 & next_target_ref.parent == run_stack_len)
     // Special-cased since `valid_checker` relies on it.
-    | (next_state == BACKTRACK) != (predicted_state == BACKTRACK);
+    | next_state.backtrack != predicted_state.backtrack;
 
-    target_matters = (next_state == RECEIVE & next_prefix_bits_left == 0)
-    | next_state == RUN | next_state == BACKTRACK | next_state == CHECK;
+    target_matters = (next_state.receive & next_prefix_bits_left == 0) | next_state.run
+    | next_state.backtrack | next_state.check;
 
     if (invalid_target & target_matters) begin
       // Oops, `target`'s going to be incorrect now, so we have to go into `STALL`
@@ -1063,7 +1073,18 @@ module vc_dependent (
           next_state = CLEAR;
         end
       end
-      default: ;
+
+      default: begin
+        next_state = 'x;
+        in_ready = 'x;
+        run = 'x;
+        sync_reset = 'x;
+        next_base_decision = 'x;
+        out_valid = 'x;
+        inc_decision_index = 'x;
+        out_last = 'x;
+        out_data = 'x;
+      end
     endcase
 
     if (advance) begin
@@ -1097,7 +1118,7 @@ module vc_dependent (
       next_target_ref = target_ref;
     end
 
-    if (state == SOLUTION | state == SPLIT | state == PAUSE) begin
+    if (state.solution | state.split | state.pause) begin
       // We're just reading from `decisions`.
       decisions_wr_data = 'x;
       decisions_wr_en = 0;
@@ -1154,10 +1175,10 @@ module vc_dependent (
       automatic logic rd_data = potential_surface_rd_datas[cuboid];
       automatic logic wr_data;
       automatic logic wr_en;
-      if (state == CLEAR) begin
+      if (state.clear) begin
         wr_data = 0;
         wr_en   = int'(clear_index) < AREA;
-      end else if (state == CHECK) begin
+      end else if (state.check) begin
         wr_data = 1;
         wr_en   = instruction_valid;
       end else begin
@@ -1168,7 +1189,7 @@ module vc_dependent (
       potential_surface_wr_datas[cuboid] = wr_data;
       potential_surface_wr_ens[cuboid]   = wr_en;
 
-      if (state == CLEAR) begin
+      if (state.clear) begin
         // Don't update the count when in `CLEAR` state because it's currently bogus.
         // Just keep it as 0, which will eventually become correct once we're done
         // clearing.
@@ -1182,7 +1203,7 @@ module vc_dependent (
       end
     end
 
-    if (next_state == RUN & next_target_ref.parent >= next_run_stack_len) begin
+    if (next_state.run & next_target_ref.parent >= next_run_stack_len) begin
       // Hang on a minute, we can't go into RUN state - we'd be trying to run an
       // instruction past the end of the queue.
       //
@@ -1214,7 +1235,7 @@ module vc_dependent (
 
     // This goes here instead of when we're already in `CHECK` state so that we
     // don't go into `CHECK` state when `potential_len == 0`.
-    if (next_state == CHECK) begin
+    if (next_state.check) begin
       if (next_potential_index >= next_potential_len) begin
         // We're about to advance to an invalid index, so stop now.
         maybe_solution = 1;
@@ -1244,7 +1265,7 @@ module vc_dependent (
       end
     end
 
-    if (next_state == BACKTRACK) begin
+    if (next_state.backtrack) begin
       if (next_run_stack_len == 0) begin
         // We're trying to backtrack when there are no instructions left to backtrack;
         // that means we're done.
