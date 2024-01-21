@@ -294,7 +294,7 @@ module core (
     if (state.solution | state.split | state.pause) begin
       // We're reading from the current index.
       decisions_addr = decision_index;
-    end else if (backtrack) begin
+    end else if (state.backtrack) begin
       last_run = target_parent.decision_index;
       // We're changing the last 1 in `decision` to a 0.
       decisions_addr = last_run;
@@ -543,19 +543,23 @@ module core (
   // `CHECK` state.
   // First we declare their signals, then actually instantiate them inside a `generate`.
 
-  // How many bits are set on each surface in `potential_surfaces`.
-  logic [$clog2(AREA+1)-1:0] potential_surface_counts[CUBOIDS];
-  logic [$clog2(AREA+1)-1:0] next_potential_surface_counts[CUBOIDS];
+  // How many bits would be set on each surface if all the potential instructions
+  // were run (ignoring that they might conflict).
+  //
+  // In other words, `potential_areas[cuboid]` is `run_stack_len` + the number of
+  // 1s set in `potential_surfaces[cuboid]`.
+  logic [$clog2(AREA+1)-1:0] potential_areas[CUBOIDS];
+  logic [$clog2(AREA+1)-1:0] next_potential_areas[CUBOIDS];
   always_ff @(posedge clk or posedge reset) begin
     if (reset | sync_reset) begin
       for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
         // We don't actually have any idea how many 1s there are at this point, but
         // since we go into `CLEAR` state on reset 0 will become correct in a second
         // anyway.
-        potential_surface_counts[cuboid] <= 0;
+        potential_areas[cuboid] <= 0;
       end
     end else begin
-      potential_surface_counts <= next_potential_surface_counts;
+      potential_areas <= next_potential_areas;
     end
   end
 
@@ -617,27 +621,41 @@ module core (
   state_t next_saved_state;
   always_ff @(posedge clk) saved_state <= next_saved_state;
 
+  // Various comparisons of registers.
+  // Whether or not it's valid to backtrack `target_parent`.
+  logic can_backtrack;
+  // Whether or not we're currently capable of splitting (in other words, whether
+  // `decisions[base_decision]` exists).
+  logic can_split;
+  always_ff @(posedge clk) begin
+    can_backtrack <= next_target_parent.decision_index >= next_base_decision;
+    can_split <= next_base_decision < next_decisions_len;
+  end
+
+  // Whether we're being interrupted by `req_pause`/`req_split`.
+  //
+  // Note that this is 0 if `req_split` is 1 and `can_split` is 0; the only case
+  // where this is 1 and `interrupted` is 0 is when `state` isn't RUN or
+  // BACKTRACK.
+  logic interrupting;
+  // Whether we're actually going to respond to that interruption.
   logic interrupted;
   always_comb begin
-    interrupted = 0;
-    if (state.run | state.backtrack) begin
-      if (req_pause) begin
-        // We always pause immediately upon request.
-        interrupted = 1;
-      end else if (req_split & base_decision != decisions_len) begin
-        // `base_decision` should always be <= decisions_len, so the above != is just a
-        // faster way of checking <.
-        assert (base_decision < decisions_len);
-        // We only split if `base_decision` is within `decisions`, since we need to
-        // split on it. If it isn't, we continue until either:
-        // - An instruction is run, at which point `base_decision` now points to the
-        //   decision to do so and we can split on it.
-        // - We get to the end of the queue without running anything; that means
-        //   `base_decision` is still 1 past the end of `decisions`, and thus there are
-        //   no decisions we're allowed to backtrack and we're done.
-        interrupted = 1;
-      end
+    interrupting = 0;
+    if (req_pause) begin
+      // We always pause immediately upon request.
+      interrupting = 1;
+    end else if (req_split & can_split) begin
+      // We only split if `base_decision` is within `decisions`, since we need to
+      // split on it. If it isn't, we continue until either:
+      // - An instruction is run, at which point `base_decision` now points to the
+      //   decision to do so and we can split on it.
+      // - We get to the end of the queue without running anything; that means
+      //   `base_decision` is still 1 past the end of `decisions`, and thus there are
+      //   no decisions we're allowed to backtrack and we're done.
+      interrupting = 1;
     end
+    interrupted = interrupting & (state.run | state.backtrack);
   end
 
   always_comb begin
@@ -651,8 +669,8 @@ module core (
         backtrack = 0;
       end
       RECEIVE: advance = prefix_bits_left == 0 & in_valid;
-      RUN: advance = !interrupted;
-      BACKTRACK: backtrack = !interrupted & target_parent.decision_index >= base_decision;
+      RUN: advance = !interrupting;
+      BACKTRACK: backtrack = !interrupting & can_backtrack;
       default: begin
         advance   = 'x;
         backtrack = 'x;
@@ -666,7 +684,9 @@ module core (
   // `valid_checker`, we run another one where they're just hardcoded to 0. That
   // way it can calculate `predicted_target_ref` at the same time as
   // `valid_checker` is running.
-  vc_dependent dep_fake (
+  vc_dependent #(
+      .TARGET_IGNORED_STATES(0)
+  ) dep_fake (
       .interrupted(interrupted),
       .in_data(in_data),
       .in_valid(in_valid),
@@ -685,7 +705,7 @@ module core (
       .potential_len(potential_len),
       .clear_index(clear_index),
       .potential_surface_rd_datas(potential_surface_rd_datas),
-      .potential_surface_counts(potential_surface_counts),
+      .potential_areas(potential_areas),
       .potential_surfaces_clear_index(potential_surfaces_clear_index),
       .was_backtrack(was_backtrack),
       .saved_state(saved_state),
@@ -710,7 +730,7 @@ module core (
       .next_potential_len(),
       .potential_surface_wr_datas(),
       .potential_surface_wr_ens(),
-      .next_potential_surface_counts(),
+      .next_potential_areas(),
       .next_saved_state(),
 
       .in_ready(),
@@ -724,7 +744,9 @@ module core (
   );
 
   // Then run the one which does it properly.
-  vc_dependent dep_real (
+  vc_dependent #(
+      .TARGET_IGNORED_STATES(1)
+  ) dep_real (
       .interrupted(interrupted),
       .in_data(in_data),
       .in_valid(in_valid),
@@ -743,7 +765,7 @@ module core (
       .potential_len(potential_len),
       .clear_index(clear_index),
       .potential_surface_rd_datas(potential_surface_rd_datas),
-      .potential_surface_counts(potential_surface_counts),
+      .potential_areas(potential_areas),
       .potential_surfaces_clear_index(potential_surfaces_clear_index),
       .was_backtrack(was_backtrack),
       .saved_state(saved_state),
@@ -769,7 +791,7 @@ module core (
       .next_potential_len(next_potential_len),
       .potential_surface_wr_datas(potential_surface_wr_datas),
       .potential_surface_wr_ens(potential_surface_wr_ens),
-      .next_potential_surface_counts(next_potential_surface_counts),
+      .next_potential_areas(next_potential_areas),
       .next_saved_state(),
 
       .in_ready(in_ready),
@@ -835,7 +857,15 @@ module core (
 endmodule
 
 // All of our combinational logic that might depend on the outputs of `valid_checker`.
-module vc_dependent (
+module vc_dependent #(
+    // Whether `next_state`s which don't care about the value of `target` should be
+    // considered.
+    //
+    // When this is 0, we pretend they don't happen, which is used to simplify the
+    // logic of `dep_fake` without actually affecting results since what it outputs
+    // only matters if we're switching into a state which cares about `target`.
+    logic TARGET_IGNORED_STATES = 1
+) (
     // Whether `req_pause` or `req_split` caused us to not advance/backtrack.
     input logic interrupted,
     //
@@ -856,7 +886,7 @@ module vc_dependent (
     input potential_index_t potential_len,
     input logic [2*COORD_BITS-3:0] clear_index,
     input logic [CUBOIDS-1:0] potential_surface_rd_datas,
-    input logic [$clog2(AREA+1)-1:0] potential_surface_counts[CUBOIDS],
+    input logic [$clog2(AREA+1)-1:0] potential_areas[CUBOIDS],
     input square_t potential_surfaces_clear_index,
     input logic was_backtrack,
     input state_t saved_state,
@@ -880,7 +910,7 @@ module vc_dependent (
     output potential_index_t next_potential_len,
     output logic [CUBOIDS-1:0] potential_surface_wr_datas,
     output logic [CUBOIDS-1:0] potential_surface_wr_ens,
-    output logic [$clog2(AREA+1)-1:0] next_potential_surface_counts[CUBOIDS],
+    output logic [$clog2(AREA+1)-1:0] next_potential_areas[CUBOIDS],
     output state_t next_saved_state,
     //
     output logic in_ready,
@@ -897,6 +927,7 @@ module vc_dependent (
     automatic instruction_ref_t to_backtrack = 'x;
     automatic decision_index_t last_run = 'x;
     automatic logic maybe_solution = 'x;
+    automatic logic [CUBOIDS-1:0] inc_potential_areas = 0;
 
     in_ready = 0;
     // This is almost always what it should be set to, except when we override it to 0 during splitting.
@@ -916,7 +947,7 @@ module vc_dependent (
 
     case (state)
       CLEAR: begin
-        if (int'(clear_index) == NET_LEN / 4 - 1) begin
+        if (int'(clear_index) == NET_LEN / 4 - 1 | !TARGET_IGNORED_STATES) begin
           // We're about to clear the last bit of the net, in which case we're done clearing.
           next_state = RECEIVE;
         end
@@ -987,12 +1018,12 @@ module vc_dependent (
       CHECK_WAIT: begin
         clearing = 0;
         for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-          if (potential_surface_counts[cuboid] != 0) begin
+          if (potential_areas[cuboid] != run_stack_len) begin
             clearing = 1;
           end
         end
 
-        if (!clearing) begin
+        if (!clearing | !TARGET_IGNORED_STATES) begin
           next_state = CHECK;
         end
       end
@@ -1010,7 +1041,7 @@ module vc_dependent (
 
         out_valid = 1;
         inc_decision_index = prefix_bits_left == 0;
-        if (prefix_bits_left == 0 & decision_index == decisions_len - 1) begin
+        if (prefix_bits_left == 0 & decision_index == decisions_len - 1 | !TARGET_IGNORED_STATES) begin
           // We've just written out the last decision (if it was a decision in the first
           // place), and so we can go back to running.
           out_last   = 1;
@@ -1041,7 +1072,7 @@ module vc_dependent (
             // 1 and so we need to keep going until we find one.
           end
 
-          if (decision_index >= base_decision & decisions_rd_data == 1) begin
+          if (decision_index >= base_decision & decisions_rd_data == 1 | !TARGET_IGNORED_STATES) begin
             // Great, we've found a 1 to set `base_decision` to. Stop here.
             next_base_decision = decision_index;
             next_state = was_backtrack ? BACKTRACK : RUN;
@@ -1123,7 +1154,7 @@ module vc_dependent (
       decisions_wr_data = 'x;
       decisions_wr_en = 0;
       next_decisions_len = decisions_len;
-    end else if (backtrack) begin
+    end else if (state.backtrack) begin
       // To backtrack, we find the last 1 in `decisions`, turn it into a 0, and get
       // rid of all the decisions after it.
       // The last 1 is just the decision associated with the last instruction we ran
@@ -1131,7 +1162,12 @@ module vc_dependent (
       // retrieve its index from there.
       last_run = target_parent.decision_index;
       decisions_wr_data = 0;
-      decisions_wr_en = 1;
+      // It's possible to be in BACKTRACK state without actually backtracking, if
+      // `req_split` or `req_pause` is 1, and if that's the case we shouldn't write
+      // anything.
+      // We take this branch anyway so that `decisions_rd_addr` can be computed more
+      // quickly.
+      decisions_wr_en = backtrack;
       next_decisions_len = last_run + 1;
     end else if (prefix_bits_left == 0 & in_valid & in_ready) begin
       decisions_wr_data = in_data;
@@ -1193,13 +1229,27 @@ module vc_dependent (
         // Don't update the count when in `CLEAR` state because it's currently bogus.
         // Just keep it as 0, which will eventually become correct once we're done
         // clearing.
-        next_potential_surface_counts[cuboid] = 0;
-      end else if (rd_data == 0 & wr_data == 1 & wr_en) begin
-        next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid] + 1;
-      end else if (rd_data == 1 & wr_data == 0 & wr_en) begin
-        next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid] - 1;
+        next_potential_areas[cuboid] = 0;
       end else begin
-        next_potential_surface_counts[cuboid] = potential_surface_counts[cuboid];
+        next_potential_areas[cuboid] = potential_areas[cuboid];
+
+        if (rd_data == 0 & wr_data == 1 & wr_en) begin
+          next_potential_areas[cuboid] += 1;
+          inc_potential_areas[cuboid] = 1;
+        end else if (rd_data == 1 & wr_data == 0 & wr_en) begin
+          next_potential_areas[cuboid] -= 1;
+        end
+
+        if (run) begin
+          next_potential_areas[cuboid] += 1;
+          // Note that we only set bits of `potential_surfaces` during CHECK state, and we
+          // only run instructions during RECEIVE or RUN state, so we shouldn't have to
+          // worry about adding 2 here.
+          assert (!inc_potential_areas[cuboid]);
+          inc_potential_areas[cuboid] = 1;
+        end else if (backtrack) begin
+          next_potential_areas[cuboid] -= 1;
+        end
       end
     end
 
@@ -1218,12 +1268,12 @@ module vc_dependent (
         // CHECK_WAIT state until we're done.
         clearing = 0;
         for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-          if (potential_surface_counts[cuboid] != 0) begin
+          if (potential_areas[cuboid] != run_stack_len) begin
             clearing = 1;
           end
         end
 
-        if (clearing) begin
+        if (clearing & TARGET_IGNORED_STATES) begin
           next_state = CHECK_WAIT;
         end else begin
           next_state = CHECK;
@@ -1236,18 +1286,28 @@ module vc_dependent (
     // This goes here instead of when we're already in `CHECK` state so that we
     // don't go into `CHECK` state when `potential_len == 0`.
     if (next_state.check) begin
-      if (next_potential_index >= next_potential_len) begin
+      if (next_potential_index == next_potential_len) begin
         // We're about to advance to an invalid index, so stop now.
         maybe_solution = 1;
         for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-          // Use `next_potential_surface_counts` to make sure we take into account the
-          // last potential instruction.
-          if (int'(run_stack_len) + int'(next_potential_surface_counts[cuboid]) != AREA) begin
+          // This is faster than using `next_potential_areas` because `AREA` is a
+          // constant, so subtracting 1 from it costs nothing.
+          //
+          // We don't have to worry about `potential_areas[cuboid]` decreasing, that only
+          // happens when clearing it which:
+          // - Can't happen during CHECK state.
+          // - Even if we're transitioning into CHECK state from RUN or CHECK_WAIT state,
+          //   we only do so once `potential_areas[*] == run_stack_len`, so there's no
+          //   clearing left that could be done in this clock cycle.
+          if (
+            int'(potential_areas[cuboid]) != AREA
+            & !(int'(potential_areas[cuboid]) == AREA - 1 & inc_potential_areas[cuboid])
+          ) begin
             maybe_solution = 0;
           end
         end
 
-        if (maybe_solution) begin
+        if (maybe_solution & TARGET_IGNORED_STATES) begin
           reset_prefix_bits = 1;
           next_state = SOLUTION;
         end else begin
