@@ -172,7 +172,8 @@ module valid_checker (
     // like this because arrays of module instances are weird.
     logic shard_values[4];
     for (shard = 0; shard < 4; shard++) begin : gen_net_shards
-      logic [1:0] neighbour = shard_neighbours[shard];
+      logic [1:0] neighbour;
+      assign neighbour = shard_neighbours[shard];
 
       // Instantiate the actual RAM for this net shard.
       async_ram #(
