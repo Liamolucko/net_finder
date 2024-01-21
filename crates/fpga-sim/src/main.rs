@@ -10,6 +10,7 @@ use pretty_assertions::assert_eq;
 #[derive(Parser)]
 struct Args {
     steps: usize,
+    split_step: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -23,8 +24,8 @@ fn main() -> anyhow::Result<()> {
     core.reset();
 
     let info = FinderInfo {
-        start_mapping: ClassMapping::new([Class(132), Class(203), Class(200)]),
-        decisions: vec![true, true, true, true, false, true, true, true, true],
+        start_mapping: ClassMapping::new([Class(138), Class(193), Class(200)]),
+        decisions: vec![true],
         base_decision: NonZeroUsize::new(1).unwrap(),
     };
 
@@ -34,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     core.load_finder(&ctx, &info);
 
     for step in 0..args.steps {
-        if step == 0 {
+        if step == args.split_step {
             *core.req_split() = true;
             core.update();
             while !matches!(core.event(&ctx), Event::Split(_)) {}

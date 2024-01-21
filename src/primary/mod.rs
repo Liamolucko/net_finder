@@ -386,12 +386,9 @@ struct Instruction<const CUBOIDS: usize> {
 impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
     fn moved_in(&self, ctx: &FinderCtx<CUBOIDS>, direction: Direction) -> Instruction<CUBOIDS> {
         let net_pos = self.net_pos.moved_in_unchecked(direction);
-        let mut mapping = self.mapping.clone();
-        zip(&ctx.square_caches, mapping.cursors_mut())
-            .for_each(|(cache, cursor)| *cursor = cursor.moved_in(cache, direction));
         Instruction {
             net_pos,
-            mapping,
+            mapping: self.mapping.moved_in(&ctx.square_caches, direction),
             followup_index: None,
         }
     }

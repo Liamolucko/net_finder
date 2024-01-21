@@ -1925,6 +1925,12 @@ impl<const CUBOIDS: usize> Mapping<CUBOIDS> {
     pub fn cursors_mut(&mut self) -> &mut [Cursor] {
         &mut self.cursors
     }
+
+    pub fn moved_in(mut self, square_caches: &[SquareCache], direction: Direction) -> Self {
+        zip(square_caches, self.cursors_mut())
+            .for_each(|(cache, cursor)| *cursor = cursor.moved_in(cache, direction));
+        self
+    }
 }
 
 /// A mapping between equivalence classes of cursors.

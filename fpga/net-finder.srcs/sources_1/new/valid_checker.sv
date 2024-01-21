@@ -144,8 +144,8 @@ module valid_checker (
         'b1100, 'b0110: shards = '{2, 3, 0, 1};
         'b0001, 'b1011: shards = '{3, 2, 1, 0};
         'b0101, 'b1111: shards = '{0, 3, 2, 1};
-        'b0110, 'b1100: shards = '{1, 0, 3, 2};
-        'b0111, 'b1101: shards = '{2, 1, 0, 3};
+        'b1001, 'b0011: shards = '{1, 0, 3, 2};
+        'b1101, 'b0111: shards = '{2, 1, 0, 3};
         default: shards = '{default: 'x};
       endcase
     end
@@ -162,8 +162,8 @@ module valid_checker (
         'b1100, 'b0110: shard_neighbours = '{2, 3, 0, 1};
         'b0001, 'b1011: shard_neighbours = '{3, 2, 1, 0};
         'b0101, 'b1111: shard_neighbours = '{0, 3, 2, 1};
-        'b0110, 'b1100: shard_neighbours = '{1, 0, 3, 2};
-        'b0111, 'b1101: shard_neighbours = '{2, 1, 0, 3};
+        'b1001, 'b0011: shard_neighbours = '{1, 0, 3, 2};
+        'b1101, 'b0111: shard_neighbours = '{2, 1, 0, 3};
         default: shard_neighbours = '{default: 'x};
       endcase
     end
