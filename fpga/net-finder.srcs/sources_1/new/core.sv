@@ -340,6 +340,16 @@ module core (
   logic [$clog2(AREA+1)-1:0] run_stack_len;
   logic [$clog2(AREA+1)-1:0] next_run_stack_len;
 
+  // `run_stack_len` + 1.
+  logic [$clog2(AREA+1)-1:0] run_stack_len_inc;
+  // `run_stack_len` - 1.
+  logic [$clog2(AREA+1)-1:0] run_stack_len_dec;
+
+  always_ff @(posedge clk) begin
+    run_stack_len_inc <= next_run_stack_len + 1;
+    run_stack_len_dec <= next_run_stack_len - 1;
+  end
+
   // A reference to the instruction we're currently looking at.
   //
   // This always lines up with `target`, except when `run_stack_len` is 0 and in
@@ -699,6 +709,8 @@ module core (
       .decisions_rd_data(decisions_rd_data),
       .decision_index(decision_index),
       .run_stack_len(run_stack_len),
+      .run_stack_len_inc(run_stack_len_inc),
+      .run_stack_len_dec(run_stack_len_dec),
       .target_ref(target_ref),
       .target_parent(target_parent),
       .last_child(last_child),
@@ -759,6 +771,8 @@ module core (
       .decisions_rd_data(decisions_rd_data),
       .decision_index(decision_index),
       .run_stack_len(run_stack_len),
+      .run_stack_len_inc(run_stack_len_inc),
+      .run_stack_len_dec(run_stack_len_dec),
       .target_ref(target_ref),
       .target_parent(target_parent),
       .last_child(last_child),
@@ -880,6 +894,8 @@ module vc_dependent #(
     input logic decisions_rd_data,
     input decision_index_t decision_index,
     input logic [$clog2(AREA+1)-1:0] run_stack_len,
+    input logic [$clog2(AREA+1)-1:0] run_stack_len_inc,
+    input logic [$clog2(AREA+1)-1:0] run_stack_len_dec,
     input instruction_ref_t target_ref,
     input run_stack_entry_t target_parent,
     input logic last_child,
@@ -1188,9 +1204,9 @@ module vc_dependent #(
     end
 
     if (run) begin
-      next_run_stack_len = run_stack_len + 1;
+      next_run_stack_len = run_stack_len_inc;
     end else if (backtrack) begin
-      next_run_stack_len = run_stack_len - 1;
+      next_run_stack_len = run_stack_len_dec;
     end else begin
       next_run_stack_len = run_stack_len;
     end

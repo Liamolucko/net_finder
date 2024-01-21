@@ -126,50 +126,53 @@ module valid_checker (
   generate
     // Determine which shard of the net each neighbour's bit is located in.
     logic [1:0] shards[4];
-    for (direction = 0; direction < 4; direction++) begin : gen_shards
-      always_comb
-        case ({
-          neighbours[direction].pos.x[1:0], neighbours[direction].pos.y[1:0]
-        })
-          // Each 4x4 chunk of the net is split up into shards like this:
-          //     2301
-          //     2301
-          //     0123
-          //     0123
-          // where each number is the shard that that square is stored in. This layout
-          // guarantees that for every square, all its neighbours are in different net
-          // shards.
-          'b0000, 'b0001, 'b1010, 'b1011: shards[direction] = 0;
-          'b0100, 'b0101, 'b1110, 'b1111: shards[direction] = 1;
-          'b1000, 'b1001, 'b0010, 'b0011: shards[direction] = 2;
-          'b1100, 'b1101, 'b0110, 'b0111: shards[direction] = 3;
-          default: shards[direction] = 'x;
-        endcase
+    always_comb begin
+      case ({
+        instruction.pos.x[1:0], instruction.pos.y[1:0]
+      })
+        // Each 4x4 chunk of the net is split up into shards like this:
+        //     2301
+        //     2301
+        //     0123
+        //     0123
+        // where each number is the shard that that square is stored in. This layout
+        // guarantees that for every square, all its neighbours are in different net
+        // shards.
+        'b0000, 'b1010: shards = '{3, 0, 1, 2};
+        'b0100, 'b1110: shards = '{0, 1, 2, 3};
+        'b1000, 'b0010: shards = '{1, 2, 3, 0};
+        'b1100, 'b0110: shards = '{2, 3, 0, 1};
+        'b0001, 'b1011: shards = '{3, 2, 1, 0};
+        'b0101, 'b1111: shards = '{0, 3, 2, 1};
+        'b0110, 'b1100: shards = '{1, 0, 3, 2};
+        'b0111, 'b1101: shards = '{2, 1, 0, 3};
+        default: shards = '{default: 'x};
+      endcase
+    end
+
+    // Also figure out the reverse, which neighbour falls into each shard.
+    logic [1:0] shard_neighbours[4];
+    always_comb begin
+      case ({
+        instruction.pos.x[1:0], instruction.pos.y[1:0]
+      })
+        'b0000, 'b1010: shard_neighbours = '{1, 2, 3, 0};
+        'b0100, 'b1110: shard_neighbours = '{0, 1, 2, 3};
+        'b1000, 'b0010: shard_neighbours = '{3, 0, 1, 2};
+        'b1100, 'b0110: shard_neighbours = '{2, 3, 0, 1};
+        'b0001, 'b1011: shard_neighbours = '{3, 2, 1, 0};
+        'b0101, 'b1111: shard_neighbours = '{0, 3, 2, 1};
+        'b0110, 'b1100: shard_neighbours = '{1, 0, 3, 2};
+        'b0111, 'b1101: shard_neighbours = '{2, 1, 0, 3};
+        default: shard_neighbours = '{default: 'x};
+      endcase
     end
 
     // Then instantiate all the shards. We need to put their outputs into a variable
     // like this because arrays of module instances are weird.
     logic shard_values[4];
     for (shard = 0; shard < 4; shard++) begin : gen_net_shards
-      // First make a one-hot vector, where each bit just represents whether the
-      // neighbour in that direction has its bit stored in this shard.
-      logic [3:0] neighbour_onehot;
-      for (direction = 0; direction < 4; direction++) begin : gen_neighbour_onehot
-        assign neighbour_onehot[direction] = shards[direction] == shard;
-      end
-
-      // Then use a binary encoder to turn that into the actual index of the neighbour
-      // using this shard.
-      logic [1:0] neighbour;
-      always_comb begin
-        case (neighbour_onehot)
-          'b0001:  neighbour = 0;
-          'b0010:  neighbour = 1;
-          'b0100:  neighbour = 2;
-          'b1000:  neighbour = 3;
-          default: neighbour = 'x;
-        endcase
-      end
+      logic [1:0] neighbour = shard_neighbours[shard];
 
       // Instantiate the actual RAM for this net shard.
       async_ram #(

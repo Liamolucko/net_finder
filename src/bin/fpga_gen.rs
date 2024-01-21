@@ -305,30 +305,39 @@ fn gen_neighbour_offset<const CUBOIDS: usize>(square_caches: &[SquareCache; CUBO
     }
 
     format!(
-        "function automatic int neighbour_offset(int cuboid, square_t square, logic [1:0] direction);\
+        "function automatic cursor_t cursor_neighbour(\
+       \n  int cuboid,\
+       \n  cursor_t cursor,\
+       \n  logic [1:0] direction\
+       \n);\
+       \n  cursor_t unrotated;\
        \n  {}\
        \n  else return 'x;\
+       \n\
+       \n  return '{{\
+       \n    square: unrotated.square,\
+       \n    orientation: cursor.orientation + unrotated.orientation\
+       \n  }};\
        \nendfunction",
-        cursor_offsets
+        square_caches
             .iter()
             .enumerate()
-            .map(|(cuboid, offsets)| format!(
+            .map(|(cuboid, cache)| format!(
+                // Note: Early-returning here on an invalid input rather than just setting
+                // `unrotated` to `'x` is intentional, for whatever reason it uses a few less LUTs
+                // and is a bit faster.
                 "if (cuboid == {cuboid})\
-             \n    case ({{square, direction}})\
+             \n    case ({{cursor.square, cursor.orientation + direction}})\
              \n      {}\
              \n      default: return 'x;\
              \n    endcase",
-                offsets
-                    .iter()
-                    .map(|(offset, squares)| format!(
-                        "{}: return {offset};",
-                        squares
-                            .iter()
-                            .map(|&(square, direction)|
-                                ((square.0 as u32) << 2) | direction as u32
-                            )
-                            .format(", ")
-                    ))
+                cache
+                    .squares()
+                    .flat_map(|square| [Left, Up, Right, Down].map(|direction| format!(
+                        "{}: unrotated = {};",
+                        square.0 << 2 | direction as u8,
+                        Cursor::new(square, 0).moved_in(cache, direction).0
+                    )))
                     .format("\n      ")
             ))
             .format("\n  else ")

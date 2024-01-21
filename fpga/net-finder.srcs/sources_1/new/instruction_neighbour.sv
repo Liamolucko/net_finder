@@ -13,15 +13,7 @@ function automatic instruction_t instruction_neighbour(instruction_t instruction
   endcase
 
   for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-    int offset = neighbour_offset(
-        cuboid,
-        instruction.mapping[cuboid].square,
-        instruction.mapping[cuboid].orientation + direction
-    );
-    result.mapping[cuboid] = '{
-        square: square_t'(int'(instruction.mapping[cuboid].square) + int'(offset[31:2])),
-        orientation: instruction.mapping[cuboid].orientation + offset[1:0]
-    };
+    result.mapping[cuboid] = cursor_neighbour(cuboid, instruction.mapping[cuboid], direction);
   end
 
   return result;

@@ -1,2 +1,2 @@
-# 70 MHz.
-create_clock -period 14.286 -name clk -waveform {0.000 7.143} [get_ports clk]
+# 80 MHz.
+create_clock -period 12.500 -name clk -waveform {0.000 6.250} [get_ports clk]
