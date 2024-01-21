@@ -1168,7 +1168,7 @@ module vc_dependent #(
       // We take this branch anyway so that `decisions_rd_addr` can be computed more
       // quickly.
       decisions_wr_en = backtrack;
-      next_decisions_len = last_run + 1;
+      next_decisions_len = backtrack ? last_run + 1 : decisions_len;
     end else if (prefix_bits_left == 0 & in_valid & in_ready) begin
       decisions_wr_data = in_data;
       decisions_wr_en = 1;
