@@ -521,7 +521,7 @@ module core (
   valid_checker vc (
       .clk(clk),
 
-      .instruction(backtrack ? target_parent.instruction : target),
+      .instruction(state.backtrack ? target_parent.instruction : target),
       // In the case that `backtrack` is 0 despite the state being `BACKTRACK`, it
       // won't matter that this is wrong since we'll be splitting or pausing anyway,
       // neither of which require `valid_checker`.
@@ -709,8 +709,6 @@ module core (
       .decisions_rd_data(decisions_rd_data),
       .decision_index(decision_index),
       .run_stack_len(run_stack_len),
-      .run_stack_len_inc(run_stack_len_inc),
-      .run_stack_len_dec(run_stack_len_dec),
       .target_ref(target_ref),
       .target_parent(target_parent),
       .last_child(last_child),
@@ -723,6 +721,10 @@ module core (
       .saved_state(saved_state),
       .advance(advance),
       .backtrack(backtrack),
+
+      .run_stack_len_inc(run_stack_len_inc),
+      .run_stack_len_dec(run_stack_len_dec),
+      .can_backtrack(can_backtrack),
 
       .next_potential_index (next_potential_index),
       .next_potential_target(next_potential_target),
@@ -771,8 +773,6 @@ module core (
       .decisions_rd_data(decisions_rd_data),
       .decision_index(decision_index),
       .run_stack_len(run_stack_len),
-      .run_stack_len_inc(run_stack_len_inc),
-      .run_stack_len_dec(run_stack_len_dec),
       .target_ref(target_ref),
       .target_parent(target_parent),
       .last_child(last_child),
@@ -785,6 +785,10 @@ module core (
       .saved_state(saved_state),
       .advance(advance),
       .backtrack(backtrack),
+
+      .run_stack_len_inc(run_stack_len_inc),
+      .run_stack_len_dec(run_stack_len_dec),
+      .can_backtrack(can_backtrack),
 
       .next_potential_index (next_potential_index),
       .next_potential_target(next_potential_target),
@@ -882,7 +886,7 @@ module vc_dependent #(
 ) (
     // Whether `req_pause` or `req_split` caused us to not advance/backtrack.
     input logic interrupted,
-    //
+
     input logic in_data,
     input logic in_valid,
     input logic in_last,
@@ -894,8 +898,6 @@ module vc_dependent #(
     input logic decisions_rd_data,
     input decision_index_t decision_index,
     input logic [$clog2(AREA+1)-1:0] run_stack_len,
-    input logic [$clog2(AREA+1)-1:0] run_stack_len_inc,
-    input logic [$clog2(AREA+1)-1:0] run_stack_len_dec,
     input instruction_ref_t target_ref,
     input run_stack_entry_t target_parent,
     input logic last_child,
@@ -908,16 +910,21 @@ module vc_dependent #(
     input state_t saved_state,
     input logic advance,
     input logic backtrack,
-    //
+
+    // Cached stuff.
+    input logic [$clog2(AREA+1)-1:0] run_stack_len_inc,
+    input logic [$clog2(AREA+1)-1:0] run_stack_len_dec,
+    input logic can_backtrack,
+
     input potential_index_t next_potential_index,
     input instruction_ref_t next_potential_target,
-    //
+
     input logic instruction_valid,
     input logic [3:0] neighbours_valid,
-    //
+
     output state_t next_state,
     output instruction_ref_t next_target_ref,
-    //
+
     output decision_index_t next_base_decision,
     output logic decisions_wr_data,
     output logic decisions_wr_en,
@@ -928,7 +935,7 @@ module vc_dependent #(
     output logic [CUBOIDS-1:0] potential_surface_wr_ens,
     output logic [$clog2(AREA+1)-1:0] next_potential_areas[CUBOIDS],
     output state_t next_saved_state,
-    //
+
     output logic in_ready,
     output logic out_data,
     output logic out_valid,
@@ -1013,7 +1020,7 @@ module vc_dependent #(
         assert (target_ref.parent == run_stack_len - 1);
 
         if (!interrupted) begin
-          if (target_parent.decision_index < base_decision) begin
+          if (!can_backtrack) begin
             // Hold up, we're about to try and backtrack an decision that it isn't this
             // finder's job to try both options of. That means we're done!
             sync_reset = 1;

@@ -126,9 +126,9 @@ module valid_checker (
   generate
     // Determine which shard of the net each neighbour's bit is located in.
     logic [1:0] shards[4];
-    always_comb begin
+    always_ff @(posedge clk) begin
       case ({
-        instruction.pos.x[1:0], instruction.pos.y[1:0]
+        next_instruction.pos.x[1:0], next_instruction.pos.y[1:0]
       })
         // Each 4x4 chunk of the net is split up into shards like this:
         //     2301
@@ -138,42 +138,47 @@ module valid_checker (
         // where each number is the shard that that square is stored in. This layout
         // guarantees that for every square, all its neighbours are in different net
         // shards.
-        'b0000, 'b1010: shards = '{3, 0, 1, 2};
-        'b0100, 'b1110: shards = '{0, 1, 2, 3};
-        'b1000, 'b0010: shards = '{1, 2, 3, 0};
-        'b1100, 'b0110: shards = '{2, 3, 0, 1};
-        'b0001, 'b1011: shards = '{3, 2, 1, 0};
-        'b0101, 'b1111: shards = '{0, 3, 2, 1};
-        'b1001, 'b0011: shards = '{1, 0, 3, 2};
-        'b1101, 'b0111: shards = '{2, 1, 0, 3};
-        default: shards = '{default: 'x};
+        'b0000, 'b1010: shards <= '{3, 0, 1, 2};
+        'b0100, 'b1110: shards <= '{0, 1, 2, 3};
+        'b1000, 'b0010: shards <= '{1, 2, 3, 0};
+        'b1100, 'b0110: shards <= '{2, 3, 0, 1};
+        'b0001, 'b1011: shards <= '{3, 2, 1, 0};
+        'b0101, 'b1111: shards <= '{0, 3, 2, 1};
+        'b1001, 'b0011: shards <= '{1, 0, 3, 2};
+        'b1101, 'b0111: shards <= '{2, 1, 0, 3};
+        default: shards <= '{default: 'x};
       endcase
     end
 
     // Also figure out the reverse, which neighbour falls into each shard.
     logic [1:0] shard_neighbours[4];
+    logic [1:0] next_shard_neighbours[4];
     always_comb begin
       case ({
-        instruction.pos.x[1:0], instruction.pos.y[1:0]
+        next_instruction.pos.x[1:0], next_instruction.pos.y[1:0]
       })
-        'b0000, 'b1010: shard_neighbours = '{1, 2, 3, 0};
-        'b0100, 'b1110: shard_neighbours = '{0, 1, 2, 3};
-        'b1000, 'b0010: shard_neighbours = '{3, 0, 1, 2};
-        'b1100, 'b0110: shard_neighbours = '{2, 3, 0, 1};
-        'b0001, 'b1011: shard_neighbours = '{3, 2, 1, 0};
-        'b0101, 'b1111: shard_neighbours = '{0, 3, 2, 1};
-        'b1001, 'b0011: shard_neighbours = '{1, 0, 3, 2};
-        'b1101, 'b0111: shard_neighbours = '{2, 1, 0, 3};
-        default: shard_neighbours = '{default: 'x};
+        'b0000, 'b1010: next_shard_neighbours = '{1, 2, 3, 0};
+        'b0100, 'b1110: next_shard_neighbours = '{0, 1, 2, 3};
+        'b1000, 'b0010: next_shard_neighbours = '{3, 0, 1, 2};
+        'b1100, 'b0110: next_shard_neighbours = '{2, 3, 0, 1};
+        'b0001, 'b1011: next_shard_neighbours = '{3, 2, 1, 0};
+        'b0101, 'b1111: next_shard_neighbours = '{0, 3, 2, 1};
+        'b1001, 'b0011: next_shard_neighbours = '{1, 0, 3, 2};
+        'b1101, 'b0111: next_shard_neighbours = '{2, 1, 0, 3};
+        default: next_shard_neighbours = '{default: 'x};
       endcase
     end
+    always_ff @(posedge clk) shard_neighbours <= next_shard_neighbours;
 
     // Then instantiate all the shards. We need to put their outputs into a variable
     // like this because arrays of module instances are weird.
     logic shard_values[4];
     for (shard = 0; shard < 4; shard++) begin : gen_net_shards
-      logic [1:0] neighbour;
-      assign neighbour = shard_neighbours[shard];
+      logic [1:0] neighbour_direction;
+      instruction_t neighbour;
+
+      assign neighbour_direction = shard_neighbours[shard];
+      always_ff @(posedge clk) neighbour <= next_neighbours[next_shard_neighbours[shard]];
 
       // Instantiate the actual RAM for this net shard.
       async_ram #(
@@ -181,12 +186,12 @@ module valid_checker (
       ) ram (
           .clk(clk),
 
-          .addr(clear_mode ? clear_index : {
-            neighbours[neighbour].pos.x[COORD_BITS-1:2], neighbours[neighbour].pos.y
-          }),
+          .addr(clear_mode ? clear_index : {neighbour.pos.x[COORD_BITS-1:2], neighbour.pos.y}),
           .wr_en(
             clear_mode ? 1
-            : (run & neighbours_valid[neighbour]) | (backtrack & neighbours_valid_in[neighbour])
+            : run ? neighbours_valid[neighbour_direction]
+            : backtrack ? neighbours_valid_in[neighbour_direction]
+            : 0
           ),
           .wr_data(clear_mode ? 0 : run),
           .rd_data(shard_values[shard])
