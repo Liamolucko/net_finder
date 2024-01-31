@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/fpga-sim"]
+members = ["crates/fpga-driver", "crates/fpga-sim"]
 
 [package]
 name = "net-finder"
@@ -33,3 +33,6 @@ wgpu = "0.17.0"
 
 [profile.release]
 debug = true
+
+[patch.crates-io]
+wishbone-bridge = { git = "https://github.com/litex-hub/wishbone-utils" }

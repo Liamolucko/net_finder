@@ -47,7 +47,7 @@ pub struct FinderCtx<const CUBOIDS: usize> {
     /// how we skip solutions covered by other `Finder`s.
     inner_cuboids: [Cuboid; CUBOIDS],
     /// The common area of all the cuboids in `outer_cuboids` / `inner_cuboids`.
-    target_area: usize,
+    pub target_area: usize,
 
     /// Square caches for the cuboids (`inner_cuboids`, specifically).
     square_caches: [SquareCache; CUBOIDS],
@@ -356,6 +356,101 @@ impl<'a, const CUBOIDS: usize> Arbitrary<'a> for FinderInfo<CUBOIDS> {
 
         Ok(res)
     }
+}
+
+impl<const CUBOIDS: usize> FinderInfo<CUBOIDS> {
+    /// Converts a `FinderInfo` to the encoded representation used by the FPGA.
+    pub fn to_bits(&self, ctx: &FinderCtx<CUBOIDS>) -> Vec<bool> {
+        /// Returns an iterator over the lower `bits` bits of `int`, from MSB to
+        /// LSB.
+        fn bits(int: impl Into<usize>, bits: u32) -> impl Iterator<Item = bool> {
+            let int: usize = int.into();
+            (0..bits).rev().map(move |bit| int & (1 << bit) != 0)
+        }
+
+        // First figure out the bits we need to actually send to the core.
+        let mut result = Vec::new();
+
+        let start_mapping = self.start_mapping.sample(&ctx.outer_square_caches);
+        // `mapping_t` on the FPGA is a packed array, which means higher indices come
+        // first and so we need to add these in reverse order.
+        for cursor in start_mapping.cursors.into_iter().rev() {
+            result.extend(bits(cursor.0, clog2(4 * ctx.target_area)));
+        }
+
+        // Mapping indexes on the FPGA don't work the same way as the ones on
+        // the CPU: they don't include the class of the cursor on the fixed
+        // cuboid.
+        for (cuboid, class) in self
+            .start_mapping
+            .classes
+            .into_iter()
+            .enumerate()
+            .filter(|&(cuboid, _)| cuboid != ctx.fixed_cuboid)
+        {
+            result.extend(bits(
+                class.index(),
+                clog2(ctx.outer_square_caches[cuboid].classes().len()),
+            ));
+        }
+
+        result.extend(bits(self.base_decision, clog2(4 * ctx.target_area)));
+
+        result.extend(&self.decisions);
+
+        result
+    }
+
+    /// Creates a `FinderInfo` from the encoded representation used by the FPGA.
+    pub fn from_bits(ctx: &FinderCtx<CUBOIDS>, bits: impl IntoIterator<Item = bool>) -> Self {
+        let mut bits = bits.into_iter();
+
+        /// Consumes the first `bits` bits from `iter` and returns them as an
+        /// integer, with the first bit read being the MSB and the last bit
+        /// being the LSB.
+        fn take_bits<T>(iter: impl Iterator<Item = bool>, bits: u32) -> T
+        where
+            T: TryFrom<usize>,
+            T::Error: Debug,
+        {
+            let mut result = 0;
+            let mut taken = 0;
+            for bit in iter.take(bits.try_into().unwrap()) {
+                result <<= 1;
+                result |= bit as usize;
+                taken += 1;
+            }
+            assert_eq!(taken, bits);
+            result.try_into().unwrap()
+        }
+
+        let mut start_mapping = Mapping {
+            cursors: array::from_fn(|_| Cursor(take_bits(&mut bits, clog2(4 * ctx.target_area)))),
+        };
+        // `mapping_t` goes from highest index to lowest, so we need to reverse it.
+        start_mapping.cursors.reverse();
+
+        // Skip over `start_mapping_index`, we don't need it.
+        take_bits::<usize>(
+            &mut bits,
+            ctx.outer_square_caches
+                .iter()
+                .enumerate()
+                .filter(|&(cuboid, _)| cuboid != ctx.fixed_cuboid)
+                .map(|(_, cache)| clog2(cache.classes().len()))
+                .sum(),
+        );
+
+        FinderInfo {
+            start_mapping: start_mapping.to_classes(&ctx.outer_square_caches),
+            base_decision: take_bits(&mut bits, clog2(4 * ctx.target_area)),
+            decisions: bits.collect(),
+        }
+    }
+}
+
+fn clog2(x: usize) -> u32 {
+    usize::BITS - (x - 1).leading_zeros()
 }
 
 /// An instruction to add a square.
@@ -836,9 +931,6 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     /// reached, goes through all of the unrun instructions to find which ones
     /// are valid, and figures out which combinations of them result in a valid
     /// net.
-    ///
-    /// It also takes a `search_time` to be inserted into any `Solution`s it
-    /// yields.
     fn finalize<'a>(&self, ctx: &'a FinderCtx<CUBOIDS>) -> Finalize<'a, CUBOIDS> {
         if !self.possible_solution(ctx) {
             return Finalize::Known(None);
@@ -863,6 +955,18 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
             .collect();
 
         ctx.finalize(completed, potential_squares)
+    }
+
+    /// A version of `finalize` which also runs the finder until it reaches the end of the queue first.
+    pub fn finish_and_finalize<'a>(
+        &mut self,
+        ctx: &'a FinderCtx<CUBOIDS>,
+    ) -> impl Iterator<Item = Solution> + 'a {
+        while self.index < self.queue.len() {
+            self.handle_instruction(ctx);
+        }
+
+        self.finalize(ctx)
     }
 
     /// Splits this `Finder` in place, so that its work is now split between

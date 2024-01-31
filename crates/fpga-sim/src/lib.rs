@@ -239,40 +239,7 @@ impl<'a> Core<'a> {
     /// If the `core` is already running a finder, this will get stuck in an
     /// infinite loop.
     pub fn load_finder(&mut self, ctx: &FinderCtx<NUM_CUBOIDS>, info: &FinderInfo<NUM_CUBOIDS>) {
-        let start_mapping = info.start_mapping.sample(&ctx.outer_square_caches);
-
-        /// Returns an iterator over the lower `bits` bits of `int`, from MSB to
-        /// LSB.
-        fn bits(int: impl Into<usize>, bits: u32) -> impl Iterator<Item = bool> {
-            let int: usize = int.into();
-            (0..bits).rev().map(move |bit| int & (1 << bit) != 0)
-        }
-
-        // First figure out the bits we need to actually send to the core.
-        let mut finder_bits = Vec::new();
-        // `mapping_t` on the FPGA is a packed array, which means higher indices come
-        // first and so we need to add these in reverse order.
-        for cursor in start_mapping.cursors.into_iter().rev() {
-            finder_bits.extend(bits(cursor.0, clog2(4 * AREA)));
-        }
-        // Mapping indexes on the FPGA don't work the same way as the ones on
-        // the CPU: they don't include the class of the cursor on the fixed
-        // cuboid.
-        for (cuboid, class) in info
-            .start_mapping
-            .classes
-            .into_iter()
-            .enumerate()
-            .filter(|&(cuboid, _)| cuboid != ctx.fixed_cuboid)
-        {
-            finder_bits.extend(bits(
-                class.index(),
-                clog2(ctx.outer_square_caches[cuboid].classes().len()),
-            ));
-        }
-        finder_bits.extend(bits(info.base_decision, clog2(4 * AREA)));
-
-        finder_bits.extend(&info.decisions);
+        let finder_bits = info.to_bits(ctx);
 
         // Then do that.
         for (i, &bit) in finder_bits.iter().enumerate() {
@@ -318,49 +285,7 @@ impl<'a> Core<'a> {
         }
 
         // Then interpret them as a `FinderInfo`.
-        let mut finder_bits = finder_bits.into_iter();
-
-        /// Consumes the first `bits` bits from `iter` and returns them as an
-        /// integer, with the first bit read being the MSB and the last bit
-        /// being the LSB.
-        fn take_bits<T>(iter: impl Iterator<Item = bool>, bits: u32) -> T
-        where
-            T: TryFrom<usize>,
-            T::Error: Debug,
-        {
-            let mut result = 0;
-            let mut taken = 0;
-            for bit in iter.take(bits.try_into().unwrap()) {
-                result <<= 1;
-                result |= bit as usize;
-                taken += 1;
-            }
-            assert_eq!(taken, bits);
-            result.try_into().unwrap()
-        }
-
-        let mut start_mapping = Mapping {
-            cursors: array::from_fn(|_| Cursor(take_bits(&mut finder_bits, clog2(4 * AREA)))),
-        };
-        // `mapping_t` goes from highest index to lowest, so we need to reverse it.
-        start_mapping.cursors.reverse();
-
-        // Skip over `start_mapping_index`, we don't need it.
-        take_bits::<usize>(
-            &mut finder_bits,
-            ctx.outer_square_caches
-                .iter()
-                .enumerate()
-                .filter(|&(cuboid, _)| cuboid != ctx.fixed_cuboid)
-                .map(|(_, cache)| clog2(cache.classes().len()))
-                .sum(),
-        );
-
-        FinderInfo {
-            start_mapping: start_mapping.to_classes(&ctx.outer_square_caches),
-            base_decision: take_bits(&mut finder_bits, clog2(4 * AREA)),
-            decisions: finder_bits.collect(),
-        }
+        FinderInfo::from_bits(ctx, finder_bits)
     }
 
     /// Waits for an 'event' to occur in the core, and returns it.

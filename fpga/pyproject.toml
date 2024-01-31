@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "net-finder-soc"
+version = "0.1.0"
+description = ""
+authors = ["Liam Murphy <liampm32@gmail.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+migen = { git = "https://github.com/m-labs/migen", rev = "ccaee68e14d3636e1d8fb2e0864dd89b1b1f7384" }
+litedram = { git = "https://github.com/enjoy-digital/litedram", rev = "2023.12" }
+liteeth = { git = "https://github.com/enjoy-digital/liteeth", tag = "2023.12" }
+# Use PR #124, which adds support for Linux 6.5+.
+litepcie = { git = "https://github.com/enjoy-digital/litepcie", rev = "bd01d5f448157d5f6c09821596421a44ca2e1282" }
+litescope = { git = "https://github.com/enjoy-digital/litescope", tag = "2023.12" }
+litex = "^2023.12"
+litex-boards = { git = "https://github.com/litex-hub/litex-boards", tag = "2023.12" }
+pythondata-cpu-vexriscv = "^1.0.1.post407"
+pythondata-misc-tapcfg = { git = "https://github.com/litex-hub/pythondata-misc-tapcfg", rev = "2023.12" }
+pythondata-software-picolibc = "^1.7.9.post181"
+pythondata-software-compiler-rt = "^0.0.post6206"
+dearpygui = "^1.10.1"
+pyvcd = "^0.4.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

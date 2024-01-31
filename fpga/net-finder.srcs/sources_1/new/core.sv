@@ -175,20 +175,24 @@ module core (
 
     // Whether the next clock cycle will be put to use for either running or
     // backtracking. For testing purposes.
-    output logic stepping
+    output logic   stepping,
+    // The current state the core's in. For profiling and/or debugging purposes.
+    output state_t state
 );
 
-  state_t state;
+  state_t state_reg;
   state_t next_state;
   state_t predicted_state;
 
   always_ff @(posedge clk, posedge reset) begin
     if (reset | sync_reset) begin
-      state <= CLEAR;
+      state_reg <= CLEAR;
     end else begin
-      state <= next_state;
+      state_reg <= next_state;
     end
   end
+
+  assign state = state_reg;
 
   assign out_solution = out_valid & state.solution;
   assign out_split = out_valid & state.split;
