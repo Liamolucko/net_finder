@@ -674,7 +674,7 @@ module core (
     advance   = 0;
     backtrack = 0;
     case (state)
-      CLEAR | CHECK_WAIT | CHECK | SOLUTION | STALL | SPLIT | PAUSE: begin
+      CLEAR, CHECK_WAIT, CHECK, SOLUTION, STALL, SPLIT, PAUSE: begin
         advance   = 0;
         backtrack = 0;
       end
