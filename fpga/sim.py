@@ -1,25 +1,20 @@
 import os
 import subprocess
 
-from litex.gen import *
-
-from litex.tools.litex_sim import generate_gtkw_savefile
-
+from core import CoreManager, Cuboid
+from liteeth.mac import LiteEthMAC
+from liteeth.phy.gmii import LiteEthPHYGMII
+from liteeth.phy.model import LiteEthPHYModel
+from liteeth.phy.xgmii import LiteEthPHYXGMII
 from litex.build.generic_platform import *
-
 from litex.build.io import DifferentialInput
 from litex.build.sim import SimPlatform
 from litex.build.sim.config import SimConfig
-
-from litex.soc.integration.soc_core import *
+from litex.gen import *
 from litex.soc.integration.builder import *
-
-from liteeth.phy.gmii import LiteEthPHYGMII
-from liteeth.phy.xgmii import LiteEthPHYXGMII
-from liteeth.phy.model import LiteEthPHYModel
-from liteeth.mac import LiteEthMAC
-
-from core import CoreManager, Cuboid
+from litex.soc.integration.soc_core import *
+from litex.tools.litex_sim import generate_gtkw_savefile
+from migen.genlib.resetsync import AsyncResetSynchronizer
 
 # IOs ----------------------------------------------------------------------------------------------
 
@@ -103,12 +98,13 @@ class CRG(Module):
         self.sync.por += int_rst.eq(self.rst)
         self.comb += [
             self.cd_sys.clk.eq(sys_clk),
-            self.cd_por.clk.eq(sys_clk),
-            self.cd_sys.rst.eq(int_rst),
+            # Use the slowest clock for this one so that the reset signal isn't missed.
+            self.cd_por.clk.eq(core_clk),
             self.cd_core.clk.eq(core_clk),
-            # TODO: not sure if this bit's right, it isn't in the right clock domain.
             self.cd_core.rst.eq(int_rst),
         ]
+
+        self.specials += AsyncResetSynchronizer(self.cd_sys, int_rst)
 
 
 # BaseSoC -----------------------------------------------------------------------------------------
@@ -118,6 +114,7 @@ class BaseSoC(SoCCore):
     def __init__(
         self,
         cuboids: list[Cuboid],
+        cores: int,
         with_ethernet=False,
         ethernet_phy_model="sim",
         with_etherbone=False,
@@ -198,7 +195,7 @@ class BaseSoC(SoCCore):
             assert cuboid.surface_area() == cuboids[0].surface_area()
         # I would use commas here but that breaks CSV export.
         self.add_config("CUBOIDS", ";".join(map(str, cuboids)))
-        self.core_mgr = CoreManager(cuboids, with_analyzer=with_analyzer)
+        self.core_mgr = CoreManager(cuboids, cores, with_analyzer=with_analyzer)
 
 
 # Build --------------------------------------------------------------------------------------------
@@ -249,6 +246,14 @@ def main():
 
     parser.add_target_argument(
         "--cuboids", nargs="+", help="The cuboids to find nets of."
+    )
+    parser.add_target_argument(
+        "--cores",
+        # Default to just 3 cores in simulation, I don't think the simulator would be
+        # very happy simulating 80 of them.
+        default=3,
+        type=int,
+        help="The number of cores to include.",
     )
 
     # Disable all the features we aren't using (by default).
@@ -305,6 +310,7 @@ def main():
         trace_reset_on=int(float(args.trace_start)) > 0
         or int(float(args.trace_end)) > 0,
         cuboids=cuboids,
+        cores=args.cores,
         **soc_kwargs,
     )
 

@@ -129,7 +129,9 @@ module run_stack_ram (
 endmodule
 
 module core (
+    // The clock signal for the core.
     input logic clk,
+    // A synchronous reset signal for the core.
     input logic reset,
 
     // This is loosely inspired by AXI4-Stream, except that it operates on bits
@@ -173,6 +175,12 @@ module core (
     input logic req_pause,
     input logic req_split,
 
+    // Whether this core needs a new finder to run.
+    //
+    // This is asserted when the core enters RECEIVE state, and deasserted as soon
+    // as it starts receiving a finder.
+    output logic wants_finder,
+
     // Whether the next clock cycle will be put to use for either running or
     // backtracking. For testing purposes.
     output logic   stepping,
@@ -184,8 +192,8 @@ module core (
   state_t next_state;
   state_t predicted_state;
 
-  always_ff @(posedge clk, posedge reset) begin
-    if (reset | sync_reset) begin
+  always_ff @(posedge clk) begin
+    if (reset | local_reset) begin
       state_reg <= CLEAR;
     end else begin
       state_reg <= next_state;
@@ -199,8 +207,9 @@ module core (
   assign out_pause = out_valid & state.pause;
 
   // Control signals.
-  // Whether to do a synchronous reset on the next clock edge.
-  logic sync_reset;
+  // Whether to do a synchronous reset on the next clock edge, independent of the
+  // rest of the design.
+  logic local_reset;
   // Whether to advance to the next instruction.
   logic advance;
   // Whether to run `target`. Should only ever be 1 if `advance` is 1 as well.
@@ -240,8 +249,8 @@ module core (
   // We don't bother clearing `prefix` on reset since it's bogus anyway.
   always_ff @(posedge clk) prefix <= next_prefix;
 
-  always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset | reset_prefix_bits) begin
+  always_ff @(posedge clk) begin
+    if (reset | local_reset | reset_prefix_bits) begin
       prefix_bits_left <= $bits(prefix_t);
     end else begin
       prefix_bits_left <= next_prefix_bits_left;
@@ -284,8 +293,8 @@ module core (
   logic decisions_wr_data;
   logic decisions_rd_data;
 
-  always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset) begin
+  always_ff @(posedge clk) begin
+    if (reset | local_reset) begin
       decisions_len <= 0;
     end else begin
       decisions_len <= next_decisions_len;
@@ -310,8 +319,8 @@ module core (
 
   // The index of the current decision we're sending.
   decision_index_t decision_index;
-  always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset | (!state.solution & !state.split & !state.pause)) begin
+  always_ff @(posedge clk) begin
+    if (reset | local_reset | (!state.solution & !state.split & !state.pause)) begin
       // Set this to 0 whenever we aren't using it so that way it'll always be 0 when
       // we start to.
       decision_index <= 0;
@@ -385,8 +394,8 @@ module core (
   // If we're wrong, a clock cycle gets wasted in STALL state.
   instruction_ref_t predicted_target_ref;
 
-  always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset) begin
+  always_ff @(posedge clk) begin
+    if (reset | local_reset) begin
       run_stack_len <= 0;
       // Don't bother resetting `target_ref`, `target_parent` and `last_child`,
       // they're all nonsense until `run_stack_len` is at least 1 anyway.
@@ -467,8 +476,8 @@ module core (
   potential_index_t potential_len;
   potential_index_t next_potential_len;
 
-  always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset) begin
+  always_ff @(posedge clk) begin
+    if (reset | local_reset) begin
       potential_len   <= 0;
       potential_index <= 0;
     end else begin
@@ -511,8 +520,8 @@ module core (
 
   // When in `CLEAR` state, the index in the net/surface we're currently clearing.
   logic [2*COORD_BITS-3:0] clear_index;
-  always_ff @(posedge clk, posedge reset) begin
-    if (reset | sync_reset | !state.clear) begin
+  always_ff @(posedge clk) begin
+    if (reset | local_reset | !state.clear) begin
       // Reset this to 0 whenever we aren't in `CLEAR` state. That way, it'll always
       // be 0 on the first clock cycle of clearing.
       clear_index <= 0;
@@ -564,8 +573,8 @@ module core (
   // 1s set in `potential_surfaces[cuboid]`.
   logic [$clog2(AREA+1)-1:0] potential_areas[CUBOIDS];
   logic [$clog2(AREA+1)-1:0] next_potential_areas[CUBOIDS];
-  always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset) begin
+  always_ff @(posedge clk) begin
+    if (reset | local_reset) begin
       for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
         // We don't actually have any idea how many 1s there are at this point, but
         // since we go into `CLEAR` state on reset 0 will become correct in a second
@@ -581,8 +590,8 @@ module core (
   // ready for the next time we enter `CHECK` state. This is the index we're up to
   // in doing so.
   square_t potential_surfaces_clear_index;
-  always_ff @(posedge clk or posedge reset) begin
-    if (reset | sync_reset | state.check) begin
+  always_ff @(posedge clk) begin
+    if (reset | local_reset | state.check) begin
       potential_surfaces_clear_index <= 0;
     end else begin
       potential_surfaces_clear_index <= potential_surfaces_clear_index + 1;
@@ -705,6 +714,7 @@ module core (
       .in_data(in_data),
       .in_valid(in_valid),
       .in_last(in_last),
+      .out_ready(out_ready),
       .state(state),
       .prefix_bits_left(prefix_bits_left),
       .prefix_out(prefix_out),
@@ -755,7 +765,8 @@ module core (
       .out_data(),
       .out_valid(),
       .out_last(),
-      .sync_reset(),
+      .wants_finder(),
+      .local_reset(),
       .run(),
       .inc_decision_index(),
       .reset_prefix_bits()
@@ -769,6 +780,7 @@ module core (
       .in_data(in_data),
       .in_valid(in_valid),
       .in_last(in_last),
+      .out_ready(out_ready),
       .state(state),
       .prefix_bits_left(prefix_bits_left),
       .prefix_out(prefix_out),
@@ -820,7 +832,8 @@ module core (
       .out_data(out_data),
       .out_valid(out_valid),
       .out_last(out_last),
-      .sync_reset(sync_reset),
+      .wants_finder(wants_finder),
+      .local_reset(local_reset),
       .run(run),
       .inc_decision_index(inc_decision_index),
       .reset_prefix_bits()
@@ -894,6 +907,7 @@ module vc_dependent #(
     input logic in_data,
     input logic in_valid,
     input logic in_last,
+    input logic out_ready,
     input state_t state,
     input logic [$clog2($bits(prefix_t)+1)-1:0] prefix_bits_left,
     input logic prefix_out,
@@ -944,7 +958,8 @@ module vc_dependent #(
     output logic out_data,
     output logic out_valid,
     output logic out_last,
-    output logic sync_reset,
+    output logic wants_finder,
+    output logic local_reset,
     output logic run,
     output logic inc_decision_index,
     output logic reset_prefix_bits
@@ -961,8 +976,9 @@ module vc_dependent #(
     out_data = prefix_bits_left > 0 ? prefix_out : decisions_rd_data;
     out_valid = 0;
     out_last = 0;
+    wants_finder = 0;
 
-    sync_reset = 0;
+    local_reset = 0;
     run = 0;
     inc_decision_index = 0;
     reset_prefix_bits = 0;
@@ -981,14 +997,14 @@ module vc_dependent #(
       end
 
       RECEIVE: begin
-        if (prefix_bits_left == 0 & in_valid) begin
-          // We have a decision to process, so no matter what we'll be advancing past this
-          // instruction.
+        wants_finder = prefix_bits_left == $bits(prefix_t);
+        if (prefix_bits_left == 0) begin
+          // We're up to processing decisions now.
           if (instruction_valid & |neighbours_valid) begin
             // The instruction's valid and isn't a potential instruction, which means that
-            // whether we run it's a decision and we can consume one.
+            // whether we run it's a decision and we can consume one if one's ready.
             in_ready = 1;
-            run = in_data;
+            run = in_valid & in_data;
           end
         end else begin
           // We always immediately read the prefix.
@@ -1027,7 +1043,7 @@ module vc_dependent #(
           if (!can_backtrack) begin
             // Hold up, we're about to try and backtrack an decision that it isn't this
             // finder's job to try both options of. That means we're done!
-            sync_reset = 1;
+            local_reset = 1;
           end else begin
             next_state = RUN;
 
@@ -1067,12 +1083,14 @@ module vc_dependent #(
         assert (decisions_len != 0);
 
         out_valid = 1;
-        inc_decision_index = prefix_bits_left == 0;
+        inc_decision_index = prefix_bits_left == 0 & out_ready;
         if (prefix_bits_left == 0 & decision_index == decisions_len - 1 | !TARGET_IGNORED_STATES) begin
           // We've just written out the last decision (if it was a decision in the first
           // place), and so we can go back to running.
-          out_last   = 1;
-          next_state = BACKTRACK;
+          out_last = 1;
+          if (out_ready | !TARGET_IGNORED_STATES) begin
+            next_state = BACKTRACK;
+          end
         end
       end
 
@@ -1082,7 +1100,6 @@ module vc_dependent #(
 
       SPLIT: begin
         assert (decisions_len != 0);
-        inc_decision_index = prefix_bits_left == 0;
         out_valid = prefix_bits_left > 0 | decision_index < base_decision;
 
         if (prefix_bits_left == 0) begin
@@ -1099,19 +1116,24 @@ module vc_dependent #(
             // 1 and so we need to keep going until we find one.
           end
 
-          if (decision_index >= base_decision & decisions_rd_data == 1 | !TARGET_IGNORED_STATES) begin
-            // Great, we've found a 1 to set `base_decision` to. Stop here.
-            next_base_decision = decision_index;
-            next_state = was_backtrack ? BACKTRACK : RUN;
-          end else if (decision_index == decisions_len - 1) begin
-            // We've gone through all the decisions without finding any 1s to make
-            // `prefix.base_decision` point to, which means it needs to be 1 past the end of
-            // `decisions`.
-            next_base_decision = decisions_len;
+          // Don't move forwards until either our output's been accepted or we're finished
+          // transmitting.
+          if (out_ready | !out_valid | !TARGET_IGNORED_STATES) begin
+            inc_decision_index = 1;
+            if (decision_index >= base_decision & decisions_rd_data == 1 | !TARGET_IGNORED_STATES) begin
+              // Great, we've found a 1 to set `base_decision` to. Stop here.
+              next_base_decision = decision_index;
+              next_state = was_backtrack ? BACKTRACK : RUN;
+            end else if (decision_index == decisions_len - 1) begin
+              // We've gone through all the decisions without finding any 1s to make
+              // `prefix.base_decision` point to, which means it needs to be 1 past the end of
+              // `decisions`.
+              next_base_decision = decisions_len;
 
-            // It's a bit sketchy to increment `decision_index` past the end of `decisions`.
-            inc_decision_index = 0;
-            next_state = was_backtrack ? BACKTRACK : RUN;
+              // It's a bit sketchy to increment `decision_index` past the end of `decisions`.
+              inc_decision_index = 0;
+              next_state = was_backtrack ? BACKTRACK : RUN;
+            end
           end
         end
       end
@@ -1120,15 +1142,17 @@ module vc_dependent #(
         assert (decisions_len != 0);
 
         out_valid = 1;
-        inc_decision_index = prefix_bits_left == 0;
+        inc_decision_index = prefix_bits_left == 0 & out_ready;
         if (prefix_bits_left == 0 & decision_index == decisions_len - 1) begin
           // We've just written out the last decision (if it was a decision in the first
           // place), and so now it's time to clear everything out ready for the next
           // finder.
-          out_last   = 1;
-          sync_reset = 1;
-          // This is overriden by `sync_reset` but eh, may as well specify it anyway.
-          next_state = CLEAR;
+          out_last = 1;
+          if (out_ready) begin
+            local_reset = 1;
+            // This is overriden by `local_reset` but eh, may as well specify it anyway.
+            next_state  = CLEAR;
+          end
         end
       end
 
@@ -1136,7 +1160,7 @@ module vc_dependent #(
         next_state = 'x;
         in_ready = 'x;
         run = 'x;
-        sync_reset = 'x;
+        local_reset = 'x;
         next_base_decision = 'x;
         out_valid = 'x;
         inc_decision_index = 'x;
@@ -1356,7 +1380,7 @@ module vc_dependent #(
       if (next_run_stack_len == 0) begin
         // We're trying to backtrack when there are no instructions left to backtrack;
         // that means we're done.
-        sync_reset = 1;
+        local_reset = 1;
       end else begin
         // Make sure `target_parent` will be set to the last entry in the run stack.
         next_target_ref = '{parent: next_run_stack_len - 1, child_index: 'x};

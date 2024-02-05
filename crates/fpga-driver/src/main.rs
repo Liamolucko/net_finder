@@ -13,6 +13,9 @@ use litex_bridge::{csr_struct, CsrGroup, CsrRo, CsrRw, SocConstant, SocInfo};
 use net_finder::{Cuboid, Finder, FinderCtx, FinderInfo, Net};
 use wishbone_bridge::{EthernetBridge, PCIeBridge};
 
+// TODO: add support for runtime-sized CSRs, because this is not always 6.
+const FINDER_WORDS: usize = 6;
+
 #[derive(Parser)]
 #[command(group = clap::ArgGroup::new("bridge").required(true).multiple(false))]
 struct Args {
@@ -54,10 +57,9 @@ fn main() -> anyhow::Result<()> {
 
 csr_struct! {
     struct CoreManagerRegisters<'a> {
-        // TODO: add support for runtime-sized CSRs, because this is not always 4 u32s long.
-        input: CsrRw<'a, 4>,
+        input: CsrRw<'a, FINDER_WORDS>,
         input_submit: CsrRw<'a>,
-        output: CsrRo<'a, 4>,
+        output: CsrRo<'a, FINDER_WORDS>,
         output_consume: CsrRw<'a>,
         flow: CsrRo<'a>,
         active: CsrRo<'a>,
@@ -118,7 +120,7 @@ fn main_inner<const CUBOIDS: usize>(
                 bits.reverse();
                 bits.extend(int_bits(len, finder_len_bits));
 
-                let input: [u32; 4] = bits
+                let input: [u32; FINDER_WORDS] = bits
                     .chunks(32)
                     // The individual bits go in little-endian order, but the addresses go in
                     // big-endian order, so we have to reverse the order of the chunks.

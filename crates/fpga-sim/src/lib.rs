@@ -199,6 +199,9 @@ impl<'a> Core<'a> {
     pub fn reset(&mut self) {
         *self.reset_sig() = true;
         self.update();
+
+        self.clock();
+
         *self.reset_sig() = false;
         self.update();
     }
