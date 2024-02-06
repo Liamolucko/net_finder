@@ -22,11 +22,11 @@ fn main() {
         println!();
     }
 
-    match cuboids.as_slice() {
-        &[] => run([], verbose),
-        &[a] => run([a], verbose),
-        &[a, b] => run([a, b], verbose),
-        &[a, b, c] => run([a, b, c], verbose),
+    match *cuboids.as_slice() {
+        [] => run([], verbose),
+        [a] => run([a], verbose),
+        [a, b] => run([a, b], verbose),
+        [a, b, c] => run([a, b, c], verbose),
         _ => panic!("only up to 3 cuboids supported"),
     }
 }

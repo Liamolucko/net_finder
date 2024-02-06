@@ -1,7 +1,6 @@
-use std::collections::HashSet;
 use std::num::{NonZeroU64, NonZeroU8};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::{array, iter, mem};
 
 use anyhow::{bail, Context};
@@ -16,9 +15,10 @@ use wgpu::{
     ShaderModuleDescriptor, ShaderSource, ShaderStages,
 };
 
-use crate::{Cursor, Finder, Mapping, Net, Pos, Solution, SquareCache, State, Surface};
-
-use super::{FinderCtx, Instruction};
+use net_finder::{
+    Cuboid, Cursor, Finder, FinderCtx, FinderInfo, Instruction, Mapping, Pos, Runtime, Solution,
+    Surface,
+};
 
 /// The number of `Finder`s we always give to the GPU.
 const NUM_FINDERS: u32 = 13440;
@@ -27,6 +27,59 @@ const WORKGROUP_SIZE: u32 = 64;
 /// The capacity of the buffer into which our shader writes the solutions it
 /// finds.
 const SOLUTION_CAPACITY: u32 = 10000;
+
+pub struct GpuRuntime<const CUBOIDS: usize> {
+    cuboids: [Cuboid; CUBOIDS],
+}
+
+impl<const CUBOIDS: usize> GpuRuntime<CUBOIDS> {
+    /// Makes a new runtime for running finders on the GPU.
+    pub fn new(cuboids: [Cuboid; CUBOIDS]) -> Self {
+        Self { cuboids }
+    }
+}
+
+impl<const CUBOIDS: usize> Runtime<CUBOIDS> for GpuRuntime<CUBOIDS> {
+    fn cuboids(&self) -> [Cuboid; CUBOIDS] {
+        self.cuboids
+    }
+
+    fn run(
+        self,
+        ctx: &FinderCtx<CUBOIDS>,
+        finders: &[FinderInfo<CUBOIDS>],
+        solution_tx: &mpsc::Sender<Solution>,
+        pause: &AtomicBool,
+        progress: Option<&ProgressBar>,
+    ) -> anyhow::Result<Vec<FinderInfo<CUBOIDS>>> {
+        let mut finders = finders
+            .iter()
+            .map(|finder| Finder::new(ctx, finder))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut pipeline = pollster::block_on(Pipeline::new(ctx.clone(), &finders))?;
+
+        while !finders.is_empty() && !pause.load(Ordering::Relaxed) {
+            let (solutions, new_finders, finders_created, finders_finished) =
+                pipeline.run_finders(mem::take(&mut finders));
+            finders = new_finders;
+
+            for solution in solutions {
+                solution_tx.send(solution)?;
+            }
+
+            if let Some(progress) = progress {
+                progress.inc_length(finders_created);
+                progress.inc(finders_finished);
+            }
+        }
+
+        Ok(finders
+            .into_iter()
+            .map(|finder| finder.into_info(ctx))
+            .collect())
+    }
+}
 
 /// Various useful constants that are often needed when talking to the GPU.
 ///
@@ -209,8 +262,10 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
         } = Constants::compute(num_cuboids, area);
 
         let mut lookup_buf_contents = Vec::new();
-        for cache in &ctx.square_caches {
-            cache.to_gpu(&mut lookup_buf_contents);
+        for cache in &ctx.outer_square_caches {
+            for cursor in &cache.neighbour_lookup {
+                lookup_buf_contents.extend_from_slice(&u32::to_le_bytes(cursor.0.into()));
+            }
         }
         let lookup_buf = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("neighbour lookup buffer"),
@@ -507,12 +562,12 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
                     let completed: Vec<_> = bytes[completed_offset..potential_offset - 4]
                         .chunks(instruction_size.try_into().unwrap())
                         .take(completed_len.try_into().unwrap())
-                        .map(Instruction::from_gpu)
+                        .map(|bytes| Instruction::from_gpu(self, bytes))
                         .collect();
                     let potential: Vec<_> = bytes[potential_offset..end_offset - 4]
                         .chunks(instruction_size.try_into().unwrap())
                         .take(potential_len.try_into().unwrap())
-                        .map(Instruction::from_gpu)
+                        .map(|bytes| Instruction::from_gpu(self, bytes))
                         .collect();
 
                     self.ctx.finalize(completed, potential)
@@ -543,15 +598,15 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
     }
 }
 
-impl SquareCache {
-    fn to_gpu(&self, buffer: &mut Vec<u8>) {
-        for cursor in &self.neighbour_lookup {
-            buffer.extend_from_slice(&u32::to_le_bytes(cursor.0.into()));
-        }
-    }
+trait ToGpu<const CUBOIDS: usize> {
+    fn to_gpu(&self, pipeline: &Pipeline<CUBOIDS>, buffer: &mut Vec<u8>);
 }
 
-impl<const CUBOIDS: usize> Finder<CUBOIDS> {
+trait FromGpu<const CUBOIDS: usize> {
+    fn from_gpu(pipeline: &Pipeline<CUBOIDS>, bytes: &[u8]) -> Self;
+}
+
+impl<const CUBOIDS: usize> ToGpu<CUBOIDS> for Finder<CUBOIDS> {
     fn to_gpu(&self, pipeline: &Pipeline<CUBOIDS>, buffer: &mut Vec<u8>) {
         let Constants {
             queue_capacity,
@@ -562,7 +617,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         // Write `queue`.
         for i in 0..queue_capacity {
             if let Some(instruction) = self.queue.get(usize::try_from(i).unwrap()) {
-                instruction.to_gpu(buffer);
+                instruction.to_gpu(pipeline, buffer);
             } else {
                 buffer.extend(iter::repeat(0).take(4 * (2 + CUBOIDS)));
             }
@@ -623,7 +678,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         //     }
         // }
     }
-
+}
+impl<const CUBOIDS: usize> FromGpu<CUBOIDS> for Finder<CUBOIDS> {
     fn from_gpu(pipeline: &Pipeline<CUBOIDS>, mut bytes: &[u8]) -> Self {
         let Constants {
             num_cursors,
@@ -642,7 +698,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         let queue = bytes[0..queue_size - 4]
             .chunks(instruction_size.try_into().unwrap())
             .take(queue_len.try_into().unwrap())
-            .map(Instruction::from_gpu)
+            .map(|bytes| Instruction::from_gpu(pipeline, bytes))
             .collect();
         bytes = &bytes[queue_size..];
 
@@ -704,8 +760,8 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     }
 }
 
-impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
-    fn to_gpu(&self, buffer: &mut Vec<u8>) {
+impl<const CUBOIDS: usize> ToGpu<CUBOIDS> for Instruction<CUBOIDS> {
+    fn to_gpu(&self, _: &Pipeline<CUBOIDS>, buffer: &mut Vec<u8>) {
         buffer.extend_from_slice(&u32::to_le_bytes(
             ((self.net_pos.x as u32) << 8) | (self.net_pos.y as u32),
         ));
@@ -719,8 +775,10 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
             self.followup_index.map_or(0, NonZeroU8::get).into(),
         ))
     }
+}
 
-    fn from_gpu(bytes: &[u8]) -> Self {
+impl<const CUBOIDS: usize> FromGpu<CUBOIDS> for Instruction<CUBOIDS> {
+    fn from_gpu(_: &Pipeline<CUBOIDS>, bytes: &[u8]) -> Self {
         let encoded_net_pos = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
         let net_pos = Pos {
             x: (encoded_net_pos >> 8) as u8,
@@ -741,52 +799,4 @@ impl<const CUBOIDS: usize> Instruction<CUBOIDS> {
             followup_index: NonZeroU8::new(followup_index.try_into().unwrap()),
         }
     }
-}
-
-pub fn run<const CUBOIDS: usize>(
-    state: Arc<Mutex<State<CUBOIDS>>>,
-    mut yielded_nets: HashSet<Net>,
-    progress: ProgressBar,
-) -> anyhow::Result<impl Iterator<Item = Solution>> {
-    let guard = state.lock().unwrap();
-    let cuboids = guard.cuboids;
-    let prior_search_time = guard.prior_search_time;
-    let start = Instant::now();
-
-    let mut finders = guard.finders.clone();
-    drop(guard);
-
-    let ctx = FinderCtx::new(cuboids, prior_search_time)?;
-
-    let mut pipeline = pollster::block_on(Pipeline::new(ctx, &finders)).unwrap();
-    // The list of solutions we're partway through yielding.
-    let mut yielding = Vec::new();
-
-    Ok(std::iter::from_fn(move || {
-        while !finders.is_empty() && yielding.is_empty() {
-            let (mut solutions, new_finders, finders_created, finders_finished) =
-                pipeline.run_finders(mem::take(&mut finders));
-            finders = new_finders;
-
-            solutions.retain(|solution| {
-                let new = yielded_nets.insert(solution.net.clone());
-                new
-            });
-            yielding = solutions;
-
-            let mut state = state.lock().unwrap();
-            state.finders = finders.clone();
-            state.solutions.extend(yielding.iter().cloned());
-            state.prior_search_time = prior_search_time + start.elapsed();
-
-            progress.inc_length(finders_created);
-            progress.inc(finders_finished);
-        }
-        if let Some(solution) = yielding.pop() {
-            Some(solution)
-        } else {
-            // We must be out of finders if we broke out of that loop, so we're done.
-            None
-        }
-    }))
 }

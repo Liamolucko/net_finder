@@ -126,7 +126,7 @@ pub fn equivalence_classes<const CUBOIDS: usize>(
     // enabled).
     result.sort_by_key(|class| {
         class
-            .into_iter()
+            .iter()
             .filter(|mapping| mapping.classes[fixed_cuboid] == fixed_class)
             .map(|mapping| mapping.index())
             .min()

@@ -21,11 +21,11 @@ struct Options {
 
 fn main() -> anyhow::Result<()> {
     let Options { output, cuboids } = Options::parse();
-    match cuboids.as_slice() {
-        &[] => run(output, []),
-        &[a] => run(output, [a]),
-        &[a, b] => run(output, [a, b]),
-        &[a, b, c] => run(output, [a, b, c]),
+    match *cuboids.as_slice() {
+        [] => run(output, []),
+        [a] => run(output, [a]),
+        [a, b] => run(output, [a, b]),
+        [a, b, c] => run(output, [a, b, c]),
         _ => bail!("only up to 3 cuboids supported"),
     }
 }

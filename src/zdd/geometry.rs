@@ -596,7 +596,7 @@ impl WipRotation {
             };
             rotations
                 .entry(rotation)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(src.try_into().unwrap());
         }
 

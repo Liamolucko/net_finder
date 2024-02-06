@@ -196,8 +196,11 @@ class CoreGroup(LiteXModule):
             # The `Core` already knows that it's supposed to use the `core` clock domain,
             # but the `BufferizeEndpoints` doesn't.
             core = ClockDomainsRenamer("core")(core)
+
             cores.append(core)
             setattr(self, f"core{i}", core)
+
+            self.comb += core.req_pause.eq(self.req_pause)
 
         # The layout of `Core.source``, which unlike `self.source` still include
         # splitting as a possibility.
@@ -365,6 +368,10 @@ class CoreManager(LiteXModule):
             description="Whether there's still any work left for the core to do."
         )
 
+        self.req_pause = CSRStorage(
+            description="Set this CSR to 1 to tell all the cores to stop what they're doing and output their current states."
+        )
+
         fifo_depth = 256
 
         # Code for getting finders from `input` to the cores.
@@ -436,6 +443,7 @@ class CoreManager(LiteXModule):
         )
 
         self.specials += MultiReg(self.cores.active, self.active.status, "sys")
+        self.specials += MultiReg(self.req_pause.storage, self.cores.req_pause, "core")
 
         # Analyzer ---------------------------------------------------------------------------------
         if with_analyzer:

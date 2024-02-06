@@ -311,10 +311,9 @@ impl Iterator for EdgeIter<'_> {
 
 impl Spliterator for EdgeIter<'_> {
     fn split(&mut self) -> Option<Self> {
-        if self.endpoint().is_none() {
-            // This iterator's already exhausted, don't bother splitting it.
-            return None;
-        }
+        // If `self.endpoint()` is `None`, this iterator's already exhausted and we
+        // shouldn't bother splitting it.
+        self.endpoint()?;
 
         let old_split_point = self.split_point;
 

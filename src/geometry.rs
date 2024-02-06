@@ -291,14 +291,12 @@ impl<T> Net<T> {
     }
 
     /// Returns an iterator over the rows of the net, from bottom to top.
-    pub fn rows(&self) -> impl Iterator<Item = &[T]> + DoubleEndedIterator + ExactSizeIterator {
+    pub fn rows(&self) -> impl DoubleEndedIterator<Item = &[T]> + ExactSizeIterator {
         self.squares.chunks(self.width.into())
     }
 
     /// Returns a mutable iterator over the rows of the net, from bottom to top.
-    pub fn rows_mut(
-        &mut self,
-    ) -> impl Iterator<Item = &mut [T]> + DoubleEndedIterator + ExactSizeIterator {
+    pub fn rows_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut [T]> + ExactSizeIterator {
         self.squares.chunks_mut(self.width.into())
     }
 
@@ -502,8 +500,8 @@ impl Net<bool> {
         let mut pos_map = Net::new(self.width(), self.height());
 
         for cursor in cuboid.unique_cursors() {
-            let cursor = Cursor::from_data(&square_cache, &cursor);
-            if self.try_color(cuboid, &square_cache, net_start, cursor, &mut pos_map) {
+            let cursor = Cursor::from_data(square_cache, &cursor);
+            if self.try_color(cuboid, square_cache, net_start, cursor, &mut pos_map) {
                 return Some(ColoredNet {
                     width: self.width,
                     // Created a colored net from the position map by just taking which face each
@@ -1263,7 +1261,7 @@ pub struct SquareCache {
     /// If `index` is the index of a cursor and `direction` is the direction you
     /// want to find a face position adjacent in, the index you need in this
     /// array is `index << 2 | (direction as usize)`.
-    pub(crate) neighbour_lookup: Vec<Cursor>,
+    pub neighbour_lookup: Vec<Cursor>,
     /// All of the equivalence classes that cursors can be categorised into,
     /// along with the number of classes in each class's family..
     classes: Vec<(u8, Vec<Cursor>)>,
@@ -1452,9 +1450,7 @@ impl SquareCache {
     }
 
     /// Returns an iterator over all the squares in this `SquareCache`.
-    pub fn squares(
-        &self,
-    ) -> impl Iterator<Item = Square> + DoubleEndedIterator + ExactSizeIterator {
+    pub fn squares(&self) -> impl DoubleEndedIterator<Item = Square> + ExactSizeIterator {
         let num_squares: u8 = self
             .squares
             .len()
@@ -1467,9 +1463,7 @@ impl SquareCache {
 
     /// Returns an iterator over all the equivalence classes of cursors in this
     /// `SquareCache`.
-    pub fn classes(
-        &self,
-    ) -> impl Iterator<Item = Class> + DoubleEndedIterator + ExactSizeIterator + '_ {
+    pub fn classes(&self) -> impl DoubleEndedIterator<Item = Class> + ExactSizeIterator + '_ {
         self.classes
             .iter()
             .enumerate()
@@ -1486,7 +1480,7 @@ impl SquareCache {
 
 /// A square on the surface of a cuboid, represented by an index into
 /// `SquareCache::squares`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Square(pub u8);
 
 impl Square {
@@ -1673,14 +1667,14 @@ impl Class {
     pub fn contents<'a>(
         &self,
         cache: &'a SquareCache,
-    ) -> impl Iterator<Item = Cursor> + DoubleEndedIterator + ExactSizeIterator + 'a {
+    ) -> impl DoubleEndedIterator<Item = Cursor> + ExactSizeIterator + 'a {
         cache.classes[usize::from(self.index())].1.iter().copied()
     }
 }
 
 /// A buffer for storing which squares on the surface of a cuboid are filled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Surface(pub(crate) u64);
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Surface(pub u64);
 
 impl Surface {
     /// Creates a new `Surface` with no squares filled.

@@ -1,8 +1,7 @@
-use std::array;
 use std::ffi::{c_char, c_void, CStr};
 use std::fmt::Debug;
 
-use net_finder::{Cuboid, Cursor, FinderCtx, FinderInfo, Mapping};
+use net_finder::{Cuboid, FinderCtx, FinderInfo};
 
 pub const CUBOIDS: [Cuboid; 3] = [
     Cuboid::new(1, 1, 11),
@@ -379,8 +378,4 @@ pub enum Event {
     /// The core's finished running anything it was running and is now waiting
     /// to receive a new finder.
     Receiving,
-}
-
-fn clog2(x: usize) -> u32 {
-    usize::BITS - (x - 1).leading_zeros()
 }
