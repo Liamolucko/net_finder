@@ -2,7 +2,7 @@ from litescope import LiteScopeAnalyzer
 from litex.gen import *
 from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import *
-from migen.genlib.cdc import MultiReg
+from migen.genlib.cdc import BusSynchronizer, MultiReg
 from migen.genlib.coding import Encoder, PriorityEncoder
 from migen.genlib.fifo import AsyncFIFO
 from utils import Collect, Flatten, Merge, SafeDemux
@@ -59,6 +59,22 @@ SOLUTION = 0
 SPLIT = 1
 PAUSE = 2
 
+STATE_LAYOUT = [
+    # Keep this in sync with the definition in `state_t` in `core.sv` (it's in
+    # reverse order because Migen goes from LSB to MSB, whereas SystemVerilog goes
+    # from MSB to LSB).
+    ("pause", 1),
+    ("split", 1),
+    ("stall", 1),
+    ("solution", 1),
+    ("check", 1),
+    ("check_wait", 1),
+    ("backtrack", 1),
+    ("run", 1),
+    ("receive", 1),
+    ("clear", 1),
+]
+
 
 class Core(LiteXModule):
     """A LiteX wrapper around `core`."""
@@ -99,23 +115,7 @@ class Core(LiteXModule):
         as it starts receiving a finder.
         """
 
-        self.state = Record(
-            [
-                # Keep this in sync with the definition in `state_t` in `core.sv` (it's in
-                # reverse order because Migen goes from LSB to MSB, whereas SystemVerilog goes
-                # from MSB to LSB).
-                ("pause", 1),
-                ("split", 1),
-                ("stall", 1),
-                ("solution", 1),
-                ("check", 1),
-                ("check_wait", 1),
-                ("backtrack", 1),
-                ("run", 1),
-                ("receive", 1),
-                ("clear", 1),
-            ]
-        )
+        self.state = Record(STATE_LAYOUT)
         """
         The current state the core's in, for profiling and/or debugging purposes.
         """
@@ -184,6 +184,16 @@ class CoreGroup(LiteXModule):
 
         self.active = Signal()
         """Whether any of the cores in this group still have work left to do."""
+
+        self.split_finders = Signal(32)
+        """The number of new finders that have been produced via. splitting."""
+        self.completed_finders = Signal(32)
+        """The total number of finders that have finished running."""
+
+        # Create performance counters of how many clock cycles have been spent in each
+        # state.
+        for state, _ in STATE_LAYOUT:
+            setattr(self, f"{state}_count", Signal(64))
 
         # # #
 
@@ -269,9 +279,41 @@ class CoreGroup(LiteXModule):
                 core.wants_finder & ~self.sink.valid & self.output_merge.source.ready
             )
 
-        self.comb += self.active.eq(
-            self.sink.valid | Reduce("OR", (~core.wants_finder for core in cores))
+        # Whether or not each core is currently running something.
+        cores_active = Signal(n)
+        for i, core in enumerate(cores):
+            self.sync.core += If(
+                core.sink.valid & core.sink.ready & core.sink.last,
+                cores_active[i].eq(1),
+            ).Elif(
+                core.wants_finder,
+                cores_active[i].eq(0),
+            )
+        self.comb += self.active.eq(self.sink.valid | Reduce("OR", cores_active))
+
+        # Add 1 to `split_finders` every time a split finder passes through `output_merge`.
+        self.sync.core += If(
+            self.output_merge.source.valid
+            & self.output_merge.source.ready
+            & self.output_merge.source.last
+            & (self.output_merge.source.kind == SPLIT),
+            self.split_finders.eq(self.split_finders + 1),
         )
+        self.sync.core += self.completed_finders.eq(
+            self.completed_finders
+            + Reduce(
+                "ADD",
+                # If the core was previously active and now wants a finder, that means it must
+                # have just finished running its finder.
+                (cores_active[i] & core.wants_finder for i, core in enumerate(cores)),
+            )
+        )
+
+        for state, _ in STATE_LAYOUT:
+            counter = getattr(self, f"{state}_count")
+            self.sync.core += counter.eq(
+                counter + Reduce("ADD", (getattr(core.state, state) for core in cores))
+            )
 
 
 class CoreManager(LiteXModule):
@@ -372,6 +414,26 @@ class CoreManager(LiteXModule):
             description="Set this CSR to 1 to tell all the cores to stop what they're doing and output their current states."
         )
 
+        self.split_finders = CSRStatus(
+            32,
+            description="The number of new finders that have been produced via. splitting.",
+        )
+        self.completed_finders = CSRStatus(
+            32, description="The total number of finders that have finished running."
+        )
+
+        for state, _ in STATE_LAYOUT:
+            setattr(
+                self,
+                f"{state}_count",
+                CSRStatus(
+                    64,
+                    # Seems like LiteX can't infer this when using `setattr`.
+                    name=f"{state}_count",
+                    description=f"The total number of clock cycles that cores have spent in {state.upper()} state.",
+                ),
+            )
+
         fifo_depth = 256
 
         # Code for getting finders from `input` to the cores.
@@ -444,6 +506,22 @@ class CoreManager(LiteXModule):
 
         self.specials += MultiReg(self.cores.active, self.active.status, "sys")
         self.specials += MultiReg(self.req_pause.storage, self.cores.req_pause, "core")
+
+        self.split_finders_sync = BusSynchronizer(32, "core", "sys")
+        self.comb += self.split_finders_sync.i.eq(self.cores.split_finders)
+        self.comb += self.split_finders.status.eq(self.split_finders_sync.o)
+
+        self.completed_finders_sync = BusSynchronizer(32, "core", "sys")
+        self.comb += self.completed_finders_sync.i.eq(self.cores.completed_finders)
+        self.comb += self.completed_finders.status.eq(self.completed_finders_sync.o)
+
+        for state, _ in STATE_LAYOUT:
+            csr = getattr(self, f"{state}_count")
+            counter = getattr(self.cores, f"{state}_count")
+            sync = BusSynchronizer(64, "core", "sys")
+            setattr(self, f"{state}_count_sync", sync)
+            self.comb += sync.i.eq(counter)
+            self.comb += csr.status.eq(sync.o)
 
         # Analyzer ---------------------------------------------------------------------------------
         if with_analyzer:

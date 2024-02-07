@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use anyhow::bail;
 use clap::Parser;
-use litex_bridge::{SocConstant, SocInfo};
+use litex_bridge::{CsrGroup, SocConstant, SocInfo};
 use net_finder::Cuboid;
-use net_finder_fpga_driver::FpgaRuntime;
+use net_finder_fpga_driver::{CoreManagerRegisters, FpgaRuntime};
 use wishbone_bridge::{EthernetBridge, PCIeBridge};
 
 #[derive(Parser)]
@@ -56,31 +56,76 @@ fn main() -> anyhow::Result<()> {
         [] => bail!("must specify at least 1 cuboid"),
         [a] => net_finder::drive(
             FpgaRuntime {
-                soc_info,
+                soc_info: soc_info.clone(),
                 cuboids: [a],
-                bridge,
+                bridge: bridge.clone(),
                 csr_only,
             },
             args.resume,
-        ),
+        )?,
         [a, b] => net_finder::drive(
             FpgaRuntime {
-                soc_info,
+                soc_info: soc_info.clone(),
                 cuboids: [a, b],
-                bridge,
+                bridge: bridge.clone(),
                 csr_only,
             },
             args.resume,
-        ),
+        )?,
         [a, b, c] => net_finder::drive(
             FpgaRuntime {
-                soc_info,
+                soc_info: soc_info.clone(),
                 cuboids: [a, b, c],
-                bridge,
+                bridge: bridge.clone(),
                 csr_only,
             },
             args.resume,
-        ),
+        )?,
         _ => bail!("only up to 3 cuboids are currently supported"),
     }
+
+    let reg_addrs = CoreManagerRegisters::addrs(&soc_info, csr_only, "core_mgr")?;
+    let regs = CoreManagerRegisters::backed_by(&bridge, reg_addrs);
+
+    fn to_u64(x: [u32; 2]) -> u64 {
+        ((x[0] as u64) << 32) | x[1] as u64
+    }
+
+    let clear_count = to_u64(regs.clear_count().read()?);
+    let receive_count = to_u64(regs.receive_count().read()?);
+    let run_count = to_u64(regs.run_count().read()?);
+    let backtrack_count = to_u64(regs.backtrack_count().read()?);
+    let check_wait_count = to_u64(regs.check_wait_count().read()?);
+    let check_count = to_u64(regs.check_count().read()?);
+    let solution_count = to_u64(regs.solution_count().read()?);
+    let stall_count = to_u64(regs.stall_count().read()?);
+    let split_count = to_u64(regs.split_count().read()?);
+    let pause_count = to_u64(regs.pause_count().read()?);
+
+    let total_cycles = clear_count
+        + receive_count
+        + run_count
+        + backtrack_count
+        + check_wait_count
+        + check_count
+        + solution_count
+        + stall_count
+        + split_count
+        + pause_count;
+
+    let percentage = |count: u64| 100.0 * count as f64 / total_cycles as f64;
+
+    println!("Time spent in each state:");
+    println!("  CLEAR:      {:5.2}%", percentage(clear_count));
+    println!("  RECEIVE:    {:5.2}%", percentage(receive_count));
+    println!("  RUN:        {:5.2}%", percentage(run_count));
+    println!("  BACKTRACK:  {:5.2}%", percentage(backtrack_count));
+    println!("  CHECK_WAIT: {:5.2}%", percentage(check_wait_count));
+    println!("  CHECK:      {:5.2}%", percentage(check_count));
+    println!("  SOLUTION:   {:5.2}%", percentage(solution_count));
+    println!("  STALL:      {:5.2}%", percentage(stall_count));
+    println!("  SPLIT:      {:5.2}%", percentage(split_count));
+    println!("  PAUSE:      {:5.2}%", percentage(pause_count));
+
+    Ok(())
 }

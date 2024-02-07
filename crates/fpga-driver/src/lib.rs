@@ -13,7 +13,7 @@ use wishbone_bridge::Bridge;
 const FINDER_WORDS: usize = 6;
 
 csr_struct! {
-    struct CoreManagerRegisters<'a> {
+    pub struct CoreManagerRegisters<'a> {
         input: CsrRw<'a, FINDER_WORDS>,
         input_submit: CsrRw<'a>,
         output: CsrRo<'a, FINDER_WORDS>,
@@ -21,6 +21,18 @@ csr_struct! {
         flow: CsrRo<'a>,
         active: CsrRo<'a>,
         req_pause: CsrRw<'a>,
+        split_finders: CsrRo<'a>,
+        completed_finders: CsrRo<'a>,
+        clear_count: CsrRo<'a, 2>,
+        receive_count: CsrRo<'a, 2>,
+        run_count: CsrRo<'a, 2>,
+        backtrack_count: CsrRo<'a, 2>,
+        check_wait_count: CsrRo<'a, 2>,
+        check_count: CsrRo<'a, 2>,
+        solution_count: CsrRo<'a, 2>,
+        stall_count: CsrRo<'a, 2>,
+        split_count: CsrRo<'a, 2>,
+        pause_count: CsrRo<'a, 2>,
     }
 }
 
@@ -51,8 +63,7 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
         mut input_finders: &[FinderInfo<CUBOIDS>],
         solution_tx: &std::sync::mpsc::Sender<net_finder::Solution>,
         pause: &std::sync::atomic::AtomicBool,
-        // TODO: add counters to the SoC so we can update the progress bar.
-        _progress: Option<&ProgressBar>,
+        progress: Option<&ProgressBar>,
     ) -> anyhow::Result<Vec<FinderInfo<CUBOIDS>>> {
         let reset_addr = CsrRw::<1>::addrs(&self.soc_info, self.csr_only, "ctrl_reset")?;
         let reset = CsrRw::backed_by(&self.bridge, reset_addr);
@@ -76,6 +87,7 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
         let finder_bits = prefix_bits + 4 * u32::try_from(ctx.target_area)?;
         let finder_len_bits = clog2(usize::try_from(finder_bits)? + 1);
 
+        let num_input_finders = u64::try_from(input_finders.len())?;
         // The finders we've received back from the SoC since asking it to pause.
         let mut paused_finders = Vec::new();
 
@@ -157,6 +169,11 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
             if pause.load(Ordering::Relaxed) {
                 // We've been asked to pause, so ask the SoC to pause in turn.
                 regs.req_pause().write([1])?;
+            }
+
+            if let Some(progress) = progress {
+                progress.set_position(regs.completed_finders().read()?[0].into());
+                progress.set_length(num_input_finders + u64::from(regs.split_finders().read()?[0]));
             }
 
             flow = regs.flow().read()?[0];
