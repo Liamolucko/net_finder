@@ -183,9 +183,11 @@ module core (
 
     // Whether the next clock cycle will be put to use for either running or
     // backtracking. For testing purposes.
-    output logic   stepping,
+    output logic stepping,
     // The current state the core's in. For profiling and/or debugging purposes.
-    output state_t state
+    output state_t state,
+    // The core's current base decision. For deciding which cores to split.
+    output decision_index_t base_decision
 );
 
   state_t state_reg;
@@ -239,8 +241,6 @@ module core (
   // The bit currently being shifted out of `prefix`.
   logic prefix_out;
   assign prefix_out = prefix[$bits(prefix)-1];
-
-  decision_index_t base_decision;
   assign base_decision = prefix.base_decision;
   // What we're going to set `prefix.base_decision` to next clock cycle (if
   // `prefix` isn't currently halfway through being shifted in/out of the core).

@@ -79,7 +79,7 @@ STATE_LAYOUT = [
 class Core(LiteXModule):
     """A LiteX wrapper around `core`."""
 
-    def __init__(self):
+    def __init__(self, cuboids: list[Cuboid]):
         self.sink = stream.Endpoint([("data", 1)])
         """A stream of finders for the core to run."""
         self.source = stream.Endpoint(
@@ -120,6 +120,14 @@ class Core(LiteXModule):
         The current state the core's in, for profiling and/or debugging purposes.
         """
 
+        self.base_decision = Signal(max=4 * cuboids[0].surface_area())
+        """
+        The index of the first decision this core's allowed to backtrack.
+
+        This is exposed in order to decide which cores to split in half: if the base
+        decision is lower, there's more of the finder left to go.
+        """
+
         out_solution = Signal()
         out_split = Signal()
         out_pause = Signal()
@@ -145,6 +153,7 @@ class Core(LiteXModule):
             i_req_split=self.req_split,
             o_wants_finder=self.wants_finder,
             o_state=self.state.raw_bits(),
+            o_base_decision=self.base_decision,
         )
 
         self.enc = Encoder(3)
@@ -174,7 +183,7 @@ class CoreGroup(LiteXModule):
     held high long enough for them to actually do so).
     """
 
-    def __init__(self, n: int):
+    def __init__(self, cuboids: list[Cuboid], n: int):
         self.sink = stream.Endpoint([("data", 1)])
         self.source = stream.Endpoint(
             stream.EndpointDescription([("data", 1)], [("kind", 1)])
@@ -199,7 +208,7 @@ class CoreGroup(LiteXModule):
 
         cores = []
         for i in range(n):
-            core = Core()
+            core = Core(cuboids)
             core = stream.BufferizeEndpoints(
                 {"sink": stream.DIR_SINK}, pipe_valid=True, pipe_ready=True
             )(core)
@@ -210,7 +219,7 @@ class CoreGroup(LiteXModule):
             cores.append(core)
             setattr(self, f"core{i}", core)
 
-            self.comb += core.req_pause.eq(self.req_pause)
+            self.sync.core += core.req_pause.eq(self.req_pause)
 
         # The layout of `Core.source``, which unlike `self.source` still include
         # splitting as a possibility.
@@ -269,27 +278,92 @@ class CoreGroup(LiteXModule):
         self.comb += self.output_mux.source0.connect(self.source, omit={"kind"})
         self.comb += self.source.kind.eq(self.output_mux.source0.kind == PAUSE)
 
-        for i, core in enumerate(cores):
-            # Request that the previous core split itself whenever this core needs a new
-            # finder, there aren't any more coming in from outside, and the `Merge` on the
-            # core's output is actually free to receive it.
-            #
-            # Do it synchronously so there isn't a timing path between the cores.
-            self.sync.core += cores[i - 1].req_split.eq(
-                core.wants_finder & ~self.sink.valid & self.output_merge.source.ready
-            )
-
         # Whether or not each core is currently running something.
         cores_active = Signal(n)
+        # Whether or not each core was running something during the previous clock cycle.
+        prev_cores_active = Signal(n)
+
         for i, core in enumerate(cores):
-            self.sync.core += If(
-                core.sink.valid & core.sink.ready & core.sink.last,
-                cores_active[i].eq(1),
-            ).Elif(
-                core.wants_finder,
-                cores_active[i].eq(0),
+            self.comb += If(
+                core.state.stall,
+                # STALL state can happen both when inactive and when active, so a core is active
+                # in STALL state if it was active on the last clock cycle.
+                cores_active[i].eq(prev_cores_active[i]),
+            ).Else(
+                # Otherwise a core is active as long as it isn't in CLEAR or RECEIVE state.
+                cores_active[i].eq(~core.state.clear & ~core.state.receive),
             )
+        self.sync.core += prev_cores_active.eq(cores_active)
         self.comb += self.active.eq(self.sink.valid | Reduce("OR", cores_active))
+
+        # The `base_decision` that a core has to have in order to be split.
+        #
+        # If no cores have this `base_decision`, it gets incremented until one does and
+        # we can split.
+        splittable_base = Signal.like(cores[0].base_decision)
+        # Whether or not each core is splittable (is active and has a `base_decision` of
+        # `splittable_base`).
+        splittable = Cat(
+            cores_active[i] & (core.base_decision == splittable_base)
+            for i, core in enumerate(cores)
+        )
+        self.sync.core += If(
+            Reduce("OR", (~prev_cores_active[i] & cores_active[i] for i in range(n))),
+            # A new core's just become active and might have a `base_decision` below
+            # `splittable_base`, so reset it to 1.
+            splittable_base.eq(1),
+        ).Elif(
+            ~Reduce("OR", splittable),
+            # There aren't any cores with this `base_decision`, so increment it until there
+            # are.
+            splittable_base.eq(splittable_base + 1),
+        )
+
+        self.splittable_enc = PriorityEncoder(n)
+        self.comb += self.splittable_enc.i.eq(splittable)
+
+        # The index of the core we're going to ask to split next (assuming we don't find
+        # a better candidate in the meantime).
+        splittee = Signal.like(self.splittable_enc.o)
+        prev_splittee = Signal.like(self.splittable_enc.o)
+        # Whether `prev_splittee` is splittable.
+        prev_splittee_valid = Signal()
+
+        cases = {i: prev_splittee_valid.eq(splittable[i]) for i in range(n)}
+        self.comb += Case(prev_splittee, cases)
+
+        # Once we pick a `splittee`, lock it in until it's no longer splittable.
+        #
+        # This prevents `req_split` being moved to a different core on the same clock
+        # edge that the first core accepts it, causing both of them to split and the
+        # second one's split finder to have nowhere to go.
+        self.comb += If(
+            prev_splittee_valid,
+            splittee.eq(prev_splittee),
+        ).Else(
+            splittee.eq(self.splittable_enc.o),
+        )
+        self.sync.core += prev_splittee.eq(splittee)
+
+        # We only want to split next clock cycle if:
+        split_wanted = (
+            # - There's actually a splittable core.
+            ~self.splittable_enc.n
+            # - There aren't already more finders coming in from outside.
+            & ~self.sink.valid
+            # - There isn't another core that's already splitting (so that we don't
+            #   accidentally split twice to fulfil one request for a finder).
+            & ~Reduce("OR", (core.state.split for core in cores))
+            # - There are actually cores that want finders.
+            & Reduce("OR", (core.wants_finder for core in cores))
+        )
+
+        for i, core in enumerate(cores):
+            # Request that `splittee` split itself, assuming splitting is actually desired
+            # in the first place.
+            #
+            # Do it synchronously so there isn't a timing path between the cores.
+            self.sync.core += core.req_split.eq((splittee == i) & split_wanted)
 
         # Add 1 to `split_finders` every time a split finder passes through `output_merge`.
         self.sync.core += If(
@@ -303,9 +377,9 @@ class CoreGroup(LiteXModule):
             self.completed_finders
             + Reduce(
                 "ADD",
-                # If the core was previously active and now wants a finder, that means it must
-                # have just finished running its finder.
-                (cores_active[i] & core.wants_finder for i, core in enumerate(cores)),
+                # If the core was previously active and now isn't, that means it must have just
+                # finished running its finder.
+                (prev_cores_active[i] & ~cores_active[i] for i in range(n)),
             )
         )
 
@@ -323,7 +397,7 @@ class CoreManager(LiteXModule):
     """
 
     def __init__(self, cuboids: list[Cuboid], cores: int, with_analyzer: bool = False):
-        self.cores = CoreGroup(cores)
+        self.cores = CoreGroup(cuboids, cores)
 
         area = cuboids[0].surface_area()
 
@@ -544,6 +618,7 @@ class CoreManager(LiteXModule):
                 analyzer_signals.append(core.req_pause)
                 analyzer_signals.append(core.wants_finder)
                 analyzer_signals.append(core.state)
+                analyzer_signals.append(core.base_decision)
             self.analyzer = LiteScopeAnalyzer(
                 analyzer_signals,
                 depth=512,

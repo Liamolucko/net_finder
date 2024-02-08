@@ -137,10 +137,10 @@ def main():
         help="Board variant (cle-215+, cle-215 or cle-101).",
     )
     parser.add_target_argument(
-        "--sys-clk-freq", default=66.67e6, type=float, help="System clock frequency."
+        "--sys-clk-freq", default=56.25e6, type=float, help="System clock frequency."
     )
     parser.add_target_argument(
-        "--core-clk-freq", default=60e6, type=float, help="Core clock frequency."
+        "--core-clk-freq", default=56.25e6, type=float, help="Core clock frequency."
     )
     parser.add_target_argument(
         "--driver", action="store_true", help="Generate PCIe driver."
