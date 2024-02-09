@@ -67,8 +67,11 @@ class SoC(SoCCore):
         sys_clk_freq=66.67e6,
         core_clk_freq=60e6,
         with_analyzer: bool = False,
-        **kwargs
+        **kwargs,
     ):
+        for cuboid in cuboids:
+            assert cuboid.surface_area() == cuboids[0].surface_area()
+
         platform = Platform(variant=variant)
 
         # CRG --------------------------------------------------------------------------------------
@@ -79,8 +82,8 @@ class SoC(SoCCore):
             self,
             platform,
             sys_clk_freq,
-            ident="net-finder LiteX SoC on Acorn CLE-101/215(+)",
-            **kwargs
+            ident=f"net-finder LiteX SoC on Acorn CLE-101/215(+) (solving {', '.join(map(str, cuboids))})",
+            **kwargs,
         )
 
         # XADC -------------------------------------------------------------------------------------
@@ -112,8 +115,6 @@ class SoC(SoCCore):
         self.flash_cs_n = GPIOOut(platform.request("flash_cs_n"))
         self.flash = S7SPIFlash(platform.request("flash"), sys_clk_freq, 25e6)
 
-        for cuboid in cuboids:
-            assert cuboid.surface_area() == cuboids[0].surface_area()
         # I would use commas here but that breaks CSV export.
         self.add_config("CUBOIDS", ";".join(map(str, cuboids)))
         self.core_mgr = CoreManager(cuboids, cores, with_analyzer=with_analyzer)
@@ -149,7 +150,7 @@ def main():
         "--cuboids", nargs="+", help="The cuboids to find nets of."
     )
     parser.add_target_argument(
-        "--cores", default=80, type=int, help="The number of cores to include."
+        "--cores", default=75, type=int, help="The number of cores to include."
     )
     parser.add_argument(
         "--with-analyzer", action="store_true", help="Enable Analyzer support."
@@ -181,7 +182,7 @@ def main():
         cuboids=cuboids,
         cores=args.cores,
         with_analyzer=args.with_analyzer,
-        **parser.soc_argdict
+        **parser.soc_argdict,
     )
 
     builder = Builder(soc, **parser.builder_argdict)
