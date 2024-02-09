@@ -1,4 +1,4 @@
-`include "valid_checker.sv"
+`include "types.svh"
 
 typedef logic [$clog2(4 * AREA)-1:0] potential_index_t;
 typedef logic [$clog2(4 * AREA)-1:0] decision_index_t;

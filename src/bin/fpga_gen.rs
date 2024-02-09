@@ -15,22 +15,22 @@ use Direction::*;
 
 #[derive(Parser)]
 struct Options {
-    output: PathBuf,
+    out_dir: PathBuf,
     cuboids: Vec<Cuboid>,
 }
 
 fn main() -> anyhow::Result<()> {
-    let Options { output, cuboids } = Options::parse();
+    let Options { out_dir, cuboids } = Options::parse();
     match *cuboids.as_slice() {
-        [] => run(output, []),
-        [a] => run(output, [a]),
-        [a, b] => run(output, [a, b]),
-        [a, b, c] => run(output, [a, b, c]),
+        [] => run(out_dir, []),
+        [a] => run(out_dir, [a]),
+        [a, b] => run(out_dir, [a, b]),
+        [a, b, c] => run(out_dir, [a, b, c]),
         _ => bail!("only up to 3 cuboids supported"),
     }
 }
 
-fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> anyhow::Result<()> {
+fn run<const CUBOIDS: usize>(out_dir: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> anyhow::Result<()> {
     for cuboid in cuboids.into_iter().skip(1) {
         assert_eq!(cuboid.surface_area(), cuboids[0].surface_area());
     }
@@ -49,10 +49,14 @@ fn run<const CUBOIDS: usize>(output: PathBuf, cuboids: [Cuboid; CUBOIDS]) -> any
     let mapping_index_module = gen_mapping_index(&square_caches, fixed_cuboid, fixed_class);
     let neighbour_offset_function = gen_neighbour_offset(&square_caches);
 
-    let mut file = File::create(output)?;
+    let mut main_file = File::create(out_dir.join("generated.sv"))?;
+    let mut header_file = File::create(out_dir.join("generated.svh"))?;
     write!(
-        file,
+        header_file,
         "\
+`ifndef GENERATED_SVH
+`define GENERATED_SVH
+
 parameter int CUBOIDS = {CUBOIDS};
 parameter int AREA = {area};
 
@@ -63,6 +67,14 @@ typedef struct packed {{
 }} cursor_t;
 typedef cursor_t [CUBOIDS-1:0] mapping_t;
 typedef logic[{mapping_index_bits}-1:0] mapping_index_t;
+
+`endif
+"
+    )?;
+    write!(
+        main_file,
+        "\
+`include \"generated.svh\"
 
 {mapping_index_module}
 

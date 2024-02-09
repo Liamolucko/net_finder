@@ -32,7 +32,10 @@ fn main() -> anyhow::Result<()> {
         cmd.arg("-CFLAGS")
             .arg("-fsanitize-coverage=inline-8bit-counters,pc-table,trace-cmp -fsanitize=address");
     }
-    cmd.arg(manifest_dir.join("../../fpga/net-finder.srcs/sources_1/new/core.sv"))
+    cmd.arg(manifest_dir.join("../../fpga/net-finder.srcs/sources_1/new/generated.sv"))
+        .arg(manifest_dir.join("../../fpga/net-finder.srcs/sources_1/new/instruction_neighbour.sv"))
+        .arg(manifest_dir.join("../../fpga/net-finder.srcs/sources_1/new/valid_checker.sv"))
+        .arg(manifest_dir.join("../../fpga/net-finder.srcs/sources_1/new/core.sv"))
         .arg(manifest_dir.join("wrapper.cpp"));
     let status = cmd.status()?;
     if !status.success() {

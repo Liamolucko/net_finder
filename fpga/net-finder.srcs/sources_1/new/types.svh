@@ -1,4 +1,7 @@
-`include "generated.sv"
+`ifndef TYPES_SVH
+`define TYPES_SVH
+
+`include "generated.svh"
 
 // Round the size of the net up to the nearest multiple of 4 so that our tiling works properly.
 parameter int NET_SIZE = 4 * int'($ceil($itor(AREA) / 4));
@@ -16,3 +19,5 @@ typedef struct packed {
   pos_t pos;
   mapping_t mapping;
 } instruction_t;
+
+`endif

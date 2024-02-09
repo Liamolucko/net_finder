@@ -196,11 +196,20 @@ def main():
                 "run",
                 "--bin",
                 "fpga_gen",
-                os.path.join(sources_dir, "generated.sv"),
+                sources_dir,
                 *args.cuboids,
             ]
         )
-        soc.platform.add_source(os.path.join(sources_dir, "core.sv"))
+        soc.platform.add_sources(
+            sources_dir,
+            "generated.svh",
+            "types.svh",
+            "generated.sv",
+            "instruction_neighbour.sv",
+            "valid_checker.sv",
+            "core.sv",
+            copy=True,
+        )
         builder.build(**parser.toolchain_argdict)
     else:
         # This allows generating the LitePCIe driver without performing a build.

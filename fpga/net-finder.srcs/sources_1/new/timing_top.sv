@@ -1,4 +1,4 @@
-`include "core.sv"
+`include "types.svh"
 
 module dff (
     input  logic clk,

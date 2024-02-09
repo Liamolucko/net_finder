@@ -1,4 +1,4 @@
-`include "instruction_neighbour.sv"
+`include "types.svh"
 
 // A single-port, 1-bit wide RAM with asynchronous read and synchronous write.
 module async_ram #(
