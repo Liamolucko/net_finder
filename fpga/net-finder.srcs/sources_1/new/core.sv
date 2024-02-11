@@ -128,7 +128,17 @@ module run_stack_ram (
   end
 endmodule
 
-module core (
+module core #(
+    // Whether to put a buffer in front of `req_pause` and `req_split`.
+    //
+    // Normally I'd put this in `CoreGroup`, but when I do that Vivado infers a
+    // single flip-flop used by all the cores, which defeats the purpose of putting
+    // it there in the first place since the signal then has to travel halfway
+    // across the FPGA.
+    //
+    // Off by default because the fuzz target assumes that we respond instantly.
+    logic BUFFER_REQS = 0
+) (
     // The clock signal for the core.
     input logic clk,
     // A synchronous reset signal for the core.
@@ -228,6 +238,20 @@ module core (
   logic reset_prefix_bits;
 
   assign stepping = run | backtrack;
+
+  logic req_pause_inner;
+  logic req_split_inner;
+  generate
+    if (BUFFER_REQS) begin : gen_reqs
+      always_ff @(posedge clk) begin
+        req_pause_inner <= req_pause;
+        req_split_inner <= req_split;
+      end
+    end else begin : gen_reqs
+      assign req_pause_inner = req_pause;
+      assign req_split_inner = req_split;
+    end
+  endgenerate
 
   // Collect that metadata into a shift register.
   prefix_t prefix;
@@ -520,14 +544,24 @@ module core (
 
   // When in `CLEAR` state, the index in the net/surface we're currently clearing.
   logic [2*COORD_BITS-3:0] clear_index;
-  always_ff @(posedge clk) begin
-    if (reset | local_reset | !state.clear) begin
+  logic [2*COORD_BITS-3:0] next_clear_index;
+
+  always_comb begin
+    if (!state.clear) begin
       // Reset this to 0 whenever we aren't in `CLEAR` state. That way, it'll always
       // be 0 on the first clock cycle of clearing.
-      clear_index <= 0;
+      next_clear_index = 0;
     end else begin
       // Then while in `CLEAR` state we increment every clock cycle.
-      clear_index <= clear_index + 1;
+      next_clear_index = clear_index + 1;
+    end
+  end
+
+  always_ff @(posedge clk) begin
+    if (reset | local_reset) begin
+      clear_index <= 0;
+    end else begin
+      clear_index <= next_clear_index;
     end
   end
 
@@ -555,8 +589,10 @@ module core (
 
       .instruction_cursors_filled(),
 
-      .clear_mode (state.clear),
-      .clear_index(clear_index)
+      .clear_mode(state.clear),
+      .next_clear_mode(next_state.clear),
+      .clear_index(clear_index),
+      .next_clear_index(next_clear_index)
   );
 
   // Instantiate RAMs used for keeping track of which squares on the surfaces are
@@ -665,10 +701,10 @@ module core (
   logic interrupted;
   always_comb begin
     interrupting = 0;
-    if (req_pause) begin
+    if (req_pause_inner) begin
       // We always pause immediately upon request.
       interrupting = 1;
-    end else if (req_split & can_split) begin
+    end else if (req_split_inner & can_split) begin
       // We only split if `base_decision` is within `decisions`, since we need to
       // split on it. If it isn't, we continue until either:
       // - An instruction is run, at which point `base_decision` now points to the
@@ -726,6 +762,7 @@ module core (
       .target_ref(target_ref),
       .target_parent(target_parent),
       .last_child(last_child),
+      .potential_index(potential_index),
       .potential_len(potential_len),
       .clear_index(clear_index),
       .potential_surface_rd_datas(potential_surface_rd_datas),
@@ -792,6 +829,7 @@ module core (
       .target_ref(target_ref),
       .target_parent(target_parent),
       .last_child(last_child),
+      .potential_index(potential_index),
       .potential_len(potential_len),
       .clear_index(clear_index),
       .potential_surface_rd_datas(potential_surface_rd_datas),
@@ -853,11 +891,11 @@ module core (
 
     next_was_backtrack = was_backtrack;
     if (interrupted) begin
-      if (req_pause) begin
+      if (req_pause_inner) begin
         reset_prefix_bits = 1;
         next_state = PAUSE;
       end else begin
-        assert (req_split & base_decision < decisions_len);
+        assert (req_split_inner & base_decision < decisions_len);
         reset_prefix_bits = 1;
         // Increment `base_decision` now, since we immediately start sending `prefix`
         // and need it to be correct.
@@ -879,15 +917,29 @@ module core (
     // Special-cased since `valid_checker` relies on it.
     | next_state.backtrack != predicted_state.backtrack;
 
-    target_matters = (next_state.receive & next_prefix_bits_left == 0) | next_state.run
-    | next_state.backtrack | next_state.check;
+    case (next_state)
+      // Make sure the synthesiser knows that we can't stall in most states (and hence
+      // their bits of `state` don't need to depend on `next_target_ref`).
+      CLEAR, CHECK_WAIT, SOLUTION, STALL, SPLIT, PAUSE: target_matters = 0;
+      RUN, BACKTRACK, CHECK, RECEIVE: begin
+        if (state.receive) begin
+          target_matters = next_prefix_bits_left == 0;
+        end else begin
+          target_matters = 1;
+        end
 
-    if (invalid_target & target_matters) begin
-      // Oops, `target`'s going to be incorrect now, so we have to go into `STALL`
-      // state and fix it.
-      next_saved_state = next_state;
-      next_state = STALL;
-    end
+        if (invalid_target & target_matters) begin
+          // Oops, `target`'s going to be incorrect now, so we have to go into `STALL`
+          // state and fix it.
+          next_saved_state = next_state;
+          next_state = STALL;
+        end
+      end
+      default: begin
+        next_state = 'x;
+        next_saved_state = 'x;
+      end
+    endcase
   end
 endmodule
 
@@ -919,6 +971,7 @@ module vc_dependent #(
     input instruction_ref_t target_ref,
     input run_stack_entry_t target_parent,
     input logic last_child,
+    input potential_index_t potential_index,
     input potential_index_t potential_len,
     input logic [2*COORD_BITS-3:0] clear_index,
     input logic [CUBOIDS-1:0] potential_surface_rd_datas,
@@ -969,7 +1022,9 @@ module vc_dependent #(
     automatic instruction_ref_t to_backtrack = 'x;
     automatic decision_index_t last_run = 'x;
     automatic logic maybe_solution = 'x;
-    automatic logic [CUBOIDS-1:0] inc_potential_areas = 0;
+
+    // Whether `next_run_stack_len + next_potential_len >= AREA`.
+    automatic logic enough_potential_area = 0;
 
     in_ready = 0;
     // This is almost always what it should be set to, except when we override it to 0 during splitting.
@@ -1072,8 +1127,23 @@ module vc_dependent #(
       end
 
       CHECK: begin
-        // All the actual logic for this state happens down below, when checking for
-        // `next_state == CHECK`.
+        if (potential_index == potential_len) begin
+          // We've gone through all the potential instructions, time to check whether all
+          // the squares now have something that sets them.
+          maybe_solution = 1;
+          for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
+            if (int'(potential_areas[cuboid]) != AREA) begin
+              maybe_solution = 0;
+            end
+          end
+
+          if (maybe_solution & TARGET_IGNORED_STATES) begin
+            reset_prefix_bits = 1;
+            next_state = SOLUTION;
+          end else begin
+            next_state = BACKTRACK;
+          end
+        end
       end
 
       SOLUTION: begin
@@ -1258,6 +1328,22 @@ module vc_dependent #(
       next_potential_len = potential_len;
     end
 
+    // Manually expand all the possibilities for `next_run_stack_len` and
+    // `next_potential_len` so that these expressions can be computed early on and
+    // then the right one is picked once the outputs of `valid_checker` are known.
+    case ({
+      advance & instruction_valid & !(|neighbours_valid), run, backtrack
+    })
+      // Either adding a potential instruction or running an instruction have the same
+      // result: the summed length increases by 1.
+      'b100, 'b010: enough_potential_area = int'(run_stack_len_inc) + int'(potential_len) >= AREA;
+      'b001:
+      enough_potential_area = int'(run_stack_len_dec) + int'(target_parent.potential_len) >= AREA;
+      // Adding a potential instruction, running an instruction and backtracking an
+      // instruction are all mutually exclusive so this is impossible.
+      default: enough_potential_area = 'x;
+    endcase
+
     for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
       automatic logic rd_data = potential_surface_rd_datas[cuboid];
       automatic logic wr_data;
@@ -1267,7 +1353,7 @@ module vc_dependent #(
         wr_en   = int'(clear_index) < AREA;
       end else if (state.check) begin
         wr_data = 1;
-        wr_en   = instruction_valid;
+        wr_en   = potential_index < potential_len & instruction_valid;
       end else begin
         wr_data = 0;
         wr_en   = int'(potential_surfaces_clear_index) < AREA;
@@ -1286,18 +1372,12 @@ module vc_dependent #(
 
         if (rd_data == 0 & wr_data == 1 & wr_en) begin
           next_potential_areas[cuboid] += 1;
-          inc_potential_areas[cuboid] = 1;
         end else if (rd_data == 1 & wr_data == 0 & wr_en) begin
           next_potential_areas[cuboid] -= 1;
         end
 
         if (run) begin
           next_potential_areas[cuboid] += 1;
-          // Note that we only set bits of `potential_surfaces` during CHECK state, and we
-          // only run instructions during RECEIVE or RUN state, so we shouldn't have to
-          // worry about adding 2 here.
-          assert (!inc_potential_areas[cuboid]);
-          inc_potential_areas[cuboid] = 1;
         end else if (backtrack) begin
           next_potential_areas[cuboid] -= 1;
         end
@@ -1307,10 +1387,7 @@ module vc_dependent #(
     if (next_state.run & next_target_ref.parent >= next_run_stack_len) begin
       // Hang on a minute, we can't go into RUN state - we'd be trying to run an
       // instruction past the end of the queue.
-      //
-      // Stop `target_ref` from becoming invalid.
-      next_target_ref = target_ref;
-      if (int'(run_stack_len) + int'(next_potential_len) >= AREA) begin
+      if (enough_potential_area) begin
         // This has passed the first test for being a solution (there's enough run +
         // potential instructions to possibly cover the surfaces), so now we start the
         // next test of whether every square has at least 1 instruction that fills it.
@@ -1334,49 +1411,16 @@ module vc_dependent #(
       end
     end
 
-    // This goes here instead of when we're already in `CHECK` state so that we
-    // don't go into `CHECK` state when `potential_len == 0`.
     if (next_state.check) begin
-      if (next_potential_index == next_potential_len) begin
-        // We're about to advance to an invalid index, so stop now.
-        maybe_solution = 1;
-        for (int cuboid = 0; cuboid < CUBOIDS; cuboid++) begin
-          // This is faster than using `next_potential_areas` because `AREA` is a
-          // constant, so subtracting 1 from it costs nothing.
-          //
-          // We don't have to worry about `potential_areas[cuboid]` decreasing, that only
-          // happens when clearing it which:
-          // - Can't happen during CHECK state.
-          // - Even if we're transitioning into CHECK state from RUN or CHECK_WAIT state,
-          //   we only do so once `potential_areas[*] == run_stack_len`, so there's no
-          //   clearing left that could be done in this clock cycle.
-          if (
-            int'(potential_areas[cuboid]) != AREA
-            & !(int'(potential_areas[cuboid]) == AREA - 1 & inc_potential_areas[cuboid])
-          ) begin
-            maybe_solution = 0;
-          end
-        end
-
-        if (maybe_solution & TARGET_IGNORED_STATES) begin
-          reset_prefix_bits = 1;
-          next_state = SOLUTION;
-        end else begin
-          next_state = BACKTRACK;
-        end
+      if (next_potential_index == potential_len) begin
+        // The potential instruction at `next_potential_index` is only being added to
+        // `potential_buf` on the next clock edge, so we can't get it from there;
+        // instead just set it to `target_ref` directly.
+        next_target_ref = target_ref;
       end else begin
-        if (next_potential_index == potential_len) begin
-          // The potential instruction at `next_potential_index` is only being added to
-          // `potential_buf` on the next clock edge, so we can't get it from there;
-          // instead just set it to `target_ref` directly.
-          next_target_ref = target_ref;
-        end else begin
-          next_target_ref = next_potential_target;
-        end
+        next_target_ref = next_potential_target;
       end
-    end
-
-    if (next_state.backtrack) begin
+    end else if (next_state.backtrack) begin
       if (next_run_stack_len == 0) begin
         // We're trying to backtrack when there are no instructions left to backtrack;
         // that means we're done.

@@ -100,6 +100,21 @@ class SoC(SoCCore):
         )
         self.add_pcie(phy=self.pcie_phy, ndmas=0, address_width=64)
         platform.add_period_constraint(self.crg.cd_sys.clk, 1e9 / sys_clk_freq)
+        platform.add_period_constraint(self.crg.cd_core.clk, 1e9 / core_clk_freq)
+        platform.add_period_constraint(self.pcie_phy.cd_clk125.clk, 1e9 / 125e6)
+        platform.add_period_constraint(self.pcie_phy.cd_clk250.clk, 1e9 / 250e6)
+        platform.add_period_constraint(self.pcie_phy.cd_userclk1.clk, 1e9 / 250e6)
+        platform.add_period_constraint(self.pcie_phy.cd_userclk2.clk, 1e9 / 125e6)
+
+        # TODO: is this correct? cc https://github.com/enjoy-digital/litepcie/issues/113
+        platform.add_false_path_constraints(
+            self.crg.cd_sys.clk,
+            self.crg.cd_core.clk,
+            self.pcie_phy.cd_clk125.clk,
+            self.pcie_phy.cd_clk250.clk,
+            self.pcie_phy.cd_userclk1.clk,
+            self.pcie_phy.cd_userclk2.clk,
+        )
 
         # ICAP (For FPGA reload over PCIe).
         from litex.soc.cores.icap import ICAP
@@ -141,7 +156,7 @@ def main():
         "--sys-clk-freq", default=56.25e6, type=float, help="System clock frequency."
     )
     parser.add_target_argument(
-        "--core-clk-freq", default=56.25e6, type=float, help="Core clock frequency."
+        "--core-clk-freq", default=66.67e6, type=float, help="Core clock frequency."
     )
     parser.add_target_argument(
         "--driver", action="store_true", help="Generate PCIe driver."
@@ -150,7 +165,7 @@ def main():
         "--cuboids", nargs="+", help="The cuboids to find nets of."
     )
     parser.add_target_argument(
-        "--cores", default=75, type=int, help="The number of cores to include."
+        "--cores", default=74, type=int, help="The number of cores to include."
     )
     parser.add_argument(
         "--with-analyzer", action="store_true", help="Enable Analyzer support."
@@ -169,6 +184,8 @@ def main():
         #
         # Also this is an awful hacky way of doing it but I don't see an alternative.
         vivado_synth_directive="default -flatten_hierarchy none",
+        # I'm baffled that this isn't enabled by default.
+        vivado_post_place_phys_opt_directive="default",
     )
 
     args = parser.parse_args()
