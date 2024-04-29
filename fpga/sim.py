@@ -1,6 +1,8 @@
 import os
 import subprocess
 
+from litex.soc.cores.uart import RS232PHYModel, Stream2Wishbone
+
 from core import CoreManager, Cuboid
 from liteeth.mac import LiteEthMAC
 from liteeth.phy.gmii import LiteEthPHYGMII
@@ -59,6 +61,16 @@ _io = [
         Subsignal("tx_en", Pins(1)),
         Subsignal("tx_er", Pins(1)),
     ),
+    (
+        "serial",
+        0,
+        Subsignal("source_valid", Pins(1)),
+        Subsignal("source_ready", Pins(1)),
+        Subsignal("source_data", Pins(8)),
+        Subsignal("sink_valid", Pins(1)),
+        Subsignal("sink_ready", Pins(1)),
+        Subsignal("sink_data", Pins(8)),
+    ),
 ]
 
 # Platform -----------------------------------------------------------------------------------------
@@ -115,6 +127,7 @@ class BaseSoC(SoCCore):
         self,
         cuboids: list[Cuboid],
         cores: int,
+        sys_clk_freq=int(1e6),
         with_ethernet=False,
         ethernet_phy_model="sim",
         with_etherbone=False,
@@ -123,10 +136,9 @@ class BaseSoC(SoCCore):
         with_analyzer=False,
         sim_debug=False,
         trace_reset_on=False,
-        **kwargs
+        **kwargs,
     ):
         platform = Platform()
-        sys_clk_freq = int(1e6)
 
         # CRG --------------------------------------------------------------------------------------
         self.crg = CRG(
@@ -184,6 +196,11 @@ class BaseSoC(SoCCore):
             # Add IRQs (if enabled).
             if self.irq.enabled:
                 self.irq.add("ethmac", use_loc_if_exists=True)
+
+        # Taken from https://github.com/michael-betz/litex_test_project/tree/master/verilator_test.
+        self.uart_phy = RS232PHYModel(self.platform.request("serial"))
+        self.uartbone = Stream2Wishbone(self.uart_phy, clk_freq=sys_clk_freq)
+        self.bus.add_master(name="uartbone", master=self.uartbone.wishbone)
 
         # Simulation debugging ----------------------------------------------------------------------
         if sim_debug:
@@ -272,10 +289,11 @@ def main():
 
     soc_kwargs = soc_core_argdict(args)
 
-    sys_clk_freq = int(1e6)
+    sys_clk_freq = int(10e6)
     sim_config = SimConfig()
     sim_config.add_clocker("sys_clk", freq_hz=sys_clk_freq)
     sim_config.add_clocker("core_clk", freq_hz=0.8 * sys_clk_freq)
+    sim_config.add_module("serial2tcp", "serial", args={"port": 1111})
 
     # Configuration --------------------------------------------------------------------------------
 
@@ -302,6 +320,7 @@ def main():
 
     # SoC ------------------------------------------------------------------------------------------
     soc = BaseSoC(
+        sys_clk_freq=sys_clk_freq,
         with_ethernet=args.with_ethernet,
         ethernet_phy_model=args.ethernet_phy_model,
         with_etherbone=args.with_etherbone,
@@ -324,11 +343,20 @@ def main():
             "run",
             "--bin",
             "fpga_gen",
-            os.path.join(sources_dir, "generated.sv"),
+            sources_dir,
             *args.cuboids,
         ]
     )
-    soc.platform.add_source(os.path.join(sources_dir, "core.sv"))
+    soc.platform.add_sources(
+        sources_dir,
+        "generated.svh",
+        "types.svh",
+        "generated.sv",
+        "instruction_neighbour.sv",
+        "valid_checker.sv",
+        "core.sv",
+        copy=True,
+    )
 
     if args.with_ethernet:
         for i in range(4):

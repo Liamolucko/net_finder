@@ -6,7 +6,7 @@ use clap::Parser;
 use litex_bridge::{CsrGroup, SocConstant, SocInfo};
 use net_finder::Cuboid;
 use net_finder_fpga_driver::{CoreManagerRegisters, FpgaRuntime};
-use wishbone_bridge::{EthernetBridge, PCIeBridge};
+use wishbone_bridge::{EthernetBridge, EthernetBridgeProtocol, PCIeBridge};
 
 #[derive(Parser)]
 #[command(group = clap::ArgGroup::new("bridge").required(true).multiple(false))]
@@ -19,12 +19,16 @@ struct Args {
     /// `/sys/bus/pci/devices`.
     #[arg(long, group = "bridge")]
     pcie_device: Option<PathBuf>,
-    /// If the SoC is connected via. Etherbone, its IP address.
+    /// If the SoC is connected via. Etherbone, its address.
     #[arg(long, group = "bridge")]
-    udp_ip: Option<String>,
+    addr: Option<String>,
+    /// Whether to use a TCP Etherbone connection instead of UDP.
+    #[arg(long)]
+    tcp: bool,
 }
 
 fn main() -> anyhow::Result<()> {
+    env_logger::init();
     let args = Args::parse();
 
     let soc_info_json = fs::read_to_string(args.soc_info)?;
@@ -41,8 +45,14 @@ fn main() -> anyhow::Result<()> {
 
     let bridge = if let Some(ref device) = args.pcie_device {
         PCIeBridge::new(device.join("resource0"))?.create()?
-    } else if let Some(ip) = args.udp_ip {
-        EthernetBridge::new(ip)?.create()?
+    } else if let Some(ip) = args.addr {
+        EthernetBridge::new(ip)?
+            .protocol(if args.tcp {
+                EthernetBridgeProtocol::TCP
+            } else {
+                EthernetBridgeProtocol::UDP
+            })
+            .create()?
     } else {
         unreachable!()
     };

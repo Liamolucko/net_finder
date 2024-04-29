@@ -32,4 +32,4 @@ spliter = "0.1.0"
 debug = true
 
 [patch.crates-io]
-wishbone-bridge = { git = "https://github.com/litex-hub/wishbone-utils" }
+wishbone-bridge = { git = "https://github.com/Liamolucko/wishbone-utils", branch = "litex-server" }
