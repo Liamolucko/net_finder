@@ -136,7 +136,6 @@ class Core(LiteXModule):
 
         self.specials += Instance(
             "core",
-            p_BUFFER_REQS=True,
             i_clk=ClockSignal("core"),
             i_reset=ResetSignal("core"),
             i_in_data=self.sink.data,
@@ -211,9 +210,7 @@ class CoreGroup(LiteXModule):
         for i in range(n):
             core = Core(cuboids)
             core = stream.BufferizeEndpoints(
-                {"sink": stream.DIR_SINK, "source": stream.DIR_SOURCE},
-                pipe_valid=True,
-                pipe_ready=True,
+                {"sink": stream.DIR_SINK}, pipe_valid=True, pipe_ready=True
             )(core)
             # The `Core` already knows that it's supposed to use the `core` clock domain,
             # but the `BufferizeEndpoints` doesn't.
@@ -222,7 +219,7 @@ class CoreGroup(LiteXModule):
             cores.append(core)
             setattr(self, f"core{i}", core)
 
-            self.comb += core.req_pause.eq(self.req_pause)
+            self.sync.core += core.req_pause.eq(self.req_pause)
 
         # The layout of `Core.source``, which unlike `self.source` still include
         # splitting as a possibility.
@@ -238,7 +235,7 @@ class CoreGroup(LiteXModule):
             self.comb += getattr(self.input_mux, f"source{i}").connect(cores[i].sink)
 
         self.input_enc = PriorityEncoder(n)
-        self.sync.core += self.input_enc.i.eq(Cat(core.wants_finder for core in cores))
+        self.comb += self.input_enc.i.eq(Cat(core.wants_finder for core in cores))
         self.comb += self.input_mux.sel.eq(self.input_enc.o)
 
         # Incoming packets can come from either `self.sink` or cores splitting.
@@ -267,6 +264,11 @@ class CoreGroup(LiteXModule):
         # Most outgoing packets get merged together into `self.source`, unless they're
         # of `SPLIT` kind: then they get routed back around into `self.split`.
         output_merge = Merge(source_layout, n)
+        # Put a buffer in front of `output_merge` so that it's impossible for the
+        # outputs of cores to affect the inputs of others.
+        output_merge = stream.BufferizeEndpoints(
+            {"source": stream.DIR_SOURCE}, pipe_valid=True, pipe_ready=True
+        )(output_merge)
         self.output_merge = ClockDomainsRenamer("core")(output_merge)
         for i in range(n):
             self.comb += cores[i].source.connect(getattr(self.output_merge, f"sink{i}"))
@@ -359,7 +361,9 @@ class CoreGroup(LiteXModule):
         for i, core in enumerate(cores):
             # Request that `splittee` split itself, assuming splitting is actually desired
             # in the first place.
-            self.comb += core.req_split.eq((splittee == i) & split_wanted)
+            #
+            # Do it synchronously so there isn't a timing path between the cores.
+            self.sync.core += core.req_split.eq((splittee == i) & split_wanted)
 
         # Add 1 to `split_finders` every time a split finder passes through `output_merge`.
         self.sync.core += If(

@@ -97,9 +97,7 @@ module valid_checker (
     // 7 series distributed RAM doesn't have any way of clearing the whole thing at
     // once, so we have to go through and individually set each bit to 0.
     input logic clear_mode,
-    input logic next_clear_mode,
-    input logic [2*COORD_BITS-3:0] clear_index,
-    input logic [2*COORD_BITS-3:0] next_clear_index
+    input logic [2*COORD_BITS-3:0] clear_index
 );
   // For each neighbour of `instruction`, whether there's already a queued
   // instruction setting the same net position.
@@ -177,18 +175,10 @@ module valid_checker (
     logic shard_values[4];
     for (shard = 0; shard < 4; shard++) begin : gen_net_shards
       logic [1:0] neighbour_direction;
-      instruction_t next_neighbour;
-      logic [2*COORD_BITS-3:0] addr;
+      instruction_t neighbour;
 
       assign neighbour_direction = shard_neighbours[shard];
-      assign next_neighbour = next_neighbours[next_shard_neighbours[shard]];
-      always_ff @(posedge clk) begin
-        if (next_clear_mode) begin
-          addr <= next_clear_index;
-        end else begin
-          addr <= {next_neighbour.pos.x[COORD_BITS-1:2], next_neighbour.pos.y};
-        end
-      end
+      always_ff @(posedge clk) neighbour <= next_neighbours[next_shard_neighbours[shard]];
 
       // Instantiate the actual RAM for this net shard.
       async_ram #(
@@ -196,7 +186,7 @@ module valid_checker (
       ) ram (
           .clk(clk),
 
-          .addr(addr),
+          .addr(clear_mode ? clear_index : {neighbour.pos.x[COORD_BITS-1:2], neighbour.pos.y}),
           .wr_en(
             clear_mode ? 1
             : run ? neighbours_valid[neighbour_direction]
