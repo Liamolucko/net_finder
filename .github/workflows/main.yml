@@ -22,10 +22,18 @@ jobs:
       - uses: actions/checkout@v4
       - run: pip install -r fpga/requirements.txt
       - run: |
-          cd fpga
-          python3 sim.py --cuboids 1x1x5 1x2x3 &
+          python3 sim.py --cuboids 1x1x5 1x2x3 --non-interactive &
+          while ! nc -z localhost 1111; do
+            sleep 1
+          done
+
           litex_server --uart --uart-port socket://127.0.0.1:1111 &
+          while ! nc -z localhost 1234; do
+            sleep 1
+          done
+
           cargo run -p net-finder-fpga-driver -- --addr localhost:1234 --tcp sim_soc_info.json
+
           kill %2
           kill %1
       - run: test "$(cat state/1x1x5,1x2x3.json | jq '.solutions | length')" = 2263
