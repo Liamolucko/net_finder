@@ -102,6 +102,8 @@ pub fn equivalence_classes<const CUBOIDS: usize>(
                 // This shouldn't have any effect on the result, since you'll still get the same
                 // sizes of equivalence classes no matter what the transform is, each mapping is
                 // just transformed a bit.
+                // TODO: if we ever get to area 64, we'll have to add a class.transform_bits() == 3
+                // check here as well for the FPGA to be able to handle it.
                 .filter(|class| class.transform() == 0)
                 .map(move |class| {
                     (

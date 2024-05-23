@@ -1,0 +1,31 @@
+name: CI
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test_cpu:
+    name: Test net-finder-cpu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo run --release -p net-finder-cpu 1x1x5 1x2x3
+      - run: test "$(cat state/1x1x5,1x2x3.json | jq '.solutions | length')" = 2263
+  test_soc:
+    name: Test SoC
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cd fpga
+      - run: pip install -r requirements.txt
+      - run: |
+          python3 sim.py --cuboids 1x1x5 1x2x3 &
+          litex_server --uart --uart-port socket://127.0.0.1:1111 &
+          cargo run -p net-finder-fpga-driver -- --addr localhost:1234 --tcp sim_soc_info.json
+          kill %2
+          kill %1
+      - run: test "$(cat state/1x1x5,1x2x3.json | jq '.solutions | length')" = 2263

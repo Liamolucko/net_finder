@@ -3,20 +3,16 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::anyhow;
 use indicatif::ProgressBar;
-use litex_bridge::{csr_struct, CsrGroup, CsrRo, CsrRw, SocInfo};
+use litex_bridge::{csr_struct, CsrGroup, CsrRo, CsrRw, DynCsrRo, DynCsrRw, SocInfo};
 use net_finder::{Cuboid, Finder, FinderInfo, Runtime};
 use wishbone_bridge::Bridge;
 
-// TODO: add support for runtime-sized CSRs, because this is not always 6.
-const FINDER_WORDS: usize = 6;
-
 csr_struct! {
     pub struct CoreManagerRegisters<'a> {
-        input: CsrRw<'a, FINDER_WORDS>,
+        input: DynCsrRw<'a>,
         input_submit: CsrRw<'a>,
-        output: CsrRo<'a, FINDER_WORDS>,
+        output: DynCsrRo<'a>,
         output_consume: CsrRw<'a>,
         flow: CsrRo<'a>,
         active: CsrRo<'a>,
@@ -110,7 +106,7 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
                     bits.reverse();
                     bits.extend(int_bits(len, finder_len_bits));
 
-                    let input: [u32; FINDER_WORDS] = bits
+                    let input: Vec<u32> = bits
                         .chunks(32)
                         // The individual bits go in little-endian order, but the addresses go in
                         // big-endian order, so we have to reverse the order of the chunks.
@@ -122,10 +118,8 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
                             }
                             word
                         })
-                        .collect::<Vec<_>>()
-                        .try_into()
-                        .map_err(|_| anyhow!("input CSR was unexpected size"))?;
-                    regs.input().write(input)?;
+                        .collect();
+                    regs.input().write(&input)?;
                     regs.input_submit().write([1])?;
                 }
             }
