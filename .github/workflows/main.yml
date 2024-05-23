@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt install verilator
       - run: pip install -r fpga/requirements.txt
       - run: |
           cd fpga
