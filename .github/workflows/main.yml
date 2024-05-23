@@ -20,9 +20,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cd fpga
-      - run: pip install -r requirements.txt
+      - run: pip install -r fpga/requirements.txt
       - run: |
+          cd fpga
           python3 sim.py --cuboids 1x1x5 1x2x3 &
           litex_server --uart --uart-port socket://127.0.0.1:1111 &
           cargo run -p net-finder-fpga-driver -- --addr localhost:1234 --tcp sim_soc_info.json
