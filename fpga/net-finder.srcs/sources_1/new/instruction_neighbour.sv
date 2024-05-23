@@ -1,5 +1,7 @@
 `include "types.svh"
 
+`timescale 1ns / 1ps
+
 function automatic instruction_t instruction_neighbour(instruction_t instruction,
                                                        logic [1:0] direction);
   instruction_t result;

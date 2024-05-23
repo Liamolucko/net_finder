@@ -1,5 +1,7 @@
 `include "types.svh"
 
+`timescale 1ns / 1ps
+
 typedef logic [$clog2(4 * AREA)-1:0] potential_index_t;
 typedef logic [$clog2(4 * AREA)-1:0] decision_index_t;
 // Make `AREA` a valid `run_stack_index_t` so that we can use

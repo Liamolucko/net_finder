@@ -76,6 +76,8 @@ typedef logic[{mapping_index_bits}-1:0] mapping_index_t;
         "\
 `include \"generated.svh\"
 
+`timescale 1ns / 1ps
+
 {mapping_index_module}
 
 {neighbour_offset_function}

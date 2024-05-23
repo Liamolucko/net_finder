@@ -1,5 +1,7 @@
 `include "types.svh"
 
+`timescale 1ns / 1ps
+
 // A single-port, 1-bit wide RAM with asynchronous read and synchronous write.
 module async_ram #(
     int SIZE
