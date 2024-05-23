@@ -34,7 +34,7 @@ jobs:
             sleep 1
           done
 
-          cargo run -p net-finder-fpga-driver -- --addr localhost:1234 --tcp sim_soc_info.json
+          cargo run -p net-finder-fpga-driver -- --addr 127.0.0.1:1234 --tcp sim_soc_info.json
 
           kill %2
           kill %1
