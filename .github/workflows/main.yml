@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt install verilator
+      - run: sudo apt install verilator libevent-dev libjson-c-dev
       - run: pip install -r fpga/requirements.txt
       - run: |
           cd fpga
