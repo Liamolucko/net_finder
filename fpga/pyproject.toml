@@ -2,17 +2,15 @@
 name = "net-finder-soc"
 version = "0.1.0"
 dependencies = [
+    "amaranth @ git+https://github.com/amaranth-lang/amaranth@d3c312cf96814a0f789aecd694666c841a798070",
+    "amaranth-yosys",
     "migen @ git+https://github.com/m-labs/migen.git@ccaee68e14d3636e1d8fb2e0864dd89b1b1f7384",
-    "litedram",
     "liteeth",
     "litepcie",
     "litescope",
     "litex",
     "litex-boards",
-    "pythondata-cpu-vexriscv",
     "pythondata-misc-tapcfg",
-    "pythondata-software-picolibc",
-    "pythondata-software-compiler-rt",
     "dearpygui",
     "pyvcd",
 ]

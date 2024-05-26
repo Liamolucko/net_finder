@@ -4,6 +4,8 @@
 /zdds
 /common_nets
 
+/fpga/.venv
+
 /fpga/.Xil/
 /fpga/build/
 /fpga/net-finder.cache/
