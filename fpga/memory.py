@@ -1,5 +1,5 @@
 from amaranth import *
-from amaranth import ShapeLike, ValueLike
+from amaranth.hdl import ShapeLike, ValueLike
 from amaranth.lib import wiring
 from amaranth.lib.memory import Memory, MemoryData, ReadPort, WritePort
 from amaranth.lib.wiring import In, Out
