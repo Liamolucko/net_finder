@@ -5,6 +5,7 @@
 /common_nets
 
 /fpga/.venv
+/fpga/.direnv
 
 /fpga/.Xil/
 /fpga/build/

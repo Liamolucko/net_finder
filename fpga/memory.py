@@ -1,9 +1,7 @@
-from typing import Union
-
 from amaranth import *
-from amaranth import ShapeLike
+from amaranth import ShapeLike, ValueLike
 from amaranth.lib import wiring
-from amaranth.lib.memory import Memory, ReadPort, WritePort
+from amaranth.lib.memory import Memory, MemoryData, ReadPort, WritePort
 from amaranth.lib.wiring import In, Out
 from amaranth.utils import ceil_log2, exact_log2
 
@@ -115,9 +113,35 @@ class ConfigMemory(wiring.Component):
     RAMs anyway).
     """
 
-    def __init__(self, *, shape: ShapeLike, depth: int, ports_per_memory: int = 2):
-        self._shape = shape
-        self._depth = depth
+    def __init__(
+        self,
+        data: MemoryData | None = None,
+        *,
+        shape: ShapeLike | None = None,
+        depth: int | None = None,
+        init: list[ValueLike] | None = None,
+        ports_per_memory: int = 2,
+    ):
+        # Copied from `Memory.__init__`.
+        if data is None:
+            if shape is None:
+                raise ValueError("Either 'data' or 'shape' needs to be given")
+            if depth is None:
+                raise ValueError("Either 'data' or 'depth' needs to be given")
+            if init is None:
+                raise ValueError("Either 'data' or 'init' needs to be given")
+            data = MemoryData(shape=shape, depth=depth, init=init)
+        else:
+            if not isinstance(data, MemoryData):
+                raise TypeError(f"'data' must be a MemoryData instance, not {data!r}")
+            if shape is not None:
+                raise ValueError("'data' and 'shape' cannot be given at the same time")
+            if depth is not None:
+                raise ValueError("'data' and 'depth' cannot be given at the same time")
+            if init is not None:
+                raise ValueError("'data' and 'init' cannot be given at the same time")
+
+        self._data = data
         self._ports_per_memory = ports_per_memory
 
         self._read_ports: list[ReadPort] = []
@@ -132,7 +156,7 @@ class ConfigMemory(wiring.Component):
 
     def read_port(self) -> ReadPort:
         read_port = ReadPort.Signature(
-            addr_width=ceil_log2(self._depth), shape=self._shape
+            addr_width=ceil_log2(self._data.depth), shape=self._data.shape
         ).create()
         self._read_ports.append(read_port)
         return read_port
@@ -146,7 +170,7 @@ class ConfigMemory(wiring.Component):
 
         for read_port in self._read_ports:
             if memory is None:
-                memory = Memory(shape=self._shape, depth=self._depth, init=[])
+                memory = Memory(self._data)
                 m.submodules[f"memory{memory_index}"] = memory
                 inner_write_port = memory.write_port()
             else:
