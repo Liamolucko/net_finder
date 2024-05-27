@@ -1,4 +1,5 @@
 from typing import Union
+
 from amaranth import *
 from amaranth import ShapeLike
 from amaranth.lib import wiring

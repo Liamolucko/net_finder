@@ -17,6 +17,7 @@ jinja2==3.1.4
     # via amaranth
 jschon==0.11.1
     # via amaranth
+litedram==2023.12
 liteeth==2023.12
 liteiclink==2023.12
     # via liteeth
@@ -24,6 +25,7 @@ litepcie==2023.12
 litescope==2023.12
 litex==2023.12
     # via
+    #   litedram
     #   liteeth
     #   liteiclink
     #   litepcie
@@ -42,6 +44,7 @@ pyvcd==0.4.0
     # via amaranth
 pyyaml==6.0.1
     # via
+    #   litedram
     #   liteeth
     #   liteiclink
     #   litepcie
