@@ -81,6 +81,7 @@ class ChunkedMemory(wiring.Component):
                 addr = Mux(inner_write_port.en, write_port.addr, read_port.addr)
                 m.d.comb += inner_write_port.addr.eq(addr[:chunk_addr_width])
                 m.d.comb += inner_read_port.addr.eq(addr[:chunk_addr_width])
+                # TODO: handle read_port.en
 
                 inner_sdp_read_ports[port_index].append(inner_read_port)
 
@@ -197,5 +198,6 @@ class ConfigMemory(wiring.Component):
                 m.d.comb += inner_read_port.addr.eq(read_port.addr)
 
             m.d.comb += read_port.data.eq(inner_read_port.data)
+            # TODO: handle read_port.en
 
         return m
