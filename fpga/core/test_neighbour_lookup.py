@@ -9,7 +9,7 @@ from amaranth.sim import Simulator
 from core.base_types import cursor_layout
 from core.neighbour_lookup import (
     NeighbourLookup,
-    NeighbourLookupEntryLayout,
+    neighbour_lookup_entry_layout,
     neighbour_lookup_layout,
 )
 
@@ -31,7 +31,7 @@ def test_neighbour_lookup():
             neighbour_lookup_layout(
                 64,
                 init=[
-                    NeighbourLookupEntryLayout(64).from_bits(entry) for entry in init
+                    neighbour_lookup_entry_layout(64).from_bits(entry) for entry in init
                 ],
             )
         )

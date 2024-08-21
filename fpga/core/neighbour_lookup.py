@@ -1,5 +1,4 @@
 from amaranth import *
-from amaranth.hdl import ValueLike
 from amaranth.lib import data, wiring
 from amaranth.lib.memory import MemoryData, ReadPort, ceil_log2
 from amaranth.lib.wiring import In, Out
@@ -12,114 +11,105 @@ def opposite(direction):
     return (direction + 2)[:2]
 
 
-class NeighbourLookupEntryLayout(data.StructLayout):
-    def __init__(self, max_area: int):
-        super().__init__(
-            {
-                # The actual neighbours; these can be either the regular neighbours or the
-                # T-shaped neighbours depending on the address.
-                #
-                # The regular neighbours are what you'd expect: the 4 cursors adjacent to the
-                # input square. So with an input square `s`, it looks like this:
-                #
-                # ```
-                #  1
-                # 0s2
-                #  3
-                # ```
-                #
-                # As indicated by the numbering, this array contains the neighbours in clockwise
-                # order starting from the left one.
-                #
-                # Then, the T-shaped neighbours look like this:
-                #
-                # ```
-                #  1
-                # s02
-                #  3
-                # ```
-                #
-                # This makes sense to have because we only store the parents of the instructions
-                # we want to run in order to save space, and so this allows getting both the
-                # instructions themselves as well as all their neighbours at the same time.
-                #
-                # The diagram is oriented such that the direction is always right. If we orient
-                # it relative to the orientation of the cursors, it can look like any of these:
-                #
-                # ```
-                #  1   s   3   2
-                # s02 301 20s 103
-                #  3   2   1   s
-                # ```
-                #
-                # `neighbours[0]` is always the middle, and then the rest go in clockwise order
-                # starting from the input square.
-                #
-                # A previous layout I considered looked like this:
-                #
-                # ```
-                #  1   s   1   1
-                # s02 012 02s 032
-                #  3   3   3   s
-                # ```
-                #
-                # It seems like it might be beneficial because it only requires 2-to-1 muxes for
-                # the neighbours, rather than 4-to-1 muxes: however, that actually isn't the
-                # case, because we only take an input square, not the actual underlying input
-                # cursor.
-                #
-                # This means that the neighbours need to be rotated around afterwards to line up
-                # with the cursor's orientation, and thus require 4-to-1 muxes anyway. So, we
-                # may as well get the benefit of the other design that the middle is always in
-                # the same spot.
-                "neighbours": data.ArrayLayout(cursor_layout(max_area), 4),
-                # If this is the first cuboid, whether the centre of this layout is in the fixed
-                # family.
-                #
-                # Otherwise, this is always 0.
-                #
-                # By 'the centre of this layout', I mean the input square when using the regular
-                # neighbours, and the immediate neighbour of the input square when using the
-                # T-shaped neighbours.
-                #
-                # It doesn't really make sense to talk about the class of a square, since
-                # orientation can have an effect; however, that isn't the case for family, since
-                # one of the transformations it allows is rotating all the cuboids in tandem
-                # around a cursor, thus reaching all orientations of the starting cursor.
-                "fixed_family": 1,
-                # If `fixed_family` is 1, the transform of the centre's class.
-                #
-                # This can't be used as-is though, because the input is a square when we want to
-                # get the transform of a cursor. However, rotating a cursor always leads to the
-                # bottom 2 bits of its class's transform changing by the same amount, so you can
-                # get to the real transform by adding on the cursor's orientation.
-                #
-                # If the cursor's class has less than 2 transform bits, it just means that the
-                # rotations go 0 -> 1 -> 0 -> 1 (or 0 -> 0 -> 0 -> 0) rather than 00 -> 01 -> 10
-                # -> 11. So addition then truncation works: we only support fixed classes with
-                # at least 2 transform bits right now anyway though.
-                #
-                # That's also the reason why this is only valid if `fixed_family` is 1: if this
-                # isn't the fixed family, we don't know how many bits it has and thus don't know
-                # what to truncate it to.
-                "transform": 3,
-            }
-        )
-
-    def __call__(self, value):
-        return NeighbourLookupEntryView(self, value)
-
-
-class NeighbourLookupEntryView(data.View):
-    # TODO: delete this, replace with function
-    pass
+def neighbour_lookup_entry_layout(max_area: int):
+    return data.StructLayout(
+        {
+            # The actual neighbours; these can be either the regular neighbours or the
+            # T-shaped neighbours depending on the address.
+            #
+            # The regular neighbours are what you'd expect: the 4 cursors adjacent to the
+            # input square. So with an input square `s`, it looks like this:
+            #
+            # ```
+            #  1
+            # 0s2
+            #  3
+            # ```
+            #
+            # As indicated by the numbering, this array contains the neighbours in clockwise
+            # order starting from the left one.
+            #
+            # Then, the T-shaped neighbours look like this:
+            #
+            # ```
+            #  1
+            # s02
+            #  3
+            # ```
+            #
+            # This makes sense to have because we only store the parents of the instructions
+            # we want to run in order to save space, and so this allows getting both the
+            # instructions themselves as well as all their neighbours at the same time.
+            #
+            # The diagram is oriented such that the direction is always right. If we orient
+            # it relative to the orientation of the cursors, it can look like any of these:
+            #
+            # ```
+            #  1   s   3   2
+            # s02 301 20s 103
+            #  3   2   1   s
+            # ```
+            #
+            # `neighbours[0]` is always the middle, and then the rest go in clockwise order
+            # starting from the input square.
+            #
+            # A previous layout I considered looked like this:
+            #
+            # ```
+            #  1   s   1   1
+            # s02 012 02s 032
+            #  3   3   3   s
+            # ```
+            #
+            # It seems like it might be beneficial because it only requires 2-to-1 muxes for
+            # the neighbours, rather than 4-to-1 muxes: however, that actually isn't the
+            # case, because we only take an input square, not the actual underlying input
+            # cursor.
+            #
+            # This means that the neighbours need to be rotated around afterwards to line up
+            # with the cursor's orientation, and thus require 4-to-1 muxes anyway. So, we
+            # may as well get the benefit of the other design that the middle is always in
+            # the same spot.
+            "neighbours": data.ArrayLayout(cursor_layout(max_area), 4),
+            # If this is the first cuboid, whether the centre of this layout is in the fixed
+            # family.
+            #
+            # Otherwise, this is always 0.
+            #
+            # By 'the centre of this layout', I mean the input square when using the regular
+            # neighbours, and the immediate neighbour of the input square when using the
+            # T-shaped neighbours.
+            #
+            # It doesn't really make sense to talk about the class of a square, since
+            # orientation can have an effect; however, that isn't the case for family, since
+            # one of the transformations it allows is rotating all the cuboids in tandem
+            # around a cursor, thus reaching all orientations of the starting cursor.
+            "fixed_family": 1,
+            # If `fixed_family` is 1, the transform of the centre's class.
+            #
+            # This can't be used as-is though, because the input is a square when we want to
+            # get the transform of a cursor. However, rotating a cursor always leads to the
+            # bottom 2 bits of its class's transform changing by the same amount, so you can
+            # get to the real transform by adding on the cursor's orientation.
+            #
+            # If the cursor's class has less than 2 transform bits, it just means that the
+            # rotations go 0 -> 1 -> 0 -> 1 (or 0 -> 0 -> 0 -> 0) rather than 00 -> 01 -> 10
+            # -> 11. So addition then truncation works: we only support fixed classes with
+            # at least 2 transform bits right now anyway though.
+            #
+            # That's also the reason why this is only valid if `fixed_family` is 1: if this
+            # isn't the fixed family, we don't know how many bits it has and thus don't know
+            # what to truncate it to.
+            "transform": 3,
+        }
+    )
 
 
 def neighbour_lookup_layout(max_area: int, init=[]) -> MemoryData:
     """Returns the layout of one cuboid's neighbour lookup."""
 
     return MemoryData(
-        shape=NeighbourLookupEntryLayout(max_area),
+        shape=neighbour_lookup_entry_layout(max_area),
         # It's 5 * max_area elements deep because we need to store:
         #
         # - the regular neighbours of every square
