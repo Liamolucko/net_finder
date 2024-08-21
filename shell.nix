@@ -31,7 +31,7 @@ pkgs.mkShell {
   venvDir = "fpga/.venv";
   packages =
     [
-      pkgs.python3.pkgs.venvShellHook
+      pkgs.python311.pkgs.venvShellHook
 
       openocd
       # Needed by Verilator simulations

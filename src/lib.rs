@@ -10,6 +10,7 @@ use std::ops::RangeFrom;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
+pub mod fpga;
 mod geometry;
 mod primary;
 mod utils;

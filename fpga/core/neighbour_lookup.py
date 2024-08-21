@@ -111,25 +111,11 @@ class NeighbourLookupEntryLayout(data.StructLayout):
 
 
 class NeighbourLookupEntryView(data.View):
-    # TODO: remove these, they're unused and outdated.
-
-    # Assuming that this neighbour lookup entry is a T-shaped entry for moving in
-    # `t_direction`, return the middle of the arrangement.
-    def t_middle(self, t_direction: ValueLike):
-        return self.neighbours[opposite(t_direction)]
-
-    # Assuming that this neighbour lookup entry is a T-shaped entry for moving in
-    # `t_direction` from `t_input`, return the neighbour in `direction` from the
-    # middle of the arrangement.
-    def t_neighbour(
-        self, t_input: ValueLike, t_direction: ValueLike, direction: ValueLike
-    ):
-        return Mux(
-            direction == opposite(t_direction), t_input, self.neighbours[t_direction]
-        )
+    # TODO: delete this, replace with function
+    pass
 
 
-def neighbour_lookup_layout(max_area: int) -> MemoryData:
+def neighbour_lookup_layout(max_area: int, init=[]) -> MemoryData:
     """Returns the layout of one cuboid's neighbour lookup."""
 
     return MemoryData(
@@ -145,7 +131,7 @@ def neighbour_lookup_layout(max_area: int) -> MemoryData:
         # max_area entries, followed by the regular neighbours (so that you can switch
         # to the regular neighbours by just setting the MSB of the address).
         depth=5 * max_area,
-        init=[],
+        init=init,
     )
 
 
@@ -192,7 +178,7 @@ class CursorNeighbourLookup(wiring.Component):
         m = Module()
 
         # Figure out what direction we need to go in relative to `self.input`'s square.
-        square_direction = self.input.orientation + self.direction
+        square_direction = (self.input.orientation + self.direction)[:2]
         # Then figure our what address that corresponds to.
         addr = Mux(
             self.t_mode,

@@ -51,7 +51,7 @@ pub struct FinderCtx<const CUBOIDS: usize> {
     pub target_area: usize,
 
     /// Square caches for the cuboids (`inner_cuboids`, specifically).
-    square_caches: [SquareCache; CUBOIDS],
+    pub square_caches: [SquareCache; CUBOIDS],
     /// Square caches for the cuboids, in the order of `outer_cuboids`.
     pub outer_square_caches: [SquareCache; CUBOIDS],
     /// The index of the cuboid in `outer_cuboids` which we always use the same
@@ -63,7 +63,6 @@ pub struct FinderCtx<const CUBOIDS: usize> {
     pub fixed_class: Class,
     /// A bitfield indicating whether each cursor on the first cuboid is in the
     /// same family of equivalence classes as `fixed_class`.
-    #[cfg(feature = "no-trie")]
     maybe_skipped_lookup: [u64; 4],
     /// The equivalence classes of mappings that we build `Finder`s out of.
     equivalence_classes: Vec<FxHashSet<ClassMapping<CUBOIDS>>>,
@@ -171,7 +170,6 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
             outer_square_caches,
             fixed_cuboid,
             fixed_class,
-            #[cfg(feature = "no-trie")]
             maybe_skipped_lookup,
             equivalence_classes,
             #[cfg(not(feature = "no-trie"))]
@@ -229,6 +227,12 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
                 mapping.classes[inner_index]
             }),
         }
+    }
+
+    /// Given a class on the fixed cuboid, returns whether it's in the fixed family.
+    pub fn fixed_family(&self, cursor: Cursor) -> bool {
+        let index = cursor.0 as usize;
+        (self.maybe_skipped_lookup[index >> 6] >> (index & 0x3f)) & 1 != 0
     }
 }
 
@@ -1010,8 +1014,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     #[inline]
     #[cfg(feature = "no-trie")]
     fn skip(&self, ctx: &FinderCtx<CUBOIDS>, mapping: Mapping<CUBOIDS>) -> bool {
-        let index = mapping.cursors[0].0 as usize;
-        if (ctx.maybe_skipped_lookup[index >> 6] >> (index & 0x3f)) & 1 == 0 {
+        if !ctx.fixed_family(mapping.cursors[0]) {
             return false;
         }
 

@@ -87,8 +87,8 @@ class PosView(data.View):
 def cursor_layout(max_area: int):
     return data.StructLayout(
         {
-            "square": ceil_log2(max_area),
             "orientation": 2,
+            "square": ceil_log2(max_area),
         }
     )
 
