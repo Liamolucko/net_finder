@@ -6,8 +6,8 @@ from amaranth.lib import wiring
 from amaranth.lib.memory import Memory
 from amaranth.sim import Simulator
 
-from .base_types import cursor_layout
-from .neighbour_lookup import (
+from ..base_types import cursor_layout
+from ..neighbour_lookup import (
     NeighbourLookup,
     neighbour_lookup_entry_layout,
     neighbour_lookup_layout,

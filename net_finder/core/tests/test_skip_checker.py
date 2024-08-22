@@ -7,8 +7,8 @@ from amaranth.lib import wiring
 from amaranth.lib.memory import Memory
 from amaranth.sim import Simulator
 
-from .base_types import cursor_layout
-from .skip_checker import SkipChecker, undo_lookup_entry_layout, undo_lookup_layout
+from ..base_types import cursor_layout
+from ..skip_checker import SkipChecker, undo_lookup_entry_layout, undo_lookup_layout
 
 
 @pytest.mark.parametrize("cuboids", [["1x1x5", "1x2x3"], ["1x1x7", "1x3x3"]])
