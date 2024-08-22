@@ -1,7 +1,6 @@
 import os
 import subprocess
 
-from core import CoreManager, Cuboid
 from litepcie.phy.s7pciephy import S7PCIEPHY
 from litepcie.software import generate_litepcie_software
 from litex.gen import *
@@ -12,6 +11,8 @@ from litex.soc.integration.builder import *
 from litex.soc.integration.soc_core import *
 from litex_boards.platforms import sqrl_acorn
 from litex_boards.targets.sqrl_acorn import CRG
+
+from .core import CoreManager, Cuboid
 
 
 class Platform(sqrl_acorn.Platform):

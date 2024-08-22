@@ -1,9 +1,6 @@
 import os
 import subprocess
 
-from litex.soc.cores.uart import RS232PHYModel, Stream2Wishbone
-
-from core import CoreManager, Cuboid
 from liteeth.mac import LiteEthMAC
 from liteeth.phy.gmii import LiteEthPHYGMII
 from liteeth.phy.model import LiteEthPHYModel
@@ -13,10 +10,13 @@ from litex.build.io import DifferentialInput
 from litex.build.sim import SimPlatform
 from litex.build.sim.config import SimConfig
 from litex.gen import *
+from litex.soc.cores.uart import RS232PHYModel, Stream2Wishbone
 from litex.soc.integration.builder import *
 from litex.soc.integration.soc_core import *
 from litex.tools.litex_sim import generate_gtkw_savefile
 from migen.genlib.resetsync import AsyncResetSynchronizer
+
+from .core import CoreManager, Cuboid
 
 # IOs ----------------------------------------------------------------------------------------------
 

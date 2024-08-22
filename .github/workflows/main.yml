@@ -21,10 +21,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt install verilator libevent-dev libjson-c-dev
-      - run: pip install -r fpga/requirements.txt
+      - run: pip install -r requirements.txt
       - run: |
-          cd fpga
-          python3 sim.py --cuboids 1x1x5 1x2x3 --non-interactive &
+          python3 -m net_finder.soc.sim --cuboids 1x1x5 1x2x3 --non-interactive &
           while ! nc -z localhost 1111; do
             sleep 1
           done

@@ -5,7 +5,8 @@ from litex.soc.interconnect.csr import *
 from migen.genlib.cdc import BusSynchronizer, MultiReg
 from migen.genlib.coding import Encoder, PriorityEncoder
 from migen.genlib.fifo import AsyncFIFO
-from utils import Collect, Flatten, Merge, SafeDemux
+
+from .utils import Collect, Flatten, Merge, SafeDemux
 
 
 class Cuboid:

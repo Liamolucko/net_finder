@@ -28,7 +28,7 @@ let
   });
 in
 pkgs.mkShell {
-  venvDir = "fpga/.venv";
+  venvDir = ".venv";
   packages =
     [
       pkgs.python311.pkgs.venvShellHook
@@ -46,6 +46,6 @@ pkgs.mkShell {
     ];
 
   postVenvCreation = ''
-    ${pkgs.uv}/bin/uv pip install -r fpga/requirements.txt
+    ${pkgs.uv}/bin/uv pip install -r requirements.txt
   '';
 }
