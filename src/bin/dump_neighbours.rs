@@ -3,7 +3,7 @@
 use std::io;
 use std::time::Duration;
 
-use net_finder::{fpga, Combinations, Cuboid, Cursor, Direction, FinderCtx, Mapping, Pos};
+use net_finder::{fpga, Combinations, Cuboid, Direction, FinderCtx, Mapping, Pos};
 use serde_json::json;
 
 use Direction::*;
@@ -13,12 +13,10 @@ fn main() {
 
     let neighbour_lookup_contents = fpga::neighbour_lookups(&ctx);
 
-    let cursor_choices = ctx.square_caches.each_ref().map(|cache| {
-        cache
-            .squares()
-            .flat_map(|square| (0..4).map(move |orientation| Cursor::new(square, orientation)))
-            .collect::<Vec<_>>()
-    });
+    let cursor_choices = ctx
+        .square_caches
+        .each_ref()
+        .map(|cache| cache.cursors().collect::<Vec<_>>());
     let instructions = Combinations::new(&cursor_choices)
         .enumerate()
         .map(|(i, cursors)| {

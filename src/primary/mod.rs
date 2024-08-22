@@ -198,7 +198,7 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
     /// Converts a `ClassMapping` whose classes are in the order of
     /// `self.outer_cuboids` to one whose classes are in the order of
     /// `self.inner_cuboids`.
-    fn to_inner(&self, mapping: ClassMapping<CUBOIDS>) -> ClassMapping<CUBOIDS> {
+    pub fn to_inner(&self, mapping: ClassMapping<CUBOIDS>) -> ClassMapping<CUBOIDS> {
         ClassMapping {
             classes: array::from_fn(|inner_index| {
                 let cuboid = self.inner_cuboids[inner_index];
@@ -215,7 +215,7 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
     /// Converts a `ClassMapping` whose classes are in the order of
     /// `self.inner_cuboids` to one whose classes are in the order of
     /// `self.outer_cuboids`.
-    fn to_outer(&self, mapping: ClassMapping<CUBOIDS>) -> ClassMapping<CUBOIDS> {
+    pub fn to_outer(&self, mapping: ClassMapping<CUBOIDS>) -> ClassMapping<CUBOIDS> {
         ClassMapping {
             classes: array::from_fn(|outer_index| {
                 let cuboid = self.outer_cuboids[outer_index];
@@ -233,6 +233,45 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
     pub fn fixed_family(&self, cursor: Cursor) -> bool {
         let index = cursor.0 as usize;
         (self.maybe_skipped_lookup[index >> 6] >> (index & 0x3f)) & 1 != 0
+    }
+
+    /// Returns whether we should skip a mapping because it's already covered by
+    /// a previous `Finder`.
+    #[inline]
+    #[cfg(feature = "no-trie")]
+    pub fn skip(&self, start_mapping_index: usize, mapping: Mapping<CUBOIDS>) -> bool {
+        if !self.fixed_family(mapping.cursors[0]) {
+            return false;
+        }
+
+        // If the fixed class doesn't care about some bits of the transformation, then
+        // we're free to alter those bits to make the index of the transformed mapping
+        // smaller.
+        //
+        // To keep track, create a SIMD mask of exactly which transformations are still
+        // allowed, and disable some bits as we go along for any transformations which
+        // give a non-minimal index.
+        let mut valid = Mask::from([true; 8]);
+
+        let transformed: ClassMapping<CUBOIDS> = ClassMapping::new(array::from_fn(|i| {
+            let cursor = mapping.cursors[i];
+            let cache = &self.square_caches[i];
+            let mut undo_lookup = Simd::from(cursor.undo_lookup(cache));
+            // Set the transforms we get from undoing all the invalid transforms to 8 so
+            // they won't show up in `min`.
+            undo_lookup = valid.select(undo_lookup, Simd::splat(8));
+            // Then find out what the lowest transform we can get is.
+            let new_transform = undo_lookup.reduce_min();
+            // In order to minimise the index of `transformed`, this is the transform we
+            // need to use, since we're going from most-significant to least-significant.
+            //
+            // So the new set of valid transforms is all the ones that give us this value
+            // (and were valid before, remember we already set the invalid ones to 8).
+            valid = undo_lookup.simd_eq(Simd::splat(new_transform));
+            cursor.class(cache).with_transform(new_transform)
+        }));
+
+        transformed.index() < start_mapping_index
     }
 }
 
@@ -1014,38 +1053,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     #[inline]
     #[cfg(feature = "no-trie")]
     fn skip(&self, ctx: &FinderCtx<CUBOIDS>, mapping: Mapping<CUBOIDS>) -> bool {
-        if !ctx.fixed_family(mapping.cursors[0]) {
-            return false;
-        }
-
-        // If the fixed class doesn't care about some bits of the transformation, then
-        // we're free to alter those bits to make the index of the transformed mapping
-        // smaller.
-        //
-        // To keep track, create a SIMD mask of exactly which transformations are still
-        // allowed, and disable some bits as we go along for any transformations which
-        // give a non-minimal index.
-        let mut valid = Mask::from([true; 8]);
-
-        let transformed: ClassMapping<CUBOIDS> = ClassMapping::new(array::from_fn(|i| {
-            let cursor = mapping.cursors[i];
-            let cache = &ctx.square_caches[i];
-            let mut undo_lookup = Simd::from(cursor.undo_lookup(cache));
-            // Set the transforms we get from undoing all the invalid transforms to 8 so
-            // they won't show up in `min`.
-            undo_lookup = valid.select(undo_lookup, Simd::splat(8));
-            // Then find out what the lowest transform we can get is.
-            let new_transform = undo_lookup.reduce_min();
-            // In order to minimise the index of `transformed`, this is the transform we
-            // need to use, since we're going from most-significant to least-significant.
-            //
-            // So the new set of valid transforms is all the ones that give us this value
-            // (and were valid before, remember we already set the invalid ones to 8).
-            valid = undo_lookup.simd_eq(Simd::splat(new_transform));
-            cursor.class(cache).with_transform(new_transform)
-        }));
-
-        transformed.index() < self.start_mapping_index
+        ctx.skip(self.start_mapping_index, mapping)
     }
 
     /// Returns whether we should skip a mapping because it's already covered by

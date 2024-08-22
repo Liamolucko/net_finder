@@ -1,5 +1,4 @@
 use std::array;
-use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write as _;
@@ -189,29 +188,13 @@ fn gen_mapping_index<const CUBOIDS: usize>(
     // For each index in `to_undo` (the VHDL signal), what that index should be set
     // to for each possible class on the fixed cuboid.
     let mut to_undo: Vec<HashMap<Class, u8>> = vec![HashMap::new(); num_options];
-    for transform in 0..8 {
-        let cache = &square_caches[fixed_cuboid];
-        let mut cursor = fixed_class.contents(cache).next().unwrap().to_data(cache);
-        if transform & 0b100 != 0 {
-            cursor.horizontal_flip();
-        }
-        cursor.orientation = (cursor.orientation + (transform & 0b11) as i8) & 0b11;
-        let transformed = cache
-            .classes()
-            .find(|class| {
-                class
-                    .contents(cache)
-                    .contains(&Cursor::from_data(cache, &cursor))
-            })
-            .unwrap();
-        for map in to_undo.iter_mut() {
-            match map.entry(transformed) {
-                Entry::Occupied(_) => {}
-                Entry::Vacant(entry) => {
-                    entry.insert(transform);
-                    break;
-                }
-            }
+    for transform in 0..(1 << fixed_class.transform_bits()) {
+        let class = fixed_class.with_transform(transform);
+        for (i, transform) in class
+            .alternate_transforms(&square_caches[fixed_cuboid])
+            .enumerate()
+        {
+            to_undo[i].insert(class, transform);
         }
     }
 

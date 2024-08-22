@@ -24,7 +24,7 @@ def test_neighbour_lookup():
     dut = Module()
 
     neighbour_lookup = NeighbourLookup(2, 64)
-    dut.submodules["neighbour_lookup"] = neighbour_lookup
+    dut.submodules.neighbour_lookup = neighbour_lookup
 
     for i, init in enumerate(data["neighbour_lookup_contents"]):
         memory = Memory(

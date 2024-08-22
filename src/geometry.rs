@@ -1461,6 +1461,12 @@ impl SquareCache {
         (0..num_squares).map(Square)
     }
 
+    /// Returns an iterator over all the cursors in this `SquareCache`.
+    pub fn cursors(&self) -> impl DoubleEndedIterator<Item = Cursor> {
+        self.squares()
+            .flat_map(|square| (0..4).map(move |orientation| Cursor::new(square, orientation)))
+    }
+
     /// Returns an iterator over all the equivalence classes of cursors in this
     /// `SquareCache`.
     pub fn classes(&self) -> impl DoubleEndedIterator<Item = Class> + ExactSizeIterator + '_ {
@@ -1669,6 +1675,33 @@ impl Class {
         cache: &'a SquareCache,
     ) -> impl DoubleEndedIterator<Item = Cursor> + ExactSizeIterator + 'a {
         cache.classes[usize::from(self.index())].1.iter().copied()
+    }
+
+    /// Returns this class with the given transform applied to it.
+    pub fn apply_transform(self, cache: &SquareCache, transform: u8) -> Self {
+        let mut cursor = self.contents(cache).next().unwrap().to_data(cache);
+        if transform & 0b100 != 0 {
+            cursor.horizontal_flip();
+        }
+        cursor.orientation = (cursor.orientation + (transform & 0b11) as i8) & 0b11;
+        Cursor::from_data(cache, &cursor).class(cache)
+    }
+
+    /// Returns this class with the given transform undone to it.
+    pub fn undo_transform(self, cache: &SquareCache, transform: u8) -> Self {
+        (0..8)
+            .map(|transform| self.with_transform(transform))
+            .find(|class| class.apply_transform(cache, transform) == self)
+            .unwrap()
+    }
+
+    /// Returns the list of all the transformations you can perform to get from the
+    /// root of this class's family to this class.
+    pub fn alternate_transforms(
+        self,
+        cache: &SquareCache,
+    ) -> impl DoubleEndedIterator<Item = u8> + '_ {
+        (0..8).filter(move |&transform| self.root().apply_transform(cache, transform) == self)
     }
 }
 
