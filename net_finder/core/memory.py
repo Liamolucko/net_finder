@@ -2,8 +2,32 @@ from amaranth import *
 from amaranth.hdl import ShapeLike, ValueLike
 from amaranth.lib import wiring
 from amaranth.lib.memory import Memory, MemoryData, ReadPort, WritePort
-from amaranth.lib.wiring import In, Out
-from amaranth.utils import ceil_log2, exact_log2
+from amaranth.lib.wiring import In, Out, PureInterface
+from amaranth.utils import ceil_log2
+
+
+class ChunkedReadPortSignature(wiring.Signature):
+    def __init__(self, *, chunk_width: int, addr_width: int, shape: ShapeLike):
+        super().__init__(
+            {
+                # I'm not bothering with `en`, I don't need it.
+                "chunk": In(chunk_width),
+                "addr": In(addr_width),
+                "data": Out(shape),
+            }
+        )
+
+
+class ChunkedWritePortSignature(wiring.Signature):
+    def __init__(self, *, chunk_width: int, addr_width: int, shape: ShapeLike):
+        super().__init__(
+            {
+                "en": In(1),
+                "chunk": In(chunk_width),
+                "addr": In(addr_width),
+                "data": In(shape),
+            }
+        )
 
 
 class ChunkedMemory(wiring.Component):
@@ -31,23 +55,23 @@ class ChunkedMemory(wiring.Component):
         self._shape = shape
         self._depth = depth
         self._chunks = chunks
-        # This internally asserts that depth is a power of 2.
-        exact_log2(depth)
 
-        self._sdp_ports: list[tuple[ReadPort, WritePort]] = []
+        self._sdp_ports: list[tuple[PureInterface, PureInterface]] = []
 
         super().__init__({})
 
-    def sdp_port(self) -> tuple[ReadPort, WritePort]:
-        addr_width = ceil_log2(self._chunks * self._depth)
-
+    def sdp_port(self) -> tuple[PureInterface, PureInterface]:
         # Return disconnected interfaces, which we then add to an array and hook up
         # during `elaborate`.
-        read_port = ReadPort.Signature(
-            addr_width=addr_width, shape=self._shape
+        read_port = ChunkedReadPortSignature(
+            chunk_width=ceil_log2(self._chunks),
+            addr_width=ceil_log2(self._depth),
+            shape=self._shape,
         ).create()
-        write_port = WritePort.Signature(
-            addr_width=addr_width, shape=self._shape
+        write_port = ChunkedWritePortSignature(
+            chunk_width=ceil_log2(self._chunks),
+            addr_width=ceil_log2(self._depth),
+            shape=self._shape,
         ).create()
 
         self._sdp_ports.append((read_port, write_port))
@@ -57,8 +81,8 @@ class ChunkedMemory(wiring.Component):
     def elaborate(self, platform) -> Module:
         m = Module()
 
-        chunk_addr_width = exact_log2(self._depth)
-
+        # For each SDP port, the list of inner read ports it uses to access different
+        # chunks.
         inner_sdp_read_ports = [[] for _ in self._sdp_ports]
         for chunk_index in range(self._chunks):
             chunk = Memory(shape=self._shape, depth=self._depth, init=[])
@@ -72,16 +96,15 @@ class ChunkedMemory(wiring.Component):
                 inner_write_port = chunk.write_port()
 
                 m.d.comb += inner_write_port.en.eq(
-                    write_port.en & (write_port.addr[chunk_addr_width:] == chunk_index)
+                    write_port.en & (write_port.chunk == chunk_index)
                 )
                 m.d.comb += inner_write_port.data.eq(write_port.data)
 
                 # Make sure that the read and write ports always use the same address so that
                 # they can infer a single port of a true-dual-port BRAM.
                 addr = Mux(inner_write_port.en, write_port.addr, read_port.addr)
-                m.d.comb += inner_write_port.addr.eq(addr[:chunk_addr_width])
-                m.d.comb += inner_read_port.addr.eq(addr[:chunk_addr_width])
-                # TODO: handle read_port.en
+                m.d.comb += inner_write_port.addr.eq(addr)
+                m.d.comb += inner_read_port.addr.eq(addr)
 
                 inner_sdp_read_ports[port_index].append(inner_read_port)
 
@@ -89,9 +112,7 @@ class ChunkedMemory(wiring.Component):
         for (read_port, _), inner_read_ports in zip(
             self._sdp_ports, inner_sdp_read_ports
         ):
-            m.d.comb += read_port.data.eq(
-                Array(inner_read_ports)[read_port.addr[chunk_addr_width:]].data,
-            )
+            m.d.comb += read_port.data.eq(Array(inner_read_ports)[read_port.chunk].data)
 
         return m
 
@@ -149,6 +170,7 @@ class ConfigMemory(wiring.Component):
 
         super().__init__(
             {
+                # TODO: I think this should be `Out`.
                 "write_port": In(
                     WritePort.Signature(addr_width=ceil_log2(depth), shape=shape)
                 )

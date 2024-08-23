@@ -53,14 +53,10 @@ class PosView(data.View):
                 m.d.comb += unchecked_x.eq(self.x)
                 m.d.comb += unchecked_y.eq(self.y - 1)
 
-        # This probably isn't really necessary since `net_size` is now always a power of
-        # 2 (due to `ChunkedMemory` requiring that), and the natural wrapping already
-        # does what we want, but it doesn't hurt to include this in case that changes.
-        #
-        # It's done as a postprocessing step like this to make it extremely obvious to
-        # the synthesiser that no extra logic is needed in the power-of-2 case: when it
-        # sees unchecked_x == 0 ? 0 : unchecked_x == 0x3f ? 0x3f : unchecked_x, it can
-        # easily optimise that down to just unchecked_x.
+        # We do this as a postprocessing step to make it extremely obvious to the
+        # synthesiser that no extra logic is needed in the power-of-2 case: when it sees
+        # unchecked_x == 0 ? 0 : unchecked_x == 0x3f ? 0x3f : unchecked_x, it can easily
+        # optimise that down to just unchecked_x.
         net_size = self.shape()._net_size
         coord_underflow = (1 << self.x.shape().width) - 1
         coord_overflow = net_size & coord_underflow
