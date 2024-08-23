@@ -34,6 +34,8 @@ pkgs.mkShell {
       pkgs.python311.pkgs.venvShellHook
 
       openocd
+      pkgs.yosys
+
       # Needed by Verilator simulations
       pkgs.json_c
       pkgs.libevent

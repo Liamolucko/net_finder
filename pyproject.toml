@@ -2,8 +2,7 @@
 name = "net-finder"
 version = "0.1.0"
 dependencies = [
-    "amaranth @ git+https://github.com/amaranth-lang/amaranth@d3c312cf96814a0f789aecd694666c841a798070",
-    "amaranth-yosys",
+    "amaranth",
     "dearpygui",
     "litedram",
     "liteeth",
