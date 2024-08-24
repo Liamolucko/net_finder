@@ -92,6 +92,8 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
         // the SoC's still running, or the SoC still has some finders buffered up to
         // send to us.
         while !input_finders.is_empty() || regs.active().read()? == [1] || flow & 0b10 != 0 {
+            let mut did_something = false;
+
             if flow & 0b01 != 0 {
                 // The SoC is ready to receive a finder, send one to it if there are still any
                 // left.
@@ -121,6 +123,8 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
                         .collect();
                     regs.input().write(&input)?;
                     regs.input_submit().write([1])?;
+
+                    did_something = true;
                 }
             }
 
@@ -158,6 +162,8 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
                         solution_tx.send(solution)?;
                     }
                 }
+
+                did_something = true;
             }
 
             if pause.load(Ordering::Relaxed) {
@@ -168,6 +174,11 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
             if let Some(progress) = progress {
                 progress.set_position(regs.completed_finders().read()?[0].into());
                 progress.set_length(num_input_finders + u64::from(regs.split_finders().read()?[0]));
+            }
+
+            // Don't max out a CPU core doing nothing.
+            if !did_something {
+                thread::sleep(Duration::from_millis(5));
             }
 
             flow = regs.flow().read()?[0];
