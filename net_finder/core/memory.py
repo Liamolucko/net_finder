@@ -56,9 +56,23 @@ class ChunkedMemory(wiring.Component):
         self._depth = depth
         self._chunks = chunks
 
+        self._read_ports: list[PureInterface] = []
         self._sdp_ports: list[tuple[PureInterface, PureInterface]] = []
 
         super().__init__({})
+
+    def read_port(self) -> PureInterface:
+        # Return a disconnected interface, which we then add to an array and hook up
+        # during `elaborate`.
+        port = ChunkedReadPortSignature(
+            chunk_width=ceil_log2(self._chunks),
+            addr_width=ceil_log2(self._depth),
+            shape=self._shape,
+        ).create()
+
+        self._read_ports.append(port)
+
+        return port
 
     def sdp_port(self) -> tuple[PureInterface, PureInterface]:
         # Return disconnected interfaces, which we then add to an array and hook up
@@ -84,6 +98,7 @@ class ChunkedMemory(wiring.Component):
         # For each SDP port, the list of inner read ports it uses to access different
         # chunks.
         inner_sdp_read_ports = [[] for _ in self._sdp_ports]
+        inner_read_ports = [[] for _ in self._read_ports]
         for chunk_index in range(self._chunks):
             chunk = Memory(shape=self._shape, depth=self._depth, init=[])
             # Register the chunk as a submodule.
@@ -108,11 +123,18 @@ class ChunkedMemory(wiring.Component):
 
                 inner_sdp_read_ports[port_index].append(inner_read_port)
 
-        # Connect up the read ports' outputs.
-        for (read_port, _), inner_read_ports in zip(
-            self._sdp_ports, inner_sdp_read_ports
-        ):
-            m.d.comb += read_port.data.eq(Array(inner_read_ports)[read_port.chunk].data)
+            for port_index, port in enumerate(self._read_ports):
+                inner_port = chunk.read_port()
+                m.d.comb += inner_port.addr.eq(port.addr)
+                inner_read_ports[port_index].append(inner_port)
+
+        # Connect up the SDP read ports' outputs.
+        for (port, _), inner_ports in zip(self._sdp_ports, inner_sdp_read_ports):
+            m.d.comb += port.data.eq(Array(inner_ports)[port.chunk].data)
+
+        # Connect up the regular read ports' outputs.
+        for port, inner_ports in zip(self._read_ports, inner_read_ports):
+            m.d.comb += port.data.eq(Array(inner_ports)[port.chunk].data)
 
         return m
 

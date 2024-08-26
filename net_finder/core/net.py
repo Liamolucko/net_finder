@@ -9,12 +9,23 @@ from .memory import ChunkedMemory
 from .utils import pipe
 
 
+def shard_depth(max_area: int):
+    net_size_ = net_size(max_area)
+    # We need to round one of the dimensions up to the next power of two in order
+    # for concatenating the x and y coordinates to work properly.
+    return (net_size_ << ceil_log2(net_size_)) // 4
+
+
 def neighbour_shards(m: Module, pos: PosView):
     """Returns which net shards all of `pos`'s neighbours fall into."""
 
     output = Signal(ArrayLayout(2, 4), src_loc_at=1)
 
-    with m.Switch(Cat(pos.x[:1], pos.y[:1])):
+    def set_output(value):
+        for i in range(4):
+            m.d.comb += output[i].eq(value[i])
+
+    with m.Switch(Cat(pos.x[:2], pos.y[:2])):
         # Each 4x4 chunk of the net is split up into shards like this:
         #     2301
         #     2301
@@ -24,21 +35,21 @@ def neighbour_shards(m: Module, pos: PosView):
         # guarantees that for every square, all its neighbours are in different net
         # shards.
         with m.Case(0b0000, 0b1010):
-            m.d.comb += output.eq([3, 0, 1, 2])
+            set_output([3, 0, 1, 2])
         with m.Case(0b0100, 0b1110):
-            m.d.comb += output.eq([3, 2, 1, 0])
+            set_output([3, 2, 1, 0])
         with m.Case(0b0001, 0b1011):
-            m.d.comb += output.eq([0, 1, 2, 3])
+            set_output([0, 1, 2, 3])
         with m.Case(0b0101, 0b1111):
-            m.d.comb += output.eq([0, 3, 2, 1])
+            set_output([0, 3, 2, 1])
         with m.Case(0b0010, 0b1000):
-            m.d.comb += output.eq([1, 2, 3, 0])
+            set_output([1, 2, 3, 0])
         with m.Case(0b0110, 0b1100):
-            m.d.comb += output.eq([1, 0, 3, 2])
+            set_output([1, 0, 3, 2])
         with m.Case(0b0011, 0b1001):
-            m.d.comb += output.eq([2, 3, 0, 1])
+            set_output([2, 3, 0, 1])
         with m.Case(0b0111, 0b1101):
-            m.d.comb += output.eq([2, 1, 0, 3])
+            set_output([2, 1, 0, 3])
 
     return output
 
@@ -48,23 +59,27 @@ def shard_neighbours(m: Module, pos: PosView):
 
     output = Signal(ArrayLayout(2, 4), src_loc_at=1)
 
-    with m.Switch(Cat(pos.x[:1], pos.y[:1])):
+    def set_output(value):
+        for i in range(4):
+            m.d.comb += output[i].eq(value[i])
+
+    with m.Switch(Cat(pos.x[:2], pos.y[:2])):
         with m.Case(0b0000, 0b1010):
-            m.d.comb += output.eq([1, 2, 3, 0])
+            set_output([1, 2, 3, 0])
         with m.Case(0b0100, 0b1110):
-            m.d.comb += output.eq([3, 2, 1, 0])
+            set_output([3, 2, 1, 0])
         with m.Case(0b0001, 0b1011):
-            m.d.comb += output.eq([0, 1, 2, 3])
+            set_output([0, 1, 2, 3])
         with m.Case(0b0101, 0b1111):
-            m.d.comb += output.eq([0, 3, 2, 1])
+            set_output([0, 3, 2, 1])
         with m.Case(0b0010, 0b1000):
-            m.d.comb += output.eq([3, 0, 1, 2])
+            set_output([3, 0, 1, 2])
         with m.Case(0b0110, 0b1100):
-            m.d.comb += output.eq([1, 0, 3, 2])
+            set_output([1, 0, 3, 2])
         with m.Case(0b0011, 0b1001):
-            m.d.comb += output.eq([2, 3, 0, 1])
+            set_output([2, 3, 0, 1])
         with m.Case(0b0111, 0b1101):
-            m.d.comb += output.eq([2, 1, 0, 3])
+            set_output([2, 1, 0, 3])
 
     return output
 
@@ -90,7 +105,7 @@ class NetWritePortSignature(wiring.Signature):
     def __init__(self, *, max_area: int, chunk_width: int):
         super().__init__(
             {
-                "en": In(1),
+                "en": In(1).array(4),
                 "chunk": In(chunk_width),
                 # The positions to read from the net: they must be the neighbours of `pos` in
                 # the usual left, up, right, down order.
@@ -140,28 +155,29 @@ class Net(wiring.Component):
 
         inner_read_ports = []
         for i in range(4):
-            net_size_ = net_size(self._max_area)
             shard = ChunkedMemory(
                 shape=1,
-                # We need to round one of the dimensions up to the next power of two in order
-                # for concatenating the x and y coordinates to work properly.
-                depth=(net_size_ << ceil_log2(net_size_)) // 4,
+                depth=shard_depth(self._max_area),
                 chunks=self._chunks,
             )
             m.submodules[f"shard{i}"] = shard
 
             inner_read_port, inner_write_port = shard.sdp_port()
 
-            neighbour = self.read_port.neighbours[read_shard_neighbours[i]]
+            neighbour = Array(self.read_port.neighbours)[read_shard_neighbours[i]]
             m.d.comb += inner_read_port.chunk.eq(self.read_port.chunk)
             m.d.comb += inner_read_port.addr.eq(Cat(neighbour.x[2:], neighbour.y))
 
             neighbour_index = write_shard_neighbours[i]
-            neighbour = self.write_port.neighbours[neighbour_index]
-            m.d.comb += inner_write_port.en.eq(self.write_port.en)
+            neighbour = Array(self.write_port.neighbours)[neighbour_index]
+            m.d.comb += inner_write_port.en.eq(
+                Array(self.write_port.en)[neighbour_index]
+            )
             m.d.comb += inner_write_port.chunk.eq(self.write_port.chunk)
             m.d.comb += inner_write_port.addr.eq(Cat(neighbour.x[2:], neighbour.y))
-            m.d.comb += inner_write_port.data.eq(self.write_port.data[neighbour_index])
+            m.d.comb += inner_write_port.data.eq(
+                Array(self.write_port.data)[neighbour_index]
+            )
 
             inner_read_ports.append(inner_read_port)
 
@@ -169,6 +185,6 @@ class Net(wiring.Component):
 
         for i in range(4):
             shard = prev_read_neighbour_shards[i]
-            m.d.comb += self.read_port.data[i].eq(inner_read_ports[shard].data)
+            m.d.comb += self.read_port.data[i].eq(Array(inner_read_ports)[shard].data)
 
         return m
