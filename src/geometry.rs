@@ -470,6 +470,14 @@ impl Net<bool> {
         self.color_with_cache(cuboid, &square_cache)
     }
 
+    // TODO: make a variant of `color` that returns all the colorings, then filters
+    // them down to the ones that are actually different: that is, renumber all the
+    // faces in the order they occur so that mapping to different faces doesn't make
+    // a difference, and then return the ones that are distinct under that
+    // representation. I think that's a good definition of different foldings:
+    // if you fold along the same lines every time, you should get the same result,
+    // and same coloring = same lines.
+
     /// Return a version of this net with its squares 'colored' with which faces
     /// they're on.
     ///
@@ -1695,8 +1703,8 @@ impl Class {
             .unwrap()
     }
 
-    /// Returns the list of all the transformations you can perform to get from the
-    /// root of this class's family to this class.
+    /// Returns the list of all the transformations you can perform to get from
+    /// the root of this class's family to this class.
     pub fn alternate_transforms(
         self,
         cache: &SquareCache,

@@ -305,6 +305,7 @@ class CoreGroup(LiteXModule):
         # Whether or not each core is splittable (is active and has a `base_decision` of
         # `splittable_base`).
         splittable = Cat(
+            # TODO: base_decision is garbage while sending, so this decision-making might be a bit off.
             cores_active[i] & (core.base_decision == splittable_base)
             for i, core in enumerate(cores)
         )

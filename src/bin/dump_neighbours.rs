@@ -1,4 +1,5 @@
-//! Dumps the information required by `test_neighbour_lookup.py` as JSON to stdout.
+//! Dumps the information required by `test_neighbour_lookup.py` as JSON to
+//! stdout.
 
 use std::io;
 use std::time::Duration;

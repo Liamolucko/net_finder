@@ -1,7 +1,7 @@
 import enum
 
 from amaranth import *
-from amaranth.lib import wiring
+from amaranth.lib import data, wiring
 from amaranth.lib.memory import ReadPort
 from amaranth.lib.wiring import In, Out
 from amaranth.utils import ceil_log2
@@ -10,11 +10,91 @@ from net_finder.core.neighbour_lookup import NeighbourLookup
 from net_finder.core.net import Net, shard_depth
 
 from .base_types import instruction_layout, net_size
-from .core import FINDERS_PER_CORE, run_stack_entry_layout
 from .memory import ChunkedMemory
 from .neighbour_lookup import neighbour_lookup_layout
 from .skip_checker import SkipChecker, undo_lookup_layout
 from .utils import pipe
+
+FINDERS_PER_CORE = 4
+
+
+def instruction_ref_layout(max_area: int):
+    """Returns the layout of an instruction reference."""
+
+    return data.StructLayout(
+        {
+            # The index of the instruction's parent in the run stack.
+            "parent": ceil_log2(max_area),
+            # The index of this instruction in its parent's list of valid children.
+            #
+            # If the index is past the end of that list, it represents the last valid
+            # child. Then we always store the last valid child as 11, so that when
+            # backtracking we can immediately see 'oh this is the last one, so we need to
+            # move onto the next instruction'.
+            "child_index": 2,
+        }
+    )
+
+
+def max_potential_len(max_area: int):
+    """
+    Returns the maximum number of potential instructions there can be at any given
+    time.
+    """
+
+    # The upper bound of how many potential instructions there can be is if every
+    # square on the surfaces, except for the ones set by the first instruction, has
+    # 4 potential instructions trying to set it: 1 from each direction.
+    #
+    # While this isn't actually possible, it's a nice clean upper bound.
+    #
+    # TODO: I think we can reduce this to 4 + 2 * (max_run_stack_len - 1), since:
+    # - The first instruction can produce at most 4 potential instructions.
+    # - Each instruction after that:
+    #   - Reduces the max. potential instructions by one (since we'd previously
+    #     pessimistically assumed it was a potential instruction, but now clearly it
+    #     isn't because we've run it)
+    #   - Increases the max. potential instructions by 3.
+    #   - So in total, it increases the maximum by 2.
+    return 4 * (max_area - 1)
+
+
+def max_decisions_len(max_area: int):
+    """Returns the maximum number of decisions there can be at any given time."""
+
+    # There's always 1 decision for the first instruction, then the upper bound is
+    # that every square has 4 instructions setting it, 3 of which we decided not to
+    # run and the last one we did.
+    #
+    # TODO: smaller upper bound:
+    #
+    # Say you have a list of decisions.
+    #
+    # If it's of maximal length, it should have max_run_stack_len 1s.
+    #
+    # The first 1 produces at most 4 instructions, and the rest produce at most 3:
+    # so then the maximum number of decisions is 4 + 3 * (max_run_stack_len - 1).
+    return 1 + 4 * (max_area - 1)
+
+
+def run_stack_entry_layout(cuboids: int, max_area: int):
+    """Returns the layout of a run stack entry."""
+
+    return data.StructLayout(
+        {
+            # The instruction that was run.
+            "instruction": instruction_layout(cuboids, max_area),
+            # A reference to where in the run stack this instruction originally came from.
+            "source": instruction_ref_layout(max_area),
+            # Whether this instruction's child in each direction was valid at the time this
+            # instruction was run.
+            "children": 4,
+            # The number of potential instructions there were at the point when it was run.
+            "potential_len": ceil_log2(max_potential_len(max_area) + 1),
+            # The index of the decision to run this instruction in the list of decisions.
+            "decision_index": ceil_log2(max_decisions_len(max_area)),
+        }
+    )
 
 
 def child_index_to_direction(children: int, child_index: int) -> int | None:
@@ -99,6 +179,15 @@ class MainPipeline(wiring.Component):
                 "task": In(Task),
                 # The run stack entry we're operating on.
                 "entry": In(run_stack_entry_layout(cuboids, max_area)),
+                # Whether the instruction to advance/check is a child of `entry`, not
+                # `entry.instruction` itself.
+                #
+                # This should always be 0 when backtracking.
+                #
+                # This is almost always 1 when advancing/checking: the only exception is when
+                # running the first instruction, since it gets handed to us from outside and
+                # doesn't have a parent.
+                "child": In(1),
                 # The index of the child of `self.entry` we're operating on (if we're advancing or
                 # checking).
                 "child_index": In(2),
@@ -118,10 +207,14 @@ class MainPipeline(wiring.Component):
                         shape=ul_layout.shape,
                     )
                 ).array(cuboids - 1),
+                # Signals coming from VC stage.
+                #
                 # The instruction the pipeline ended up operating on - so, the neighbour of
                 # `entry` when advancing/checking, and `entry.instruction` itself when
                 # backtracking.
                 "instruction": Out(instruction_layout(cuboids, max_area)),
+                # Signals coming from WB stage.
+                #
                 # Whether or not `instruction` was valid.
                 "instruction_valid": Out(1),
                 # Whether or not the neighbours of `instruction` in each direction were valid.
@@ -157,6 +250,7 @@ class MainPipeline(wiring.Component):
         nl_start_mapping_index = self.start_mapping_index
         nl_task = self.task
         nl_entry = self.entry
+        nl_child = self.child
         nl_child_index = self.child_index
         nl_clear_index = self.clear_index
 
@@ -186,7 +280,7 @@ class MainPipeline(wiring.Component):
                 wiring.flipped(self.neighbour_lookups[i]),
             )
         m.d.comb += neighbour_lookup.input.eq(nl_entry.instruction)
-        m.d.comb += neighbour_lookup.t_mode.eq(nl_task != Task.Backtrack)
+        m.d.comb += neighbour_lookup.t_mode.eq(nl_child)
         m.d.comb += neighbour_lookup.direction.eq(nl_child_direction)
 
         # Valid check (VC) stage
@@ -235,12 +329,12 @@ class MainPipeline(wiring.Component):
         m.d.comb += skip_checker.fixed_family.eq(vc_fixed_family)
         m.d.comb += skip_checker.transform.eq(vc_transform)
 
+        m.d.comb += self.instruction.eq(vc_middle)
+
         # Write back (WB) stage
         #
         # This is the stage where we write back any changes that were made to the net
         # and surfaces.
-        #
-        # This occurs at the same time as the outer pipeline's IF stage.
 
         wb_finder = pipe(m, vc_finder)
         wb_task = pipe(m, vc_task)

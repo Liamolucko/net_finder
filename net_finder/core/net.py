@@ -4,7 +4,7 @@ from amaranth.lib.data import ArrayLayout
 from amaranth.lib.wiring import In, Out
 from amaranth.utils import ceil_log2
 
-from .base_types import PosLayout, PosView, net_size
+from .base_types import PosLayout, PosView, net_size, next_power_of_two
 from .memory import ChunkedMemory
 from .utils import pipe
 
@@ -13,7 +13,7 @@ def shard_depth(max_area: int):
     net_size_ = net_size(max_area)
     # We need to round one of the dimensions up to the next power of two in order
     # for concatenating the x and y coordinates to work properly.
-    return (net_size_ << ceil_log2(net_size_)) // 4
+    return net_size_ * next_power_of_two(net_size_) // 4
 
 
 def neighbour_shards(m: Module, pos: PosView):

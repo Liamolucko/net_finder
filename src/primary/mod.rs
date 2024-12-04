@@ -229,7 +229,8 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
         }
     }
 
-    /// Given a class on the fixed cuboid, returns whether it's in the fixed family.
+    /// Given a class on the fixed cuboid, returns whether it's in the fixed
+    /// family.
     pub fn fixed_family(&self, cursor: Cursor) -> bool {
         let index = cursor.0 as usize;
         (self.maybe_skipped_lookup[index >> 6] >> (index & 0x3f)) & 1 != 0
@@ -1111,7 +1112,10 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
         // net but disagreeing on what each other should map to (which leads to a cut).
         for &instruction in completed.iter() {
             let to_check = [
-                instruction,
+                instruction, /* TODO: is this needed? I think it was at the time this was
+                              * written, since `net` hadn't been added yet, but `net` should now
+                              * guarantee that you can't have two instructions setting the same
+                              * net position. */
                 instruction.moved_in(self, Left),
                 instruction.moved_in(self, Up),
                 instruction.moved_in(self, Right),
@@ -1600,6 +1604,13 @@ pub fn drive<const CUBOIDS: usize, R: Runtime<CUBOIDS>>(
             continue;
         }
 
+        // TODO: this is starting to get suspicious. Counting flipped versions of nets
+        // as well isn't doubling the number of solutions; the flipped version of the
+        // net will always be another valid solution, so that should mean it's happening
+        // because the flipped version of the net is the same as the original net and
+        // still doesn't get counted separately, but that doesn't seem to be the case.
+        // So then why isn't it double? Are we missing solutions? I think we
+        // established that this was due to skipping? I don't 100% remember...
         count += 1;
         progress.suspend(|| {
             println!(

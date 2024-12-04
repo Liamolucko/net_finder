@@ -29,23 +29,17 @@ let
 in
 pkgs.mkShell {
   venvDir = ".venv";
-  packages =
-    [
-      pkgs.python311.pkgs.venvShellHook
+  packages = [
+    pkgs.python311.pkgs.venvShellHook
 
-      openocd
-      pkgs.yosys
+    openocd
+    pkgs.yosys
 
-      # Needed by Verilator simulations
-      pkgs.json_c
-      pkgs.libevent
-      pkgs.zlib
-    ]
-    ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-      # Needed by Rust code
-      pkgs.libiconv
-      pkgs.darwin.apple_sdk.frameworks.CoreFoundation
-    ];
+    # Needed by Verilator simulations
+    pkgs.json_c
+    pkgs.libevent
+    pkgs.zlib
+  ];
 
   postVenvCreation = ''
     ${pkgs.uv}/bin/uv pip install -r requirements.txt

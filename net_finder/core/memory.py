@@ -1,3 +1,5 @@
+from itertools import chain
+
 from amaranth import *
 from amaranth.hdl import ShapeLike, ValueLike
 from amaranth.lib import wiring
@@ -56,12 +58,13 @@ class ChunkedMemory(wiring.Component):
         self._depth = depth
         self._chunks = chunks
 
-        self._read_ports: list[PureInterface] = []
-        self._sdp_ports: list[tuple[PureInterface, PureInterface]] = []
+        self._read_ports: list[tuple[PureInterface, str]] = []
+        self._write_ports: list[PureInterface] = []
+        self._sdp_ports: list[tuple[tuple[PureInterface, str], PureInterface]] = []
 
         super().__init__({})
 
-    def read_port(self) -> PureInterface:
+    def read_port(self, domain="sync") -> PureInterface:
         # Return a disconnected interface, which we then add to an array and hook up
         # during `elaborate`.
         port = ChunkedReadPortSignature(
@@ -70,11 +73,24 @@ class ChunkedMemory(wiring.Component):
             shape=self._shape,
         ).create()
 
-        self._read_ports.append(port)
+        self._read_ports.append((port, domain))
 
         return port
 
-    def sdp_port(self) -> tuple[PureInterface, PureInterface]:
+    def write_port(self) -> PureInterface:
+        # Return a disconnected interface, which we then add to an array and hook up
+        # during `elaborate`.
+        port = ChunkedWritePortSignature(
+            chunk_width=ceil_log2(self._chunks),
+            addr_width=ceil_log2(self._depth),
+            shape=self._shape,
+        ).create()
+
+        self._write_ports.append(port)
+
+        return port
+
+    def sdp_port(self, read_domain="sync") -> tuple[PureInterface, PureInterface]:
         # Return disconnected interfaces, which we then add to an array and hook up
         # during `elaborate`.
         read_port = ChunkedReadPortSignature(
@@ -88,7 +104,7 @@ class ChunkedMemory(wiring.Component):
             shape=self._shape,
         ).create()
 
-        self._sdp_ports.append((read_port, write_port))
+        self._sdp_ports.append(((read_port, read_domain), write_port))
 
         return read_port, write_port
 
@@ -106,7 +122,7 @@ class ChunkedMemory(wiring.Component):
 
             # Give the chunk a port corresponding to each of our outer ports, and hook up
             # their inputs.
-            for port_index, (read_port, write_port) in enumerate(self._sdp_ports):
+            for port_index, ((read_port, _), write_port) in enumerate(self._sdp_ports):
                 inner_read_port = chunk.read_port()
                 inner_write_port = chunk.write_port()
 
@@ -123,18 +139,25 @@ class ChunkedMemory(wiring.Component):
 
                 inner_sdp_read_ports[port_index].append(inner_read_port)
 
-            for port_index, port in enumerate(self._read_ports):
-                inner_port = chunk.read_port()
+            for port_index, (port, domain) in enumerate(self._read_ports):
+                inner_port = chunk.read_port(domain=domain)
                 m.d.comb += inner_port.addr.eq(port.addr)
                 inner_read_ports[port_index].append(inner_port)
 
-        # Connect up the SDP read ports' outputs.
-        for (port, _), inner_ports in zip(self._sdp_ports, inner_sdp_read_ports):
-            m.d.comb += port.data.eq(Array(inner_ports)[port.chunk].data)
+            for port_index, port in enumerate(self._write_ports):
+                inner_port = chunk.write_port()
+                m.d.comb += inner_port.addr.eq(port.addr)
+                m.d.comb += inner_port.data.eq(port.data)
+                m.d.comb += inner_port.en.eq(port.en & (port.chunk == chunk_index))
 
-        # Connect up the regular read ports' outputs.
-        for port, inner_ports in zip(self._read_ports, inner_read_ports):
-            m.d.comb += port.data.eq(Array(inner_ports)[port.chunk].data)
+        # Connect up the read ports' outputs.
+        for (port, domain), inner_ports in zip(
+            chain(self._read_ports, (r for r, _ in self._sdp_ports)),
+            chain(inner_read_ports, inner_sdp_read_ports),
+        ):
+            chunk = Signal.like(port.chunk)
+            m.d[domain] += chunk.eq(port.chunk)
+            m.d.comb += port.data.eq(Array(inner_ports)[chunk].data)
 
         return m
 

@@ -6,6 +6,10 @@ from amaranth.lib import data
 from amaranth.utils import ceil_log2
 
 
+def next_power_of_two(n: int):
+    return 1 << ceil_log2(n)
+
+
 def net_size(max_area: int):
     """Returns the width/height of the net."""
 
