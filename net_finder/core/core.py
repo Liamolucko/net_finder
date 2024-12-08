@@ -15,6 +15,7 @@ from .main_pipeline import (
     instruction_ref_layout,
     max_decisions_len,
     max_potential_len,
+    max_run_stack_len,
     run_stack_entry_layout,
 )
 from .memory import ChunkedMemory
@@ -22,17 +23,6 @@ from .neighbour_lookup import neighbour_lookup_layout
 from .net import shard_depth
 from .skip_checker import undo_lookup_layout
 from .utils import pipe
-
-
-def max_run_stack_len(max_area: int):
-    """
-    Returns the maximum number of run instructions there can be at any given time.
-    """
-
-    # The run stack's length can't ever actually reach `max_area`: if every other
-    # square is already filled, the last one to be added will always be a potential
-    # instruction since all its neighbouring squares will already be filled.
-    return max_area - 1
 
 
 def prefix_layout(cuboids: int, max_area: int):

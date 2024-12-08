@@ -36,19 +36,23 @@ def instruction_ref_layout(max_area: int):
     )
 
 
+def max_run_stack_len(max_area: int):
+    """
+    Returns the maximum number of run instructions there can be at any given time.
+    """
+
+    # The run stack's length can't ever actually reach `max_area`: if every other
+    # square is already filled, the last one to be added will always be a potential
+    # instruction since all its neighbouring squares will already be filled.
+    return max_area - 1
+
+
 def max_potential_len(max_area: int):
     """
     Returns the maximum number of potential instructions there can be at any given
     time.
     """
 
-    # The upper bound of how many potential instructions there can be is if every
-    # square on the surfaces, except for the ones set by the first instruction, has
-    # 4 potential instructions trying to set it: 1 from each direction.
-    #
-    # While this isn't actually possible, it's a nice clean upper bound.
-    #
-    # TODO: I think we can reduce this to 4 + 2 * (max_run_stack_len - 1), since:
     # - The first instruction can produce at most 4 potential instructions.
     # - Each instruction after that:
     #   - Reduces the max. potential instructions by one (since we'd previously
@@ -56,25 +60,19 @@ def max_potential_len(max_area: int):
     #     isn't because we've run it)
     #   - Increases the max. potential instructions by 3.
     #   - So in total, it increases the maximum by 2.
-    return 4 * (max_area - 1)
+    return 4 + 2 * (max_run_stack_len(max_area) - 1)
 
 
 def max_decisions_len(max_area: int):
     """Returns the maximum number of decisions there can be at any given time."""
 
-    # There's always 1 decision for the first instruction, then the upper bound is
-    # that every square has 4 instructions setting it, 3 of which we decided not to
-    # run and the last one we did.
-    #
-    # TODO: smaller upper bound:
-    #
     # Say you have a list of decisions.
     #
     # If it's of maximal length, it should have max_run_stack_len 1s.
     #
     # The first 1 produces at most 4 instructions, and the rest produce at most 3:
-    # so then the maximum number of decisions is 4 + 3 * (max_run_stack_len - 1).
-    return 1 + 4 * (max_area - 1)
+    # so then the maximum number of decisions is 1 + 4 + 3 * (max_run_stack_len - 1).
+    return 1 + 4 + 3 * (max_run_stack_len(max_area) - 1)
 
 
 def run_stack_entry_layout(cuboids: int, max_area: int):

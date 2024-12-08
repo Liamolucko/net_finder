@@ -532,8 +532,12 @@ impl<const CUBOIDS: usize> FinderInfo<CUBOIDS> {
     }
 }
 
+fn max_run_stack_len(max_area: usize) -> usize {
+    max_area - 1
+}
+
 fn max_decisions_len(max_area: usize) -> usize {
-    1 + 4 * (max_area - 1)
+    1 + 4 + 3 * (max_run_stack_len(max_area) - 1)
 }
 
 /// An instruction to add a square.
