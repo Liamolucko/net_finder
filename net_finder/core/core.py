@@ -89,7 +89,7 @@ def core_out_layout():
 
 
 class CoreInterface(wiring.Signature):
-    def __init__(self):
+    def __init__(self, max_area: int):
         super().__init__(
             {
                 "input": In(stream.Signature(core_in_layout())),
@@ -99,7 +99,7 @@ class CoreInterface(wiring.Signature):
                 "wants_finder": Out(1),
                 "stepping": Out(1),
                 "active": Out(1),
-                "base_decision": Out(1),
+                "base_decision": Out(range(max_decisions_len(max_area) + 1)),
             }
         )
 
@@ -121,7 +121,7 @@ class Core(wiring.Component):
 
         super().__init__(
             {
-                "interfaces": Out(CoreInterface()).array(FINDERS_PER_CORE),
+                "interfaces": Out(CoreInterface(max_area)).array(FINDERS_PER_CORE),
                 # The ports this core should use to access the neighbour lookups.
                 "neighbour_lookups": In(
                     ReadPort.Signature(
@@ -228,7 +228,7 @@ class Core(wiring.Component):
         wb_read_decision = Signal(1)
         # If we're in Check state, whether or not we need to wait for the potential
         # surfaces to finish being cleared before proceeding.
-        wb_clearing = Signal(1)
+        wb_clearing = Signal(1, init=1)
         # If we're in Split state, whether we've already finished sending the finder and
         # are now just searching for a new `base_decision`.
         wb_finder_done = Signal(1)
@@ -287,7 +287,7 @@ class Core(wiring.Component):
 
         if_initial_prefix = pipe(m, wb_next_prefix)
         if_prefix_bits_left = pipe(
-            m, wb_next_prefix_bits_left, init=if_prefix.shape().size
+            m, wb_next_prefix_bits_left, init=if_initial_prefix.shape().size
         )
         if_run_stack_len = pipe(m, wb_next_run_stack_len)
         if_potential_len = pipe(m, wb_next_potential_len)
@@ -340,14 +340,43 @@ class Core(wiring.Component):
             with m.Default():
                 m.d.comb += if_decision_index.eq(0)
 
-        # We only get to Clear state via. resetting, which will reset this to 0 anyway:
-        # so the only time we actually need to reset it is when exiting Check state so
-        # that we don't waste time clearing addresses the potential surfaces don't have.
-        if_clear_index = Mux(if_prev_state == State.Check, 0, if_prev_clear_index + 1)
-
         if_state = Signal(State)
         if_prefix = Signal.like(if_initial_prefix)
         m.d.comb += if_prefix.eq(if_initial_prefix)
+
+        def run_transitions(allow_check: bool = True):
+            """
+            Rather than just writing `if_state.eq(State.Run)`, you should invoke this
+            function in order to make sure that we don't end up accidentally spending an
+            iteration in Run state when we should be doing something else.
+            """
+
+            with m.If(if_req_pause):
+                m.d.comb += if_state.eq(State.Pause)
+            with m.Elif(
+                if_req_split & (if_initial_prefix.base_decision < if_decisions_len)
+            ):
+                m.d.comb += if_state.eq(State.Split)
+                # Set `base_decision` to what the base decision of the finder we're sending will
+                # be (1 past the end of its decisions), so that it gets sent out along with the
+                # rest of the prefix.
+                #
+                # However, it might not be our new base decision, since it might be a 0: we'll
+                # fix it up once we find the first 1 past our old base decision.
+                m.d.comb += if_prefix.base_decision.eq(
+                    if_initial_prefix.base_decision + 1
+                )
+            if allow_check:
+                with m.Elif(
+                    if_backtrack
+                    & (if_run_stack_len + if_potential_len >= if_initial_prefix.area)
+                ):
+                    # There are enough run + potential instructions that we might have a solution,
+                    # so check for that before we backtrack.
+                    m.d.comb += if_state.eq(State.Check)
+            with m.Else():
+                # Note that this also covers the case where we backtrack immediately.
+                m.d.comb += if_state.eq(State.Run)
 
         with m.Switch(if_prev_state):
             with m.Case(State.Clear):
@@ -357,41 +386,17 @@ class Core(wiring.Component):
                     m.d.comb += if_state.eq(State.Clear)
             with m.Case(State.Receive):
                 with m.If(if_prev_received & if_prev_in.last):
-                    m.d.comb += if_state.eq(State.Run)
+                    run_transitions()
                 with m.Else():
                     m.d.comb += if_state.eq(State.Receive)
             with m.Case(State.Run):
-                with m.If(if_req_pause):
-                    m.d.comb += if_state.eq(State.Pause)
-                with m.Elif(
-                    if_req_split & (if_initial_prefix.base_decision < if_decisions_len)
-                ):
-                    m.d.comb += if_state.eq(State.Split)
-                    # Set `base_decision` to what the base decision of the finder we're sending will
-                    # be (1 past the end of its decisions), so that it gets sent out along with the
-                    # rest of the prefix.
-                    #
-                    # However, it might not be our new base decision, since it might be a 0: we'll
-                    # fix it up once we find the first 1 past our old base decision.
-                    m.d.comb += if_prefix.base_decision.eq(
-                        if_initial_prefix.base_decision + 1
-                    )
-                with m.Elif(
-                    if_backtrack
-                    & (if_run_stack_len + if_potential_len >= if_initial_prefix.area)
-                ):
-                    # There are enough run + potential instructions that we might have a solution,
-                    # so check for that before we backtrack.
-                    m.d.comb += if_state.eq(State.Check)
-                with m.Else():
-                    # Note that this also covers the case where we backtrack immediately.
-                    m.d.comb += if_state.eq(State.Run)
+                run_transitions()
             with m.Case(State.Check):
                 all_squares_filled = Cat(
                     if_run_stack_len + if_potential_areas[i] == if_initial_prefix.area
                     for i in range(self._cuboids)
                 ).all()
-                with m.If(all_squares_filled):
+                with m.If(~if_prev_clearing & all_squares_filled):
                     # All the squares are filled, which means we have a potential solution!
                     m.d.comb += if_state.eq(State.Solution)
                 # Note: although `wb_potential_index` can only go up to `max_potential_len - 1`,
@@ -401,12 +406,12 @@ class Core(wiring.Component):
                 with m.Elif(if_potential_index == if_potential_len):
                     # We've run all the potential instructions and not all the squares are filled,
                     # so this isn't a solution. Time to backtrack.
-                    m.d.comb += if_state.eq(State.Run)
+                    run_transitions(allow_check=False)
                 with m.Else():
                     m.d.comb += if_state.eq(State.Check)
             with m.Case(State.Solution):
-                with m.If(if_prefix_done & (if_decision_index == if_decisions_len)):
-                    m.d.comb += if_state.eq(State.Run)
+                with m.If(if_decision_index == if_decisions_len):
+                    run_transitions(allow_check=False)
                 with m.Else():
                     m.d.comb += if_state.eq(State.Solution)
             with m.Case(State.Pause):
@@ -416,12 +421,23 @@ class Core(wiring.Component):
             with m.Case(State.Split):
                 # We don't actually stop once the finder is sent like you might expect: since
                 # `base_decision` can't point to a 0, we have to keep going until we find a 1 to
-                # set it to.
-                with m.If(if_prev_finder_done & if_prev_read_decision):
-                    m.d.comb += if_state.eq(State.Run)
-                    m.d.comb += if_prefix.base_decision.eq(if_prev_decision_index)
+                # set it to, or hit the end of `decisions` if there aren't any.
+                with m.If(
+                    (if_prev_finder_done & if_prev_read_decision)
+                    | (if_decision_index == if_decisions_len)
+                ):
+                    run_transitions()
                 with m.Else():
                     m.d.comb += if_state.eq(State.Split)
+
+        # We only get to Clear state via. resetting, which will reset this to 0 anyway:
+        # so the only time we actually need to reset it is when exiting Check state so
+        # that we don't waste time clearing addresses the potential surfaces don't have.
+        if_clear_index = Mux(
+            (if_prev_state == State.Check) & (if_state != State.Check),
+            0,
+            if_prev_clear_index + 1,
+        )
 
         m.d.comb += potential_read.chunk.eq(if_finder)
         m.d.comb += potential_read.addr.eq(if_potential_index)
@@ -572,10 +588,24 @@ class Core(wiring.Component):
 
         vc_instruction = main_pipeline.instruction
 
+        # The `vc_potential_index == 0` is necessary because otherwise Check state would
+        # freeze up as soon as it ran the first potential instruction and the potential
+        # surfaces weren't empty anymore.
+        vc_clearing = (vc_state != State.Check) | (
+            (vc_potential_index == 0)
+            & Cat(vc_potential_areas[i] != 0 for i in range(self._cuboids)).any()
+        )
+
         for i in range(self._cuboids):
             read_port, _ = potential_surface_ports[i]
             m.d.comb += read_port.chunk.eq(vc_finder)
-            m.d.comb += read_port.addr.eq(vc_instruction.mapping[i])
+            m.d.comb += read_port.addr.eq(
+                Mux(
+                    vc_clearing,
+                    vc_clear_index,
+                    vc_instruction.mapping[i].square,
+                )
+            )
 
         m.d.comb += decisions_read.chunk.eq(vc_finder)
         m.d.comb += decisions_read.addr.eq(vc_decision_index)
@@ -603,6 +633,7 @@ class Core(wiring.Component):
         wb_task = pipe(m, vc_task)
         wb_entry = pipe(m, vc_entry)
         wb_instruction = pipe(m, vc_instruction)
+        m.d.sync += wb_clearing.eq(vc_clearing)
 
         wb_instruction_valid = main_pipeline.instruction_valid
         wb_neighbours_valid = main_pipeline.neighbours_valid
@@ -612,8 +643,10 @@ class Core(wiring.Component):
         wb_run = (
             (wb_task == Task.Advance) & wb_instruction_valid & wb_neighbours_valid.any()
         )
+        # Potential instructions still need to be added in Receive state even if the
+        # next decision is 0.
         wb_potential = (
-            (wb_task == Task.Advance)
+            ((wb_task == Task.Advance) | ((wb_state == State.Receive) & wb_prefix_done))
             & wb_instruction_valid
             & ~wb_neighbours_valid.any()
         )
@@ -627,6 +660,8 @@ class Core(wiring.Component):
         for i in range(FINDERS_PER_CORE):
             m.d.comb += in_fifos[i].r_en.eq((wb_finder == i) & wb_received)
 
+        # The `wb_prefix_done` is needed so that we don't try and interpret the meaning
+        # of `wb_prefix.base_decision` while the prefix is still being shifted out.
         m.d.comb += wb_finder_done.eq(
             wb_prefix_done & (wb_decision_index >= wb_prefix.base_decision)
         )
@@ -708,29 +743,22 @@ class Core(wiring.Component):
             (wb_received & wb_prefix_done) | wb_run | (wb_task == Task.Backtrack)
         )
 
-        # The `wb_potential_index == 0` is necessary because otherwise Check state would
-        # freeze up as soon as it ran the first potential instruction and the potential
-        # surfaces weren't empty anymore.
-        m.d.comb += wb_clearing.eq(
-            (wb_potential_index == 0)
-            & Cat(wb_potential_areas[i] != 0 for i in range(self._cuboids)).any()
-        )
         for i in range(self._cuboids):
             _, write_port = potential_surface_ports[i]
             m.d.comb += write_port.chunk.eq(wb_finder)
             m.d.comb += write_port.addr.eq(
                 Mux(
-                    wb_state == State.Check,
-                    wb_instruction.mapping[i].square,
+                    wb_clearing,
                     wb_clear_index,
+                    wb_instruction.mapping[i].square,
                 )
             )
-            m.d.comb += write_port.data.eq(wb_state == State.Check)
+            m.d.comb += write_port.data.eq(~wb_clearing)
             m.d.comb += write_port.en.eq(
                 Mux(
-                    wb_state == State.Check,
-                    wb_instruction_valid,
+                    wb_clearing,
                     wb_clear_index < self._max_area,
+                    wb_instruction_valid,
                 )
             )
 
@@ -741,10 +769,16 @@ class Core(wiring.Component):
         )
         m.d.comb += wb_next_prefix_bits_left.eq(
             Mux(
-                (wb_state == State.Receive)
-                | (wb_state == State.Solution)
+                ((wb_state == State.Receive) & ~(wb_in.last & wb_received))
+                | ((wb_state == State.Solution) & ~(wb_out.last & wb_sent))
                 | (wb_state == State.Pause)
-                | (wb_state == State.Split),
+                | (
+                    (wb_state == State.Split)
+                    & ~(
+                        (wb_finder_done & wb_read_decision)
+                        | (wb_prefix_done & (wb_decision_index == wb_decisions_len - 1))
+                    )
+                ),
                 wb_prefix_bits_left - shift_prefix,
                 wb_prefix.shape().size,
             )
@@ -755,6 +789,16 @@ class Core(wiring.Component):
             & (wb_entry.decision_index == wb_prefix.base_decision)
         ):
             m.d.comb += wb_next_prefix.base_decision.eq(wb_prefix.base_decision + 1)
+        with m.Elif((wb_state == State.Split) & wb_finder_done & wb_read_decision):
+            m.d.comb += wb_next_prefix.base_decision.eq(wb_decision_index)
+        with m.Elif(
+            (wb_state == State.Split)
+            # Unlike the previous case, this can actually occur on the same cycle as
+            # wb_out.last is set, so wb_finder_done wouldn't work here.
+            & wb_prefix_done
+            & (wb_decision_index == wb_decisions_len - 1)
+        ):
+            m.d.comb += wb_next_prefix.base_decision.eq(wb_decisions_len)
 
         with m.If(wb_task == Task.Backtrack):
             m.d.comb += wb_next_run_stack_len.eq(wb_run_stack_len - 1)
@@ -779,13 +823,13 @@ class Core(wiring.Component):
         for i in range(self._cuboids):
             read_port, write_port = potential_surface_ports[i]
             with m.If(wb_state == State.Clear):
-                wb_next_potential_areas[i].eq(wb_potential_areas[i])
+                m.d.comb += wb_next_potential_areas[i].eq(wb_potential_areas[i])
             with m.Elif(write_port.en & (read_port.data == 0) & (write_port.data == 1)):
-                wb_next_potential_areas[i].eq(wb_potential_areas[i] + 1)
+                m.d.comb += wb_next_potential_areas[i].eq(wb_potential_areas[i] + 1)
             with m.Elif(write_port.en & (read_port.data == 1) & (write_port.data == 0)):
-                wb_next_potential_areas[i].eq(wb_potential_areas[i] - 1)
+                m.d.comb += wb_next_potential_areas[i].eq(wb_potential_areas[i] - 1)
             with m.Else():
-                wb_next_potential_areas[i].eq(wb_potential_areas[i])
+                m.d.comb += wb_next_potential_areas[i].eq(wb_potential_areas[i])
 
         m.d.comb += wb_target_processed.eq(
             (
@@ -827,7 +871,7 @@ class Core(wiring.Component):
                     m.d.comb += prefix_bits_left.eq(wb_prefix_bits_left)
 
             m.d.comb += self.interfaces[i].wants_finder.eq(
-                (state == State.Receive) & prefix_bits_left == prefix.shape().size
+                (state == State.Receive) & (prefix_bits_left == prefix.shape().size)
             )
             m.d.comb += self.interfaces[i].active.eq(
                 (state != State.Clear) & (state != State.Receive)

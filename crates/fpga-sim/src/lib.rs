@@ -1,42 +1,55 @@
+use std::cell::Cell;
 use std::ffi::{c_char, c_void, CStr};
 use std::fmt::Debug;
+use std::iter::zip;
 
-use net_finder::{Cuboid, FinderCtx, FinderInfo};
+use net_finder::{fpga, FinderCtx, FinderInfo};
 
-pub const CUBOIDS: [Cuboid; 3] = [
-    Cuboid::new(1, 1, 11),
-    Cuboid::new(1, 2, 7),
-    Cuboid::new(1, 3, 5),
-];
-pub const NUM_CUBOIDS: usize = CUBOIDS.len();
-pub const AREA: usize = CUBOIDS[0].surface_area();
+pub const MAX_AREA: usize = 64;
+pub const MAX_CUBOIDS: usize = 3;
+
+#[repr(C)]
+struct InterfaceInner {
+    in_payload: *const Cell<u8>,
+    in_valid: *const Cell<bool>,
+    in_ready: *const Cell<bool>,
+
+    out_payload: *const Cell<u8>,
+    out_valid: *const Cell<bool>,
+    out_ready: *const Cell<bool>,
+
+    req_pause: *const Cell<bool>,
+    req_split: *const Cell<bool>,
+
+    wants_finder: *const Cell<bool>,
+    stepping: *const Cell<bool>,
+}
+
+#[repr(C)]
+struct NeighbourLookupInner {
+    en: *const Cell<bool>,
+    addr: *const Cell<u16>,
+    data: *const Cell<u64>,
+}
+
+#[repr(C)]
+struct UndoLookupInner {
+    en: *const Cell<bool>,
+    addr: *const Cell<u16>,
+    data: *const Cell<u16>,
+}
 
 #[repr(C)]
 struct CoreInner {
     ptr: *mut c_void,
 
     // Invariant: outside of `Core::clock`, this is always `false`.
-    clk: *mut bool,
-    reset: *mut bool,
+    clk: *const Cell<bool>,
+    reset: *const Cell<bool>,
 
-    in_data: *mut bool,
-    in_valid: *mut bool,
-    in_ready: *const bool,
-    in_last: *mut bool,
-
-    out_data: *const bool,
-    out_valid: *const bool,
-    out_ready: *mut bool,
-    out_last: *const bool,
-
-    out_solution: *const bool,
-    out_split: *const bool,
-    out_pause: *const bool,
-
-    req_pause: *mut bool,
-    req_split: *mut bool,
-
-    stepping: *const bool,
+    interfaces: [InterfaceInner; 4],
+    neighbour_lookups: [NeighbourLookupInner; 3],
+    undo_lookups: [UndoLookupInner; 2],
 }
 
 extern "C" {
@@ -47,10 +60,11 @@ extern "C" {
     fn verilated_context_time_inc(this: *mut c_void, add: u64);
     fn verilated_context_free(this: *mut c_void);
 
-    fn verilated_fst_new() -> *mut c_void;
-    fn verilated_fst_open(this: *mut c_void, filename: *const c_char);
-    fn verilated_fst_dump(this: *mut c_void, time: u64);
-    fn verilated_fst_free(this: *mut c_void);
+    fn verilated_vcd_new() -> *mut c_void;
+    fn verilated_vcd_open(this: *mut c_void, filename: *const c_char);
+    fn verilated_vcd_dump(this: *mut c_void, time: u64);
+    fn verilated_vcd_flush(this: *mut c_void);
+    fn verilated_vcd_free(this: *mut c_void);
 
     fn core_new(context: *mut c_void) -> CoreInner;
     fn core_update(this: *mut c_void);
@@ -86,40 +100,63 @@ impl Drop for VerilatedContext {
 
 pub struct Core<'a> {
     inner: CoreInner,
-    fst: Option<*mut c_void>,
+    vcd: Option<*mut c_void>,
     // This can be retrieved via `VerilatedModel::contextp`, but that gives a pointer to the
     // underlying `VerilatedContext` when `&VerilatedContext` in Rust is actually a pointer to a
     // pointer. So we'd probably have to add a `VerilatedContextRef`, and so on... this is easier.
     ctx: &'a VerilatedContext,
+    /// The clock cycle number we're up to.
+    tick: Cell<u64>,
+    tick_event: event_listener::Event,
 }
 
 /// A simulated instance of `core`.
 impl<'a> Core<'a> {
     /// Creates a new simulated instance of `core`.
     ///
-    /// You can optionally provide the name of a file to write an FST trace of
+    /// You can optionally provide the name of a file to write a VCD trace of
     /// the simulation to.
     // TODO: I'm pretty sure it's ok for this to be a shared reference but idk.
     pub fn new(ctx: &'a VerilatedContext, trace_file: Option<&CStr>) -> Self {
         let inner = unsafe { core_new(ctx.ptr) };
-        let fst = trace_file.map(|filename| unsafe {
-            let ptr = verilated_fst_new();
+        let vcd = trace_file.map(|filename| unsafe {
+            let ptr = verilated_vcd_new();
             core_trace(inner.ptr, ptr);
-            verilated_fst_open(ptr, filename.as_ptr());
+            verilated_vcd_open(ptr, filename.as_ptr());
             ptr
         });
 
-        let mut this = Self { inner, fst, ctx };
+        let this = Self {
+            inner,
+            vcd,
+            ctx,
+            tick: Cell::new(0),
+            tick_event: event_listener::Event::new(),
+        };
 
         // Initialise all the `core`'s inputs low.
-        *this.clk() = false;
-        *this.reset_sig() = false;
-        *this.in_data() = false;
-        *this.in_valid() = false;
-        *this.in_last() = false;
-        *this.out_ready() = false;
-        *this.req_pause() = false;
-        *this.req_split() = false;
+        this.clk().set(false);
+        this.reset_sig().set(false);
+
+        for interface in this.interfaces() {
+            interface.in_payload.set(0);
+            interface.in_valid.set(false);
+            interface.out_ready.set(false);
+            interface.req_pause.set(false);
+            interface.req_split.set(false);
+        }
+
+        for mem in this.neighbour_lookups() {
+            mem.en.set(false);
+            mem.addr.set(0);
+            mem.data.set(0);
+        }
+
+        for mem in this.undo_lookups() {
+            mem.en.set(false);
+            mem.addr.set(0);
+            mem.data.set(0);
+        }
 
         this.update();
 
@@ -134,83 +171,183 @@ impl<'a> Core<'a> {
     ///
     /// Note that this doesn't create an implicit clock edge or anything like
     /// that; the clock is just another input.
-    pub fn update(&mut self) {
+    pub fn update(&self) {
         self.ctx.time_inc(1);
         unsafe {
             core_update(self.inner.ptr);
-            if let Some(ptr) = self.fst {
-                verilated_fst_dump(ptr, self.ctx.time());
+            if let Some(ptr) = self.vcd {
+                verilated_vcd_dump(ptr, self.ctx.time());
             }
         }
     }
 
-    fn clk(&mut self) -> &mut bool {
-        unsafe { &mut *self.inner.clk }
-    }
-    fn reset_sig(&mut self) -> &mut bool {
-        unsafe { &mut *self.inner.reset }
-    }
-    pub fn in_data(&mut self) -> &mut bool {
-        unsafe { &mut *self.inner.in_data }
-    }
-    pub fn in_valid(&mut self) -> &mut bool {
-        unsafe { &mut *self.inner.in_valid }
-    }
-    pub fn in_last(&mut self) -> &mut bool {
-        unsafe { &mut *self.inner.in_last }
-    }
-    pub fn out_ready(&mut self) -> &mut bool {
-        unsafe { &mut *self.inner.out_ready }
-    }
-    pub fn req_pause(&mut self) -> &mut bool {
-        unsafe { &mut *self.inner.req_pause }
-    }
-    pub fn req_split(&mut self) -> &mut bool {
-        unsafe { &mut *self.inner.req_split }
+    pub fn flush_vcd(&self) {
+        if let Some(ptr) = self.vcd {
+            unsafe { verilated_vcd_flush(ptr) }
+        }
     }
 
-    pub fn in_ready(&self) -> bool {
-        unsafe { *self.inner.in_ready }
+    fn clk(&self) -> &Cell<bool> {
+        unsafe { &*self.inner.clk }
     }
-    pub fn out_data(&self) -> bool {
-        unsafe { *self.inner.out_data }
-    }
-    pub fn out_valid(&self) -> bool {
-        unsafe { *self.inner.out_valid }
-    }
-    pub fn out_last(&self) -> bool {
-        unsafe { *self.inner.out_last }
-    }
-    pub fn out_solution(&self) -> bool {
-        unsafe { *self.inner.out_solution }
-    }
-    pub fn out_split(&self) -> bool {
-        unsafe { *self.inner.out_split }
-    }
-    pub fn out_pause(&self) -> bool {
-        unsafe { *self.inner.out_pause }
-    }
-    pub fn stepping(&self) -> bool {
-        unsafe { *self.inner.stepping }
+    fn reset_sig(&self) -> &Cell<bool> {
+        unsafe { &*self.inner.reset }
     }
 
     /// Resets the `core`.
-    pub fn reset(&mut self) {
-        *self.reset_sig() = true;
+    pub fn reset(&self) {
+        self.reset_sig().set(true);
         self.update();
 
         self.clock();
 
-        *self.reset_sig() = false;
+        self.reset_sig().set(false);
         self.update();
     }
 
     /// Runs a clock cycle of the `core`.
-    pub fn clock(&mut self) {
-        *self.clk() = true;
+    pub fn clock(&self) {
+        self.clk().set(true);
         self.update();
-        *self.clk() = false;
+        self.clk().set(false);
         self.update();
+
+        self.tick.set(self.tick.get() + 1);
+        self.tick_event.notify(usize::MAX);
+    }
+
+    pub fn interfaces(&self) -> impl ExactSizeIterator<Item = Interface> + DoubleEndedIterator {
+        self.inner.interfaces.iter().map(|raw| Interface {
+            core: self,
+            in_payload: unsafe { &*raw.in_payload },
+            in_valid: unsafe { &*raw.in_valid },
+            in_ready: unsafe { &*raw.in_ready },
+            out_payload: unsafe { &*raw.out_payload },
+            out_valid: unsafe { &*raw.out_valid },
+            out_ready: unsafe { &*raw.out_ready },
+            req_pause: unsafe { &*raw.req_pause },
+            req_split: unsafe { &*raw.req_split },
+            wants_finder: unsafe { &*raw.wants_finder },
+            stepping: unsafe { &*raw.stepping },
+        })
+    }
+
+    fn neighbour_lookups(
+        &self,
+    ) -> impl ExactSizeIterator<Item = NeighbourLookup> + DoubleEndedIterator {
+        self.inner
+            .neighbour_lookups
+            .iter()
+            .map(|raw| NeighbourLookup {
+                core: self,
+                en: unsafe { &*raw.en },
+                addr: unsafe { &*raw.addr },
+                data: unsafe { &*raw.data },
+            })
+    }
+
+    fn undo_lookups(&self) -> impl ExactSizeIterator<Item = UndoLookup> + DoubleEndedIterator {
+        self.inner.undo_lookups.iter().map(|raw| UndoLookup {
+            core: self,
+            en: unsafe { &*raw.en },
+            addr: unsafe { &*raw.addr },
+            data: unsafe { &*raw.data },
+        })
+    }
+
+    /// Waits for a clock cycle to pass.
+    ///
+    /// Make sure not to `await` anything else: the fuzz target will perform a
+    /// clock cycle whenever all its tasks are idle, so you might end up
+    /// missing a clock cycle.
+    pub async fn tick(&self) {
+        let tick = self.tick.get();
+        while self.tick.get() == tick {
+            self.tick_event.listen().await;
+        }
+    }
+
+    pub fn fill_mems<const CUBOIDS: usize>(&self, ctx: &FinderCtx<CUBOIDS>) {
+        for (mem, contents) in zip(
+            self.neighbour_lookups(),
+            fpga::neighbour_lookups(ctx, MAX_AREA, MAX_CUBOIDS),
+        ) {
+            mem.fill(&contents);
+        }
+
+        for (mem, contents) in zip(self.undo_lookups(), fpga::undo_lookups(ctx, MAX_CUBOIDS)) {
+            mem.fill(&contents);
+        }
+    }
+}
+
+impl Drop for Core<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            // Make sure to drop the `VerilatedVcdC` first.
+            if let Some(ptr) = self.vcd {
+                verilated_vcd_free(ptr);
+            }
+            core_free(self.inner.ptr);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FinderType {
+    Solution = 0,
+    Split = 1,
+    Pause = 2,
+}
+
+pub struct Interface<'a> {
+    core: &'a Core<'a>,
+
+    in_payload: &'a Cell<u8>,
+    in_valid: &'a Cell<bool>,
+    in_ready: &'a Cell<bool>,
+
+    out_payload: &'a Cell<u8>,
+    pub out_valid: &'a Cell<bool>,
+    out_ready: &'a Cell<bool>,
+
+    pub req_pause: &'a Cell<bool>,
+    pub req_split: &'a Cell<bool>,
+
+    pub wants_finder: &'a Cell<bool>,
+    stepping: &'a Cell<bool>,
+}
+
+impl Interface<'_> {
+    pub fn core(&self) -> &Core {
+        self.core
+    }
+
+    fn set_in_data(&self, value: bool) {
+        self.in_payload
+            .set(self.in_payload.get() & !1 | value as u8)
+    }
+
+    fn set_in_last(&self, value: bool) {
+        self.in_payload
+            .set(self.in_payload.get() & !(1 << 1) | ((value as u8) << 1))
+    }
+
+    fn out_data(&self) -> bool {
+        self.out_payload.get() & 1 != 0
+    }
+
+    fn out_last(&self) -> bool {
+        (self.out_payload.get() >> 1) & 1 != 0
+    }
+
+    fn out_type(&self) -> FinderType {
+        match self.out_payload.get() >> 2 {
+            0 => FinderType::Solution,
+            1 => FinderType::Split,
+            2 => FinderType::Pause,
+            _ => unreachable!(),
+        }
     }
 
     /// Clocks this `core` until a clock edge occurs where `self.stepping()` is
@@ -220,15 +357,15 @@ impl<'a> Core<'a> {
     /// which case this returns `false`.
     ///
     /// This will ignore any solutions the finder produces along the way.
-    pub fn step(&mut self) -> bool {
+    pub async fn step(&self) -> bool {
         loop {
-            if self.in_ready() {
+            if self.in_ready.get() {
                 return false;
             }
             // If `self.stepping()` was true before a clock edge, that means stepping
             // occured on that clock edge.
-            let stepped = self.stepping();
-            self.clock();
+            let stepped = self.stepping.get();
+            self.core.tick().await;
             if stepped {
                 break;
             }
@@ -240,22 +377,31 @@ impl<'a> Core<'a> {
     ///
     /// If the `core` is already running a finder, this will get stuck in an
     /// infinite loop.
-    pub fn load_finder(&mut self, ctx: &FinderCtx<NUM_CUBOIDS>, info: &FinderInfo<NUM_CUBOIDS>) {
-        let finder_bits = info.to_bits(ctx);
+    pub async fn load_finder<const CUBOIDS: usize>(
+        &self,
+        ctx: &FinderCtx<CUBOIDS>,
+        info: &FinderInfo<CUBOIDS>,
+    ) {
+        let finder_bits = info.to_bits(ctx, MAX_AREA, MAX_CUBOIDS);
 
-        // Then do that.
+        let expected_steps = info.decisions.iter().filter(|&&decision| decision).count();
+        let mut steps = 0;
+
         for (i, &bit) in finder_bits.iter().enumerate() {
             // First set up the inputs and update the outputs.
-            *self.in_data() = bit;
-            *self.in_valid() = true;
-            *self.in_last() = i == finder_bits.len() - 1;
-            self.update();
+            self.set_in_data(bit);
+            self.in_valid.set(true);
+            self.set_in_last(i == finder_bits.len() - 1);
+            self.core.update();
 
             // Then clock the `core` until there's a clock edge where `in_ready` is 1, which
             // means that it consumed the bit.
             loop {
-                let consumed = self.in_ready();
-                self.clock();
+                let consumed = self.in_ready.get();
+                if self.stepping.get() {
+                    steps += 1;
+                }
+                self.core.tick().await;
                 if consumed {
                     break;
                 }
@@ -263,66 +409,78 @@ impl<'a> Core<'a> {
         }
 
         // Reset everything we used back to 0.
-        *self.in_data() = false;
-        *self.in_valid() = false;
-        *self.in_last() = false;
-        self.update();
+        self.set_in_data(false);
+        self.in_valid.set(false);
+        self.set_in_last(false);
+        self.core.update();
+
+        // Wait until all the steps we told the core to do have actually been performed,
+        // so they don't get misinterpreted as actual runtime steps.
+        while steps < expected_steps {
+            if self.stepping.get() {
+                steps += 1;
+            }
+            self.core.tick().await;
+        }
     }
 
     /// Receives a finder from the core.
-    fn recv_finder(&mut self, ctx: &FinderCtx<NUM_CUBOIDS>) -> FinderInfo<NUM_CUBOIDS> {
+    async fn recv_finder<const CUBOIDS: usize>(
+        &self,
+        ctx: &FinderCtx<CUBOIDS>,
+    ) -> FinderInfo<CUBOIDS> {
         // First, receive the raw bits from the core.
         let mut finder_bits = Vec::new();
-        *self.out_ready() = true;
-        self.update();
+        self.out_ready.set(true);
+        self.core.update();
         loop {
-            if self.out_valid() {
+            if self.out_valid.get() {
                 finder_bits.push(self.out_data());
             }
-            let done = self.out_valid() && self.out_last();
-            self.clock();
+            let done = self.out_valid.get() && self.out_last();
+            self.core.tick().await;
             if done {
                 break;
             }
         }
 
+        self.out_ready.set(false);
+        self.core.update();
+
         // Then interpret them as a `FinderInfo`.
-        FinderInfo::from_bits(ctx, finder_bits)
+        FinderInfo::from_bits(ctx, MAX_AREA, MAX_CUBOIDS, finder_bits)
     }
 
     /// Waits for an 'event' to occur in the core, and returns it.
-    pub fn event(&mut self, ctx: &FinderCtx<NUM_CUBOIDS>) -> Event {
+    pub async fn event<const CUBOIDS: usize>(&self, ctx: &FinderCtx<CUBOIDS>) -> Event<CUBOIDS> {
         loop {
             match (
-                self.stepping(),
-                self.out_solution(),
-                self.out_split(),
-                self.out_pause(),
-                self.in_ready(),
+                self.stepping.get(),
+                self.out_valid.get(),
+                self.wants_finder.get(),
             ) {
-                (false, false, false, false, false) => {
+                (false, false, false) => {
                     // Nothing's happened, wait another clock cycle.
-                    self.clock();
+                    self.core.tick().await;
                 }
-                (true, false, false, false, false) => {
+                (true, false, false) => {
                     // A step has occured.
-                    self.clock();
+                    self.core.tick().await;
                     return Event::Step;
                 }
-                (false, true, false, false, false) => {
-                    // The core's outputting a solution, receive and return it.
-                    return Event::Solution(self.recv_finder(ctx));
+                (false, true, false) => {
+                    let finder = self.recv_finder(ctx).await;
+                    return match self.out_type() {
+                        // The core's outputting a solution, receive and return it.
+                        FinderType::Solution => Event::Solution(finder),
+                        // The core's splitting its finder in half, receive the second half and
+                        // return it.
+                        FinderType::Split => Event::Split(finder),
+                        // The core's pausing, receive its finder and return it.
+                        FinderType::Pause => Event::Pause(finder),
+                    };
                 }
-                (false, false, true, false, false) => {
-                    // The core's splitting its finder in half, receive the second half and return
-                    // it.
-                    return Event::Split(self.recv_finder(ctx));
-                }
-                (false, false, false, true, false) => {
-                    // The core's pausing, receive its finder and return it.
-                    return Event::Pause(self.recv_finder(ctx));
-                }
-                (false, false, false, false, true) => {
+                (false, false, true) => {
                     // The core's stopped (or had already stopped).
                     return Event::Receiving;
                 }
@@ -335,12 +493,15 @@ impl<'a> Core<'a> {
     /// it wasn't running anything.
     ///
     /// Any solutions the `core` produces before pausing are ignored.
-    pub fn pause(&mut self, ctx: &FinderCtx<NUM_CUBOIDS>) -> Option<FinderInfo<NUM_CUBOIDS>> {
-        *self.req_pause() = true;
-        self.update();
+    pub async fn pause<const CUBOIDS: usize>(
+        &self,
+        ctx: &FinderCtx<CUBOIDS>,
+    ) -> Option<FinderInfo<CUBOIDS>> {
+        self.req_pause.set(true);
+        self.core.update();
 
         loop {
-            match self.event(ctx) {
+            match self.event(ctx).await {
                 Event::Step | Event::Solution(_) => {}
                 Event::Split(_) => unreachable!("core splitted unprompted"),
                 Event::Pause(info) => return Some(info),
@@ -350,31 +511,69 @@ impl<'a> Core<'a> {
     }
 }
 
-impl Drop for Core<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            // Make sure to drop the `VerilatedFstC` first.
-            if let Some(ptr) = self.fst {
-                verilated_fst_free(ptr);
-            }
-            core_free(self.inner.ptr);
+pub struct NeighbourLookup<'a> {
+    core: &'a Core<'a>,
+
+    en: &'a Cell<bool>,
+    addr: &'a Cell<u16>,
+    data: &'a Cell<u64>,
+}
+
+impl NeighbourLookup<'_> {
+    pub fn fill(&self, contents: &[u64]) {
+        for (i, &entry) in contents.iter().enumerate() {
+            self.en.set(true);
+            self.addr.set(i.try_into().unwrap());
+            self.data.set(entry);
+            self.core.update();
+            self.core.clock();
         }
+
+        self.en.set(false);
+        self.addr.set(0);
+        self.data.set(0);
+        self.core.update();
+    }
+}
+
+pub struct UndoLookup<'a> {
+    core: &'a Core<'a>,
+
+    en: &'a Cell<bool>,
+    addr: &'a Cell<u16>,
+    data: &'a Cell<u16>,
+}
+
+impl UndoLookup<'_> {
+    pub fn fill(&self, contents: &[u16]) {
+        for (i, &entry) in contents.iter().enumerate() {
+            self.en.set(true);
+            self.addr.set(i.try_into().unwrap());
+            self.data.set(entry);
+            self.core.update();
+            self.core.clock();
+        }
+
+        self.en.set(false);
+        self.addr.set(0);
+        self.data.set(0);
+        self.core.update();
     }
 }
 
 /// An event returned by `Core::event`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Event {
+pub enum Event<const CUBOIDS: usize> {
     /// The core's list of decisions has changed.
     Step,
     /// The core's found a possible solution; the state where it found that
     /// solution is given here.
-    Solution(FinderInfo<NUM_CUBOIDS>),
+    Solution(FinderInfo<CUBOIDS>),
     /// The core's split its finder in two; it's continuing to run one half, and
     /// the other half is given here.
-    Split(FinderInfo<NUM_CUBOIDS>),
+    Split(FinderInfo<CUBOIDS>),
     /// The core's paused itself; it had the contained state when it did so.
-    Pause(FinderInfo<NUM_CUBOIDS>),
+    Pause(FinderInfo<CUBOIDS>),
     /// The core's finished running anything it was running and is now waiting
     /// to receive a new finder.
     Receiving,

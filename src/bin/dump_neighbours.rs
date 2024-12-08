@@ -12,7 +12,7 @@ use Direction::*;
 fn main() {
     let ctx = FinderCtx::new([Cuboid::new(1, 1, 5), Cuboid::new(1, 2, 3)], Duration::ZERO).unwrap();
 
-    let neighbour_lookup_contents = fpga::neighbour_lookups(&ctx);
+    let neighbour_lookup_contents = fpga::neighbour_lookups(&ctx, 64, 2);
 
     let cursor_choices = ctx
         .square_caches

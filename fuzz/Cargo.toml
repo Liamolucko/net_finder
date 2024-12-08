@@ -10,8 +10,11 @@ cargo-fuzz = true
 
 [dependencies]
 anyhow = "1.0.78"
+async-executor = "1.13.1"
+futures-concurrency = "7.6.2"
 libfuzzer-sys = "0.4"
 net-finder-fpga-sim = { path = "../crates/fpga-sim" }
+pollster = "0.4.0"
 pretty_assertions = "1.4.0"
 
 [dependencies.net-finder]

@@ -259,7 +259,7 @@ class MainPipeline(wiring.Component):
         with m.Switch(Cat(nl_entry.children, nl_child_index)):
             for value in range(64):
                 children = value & 0b001111
-                child_index = value & 0b110000
+                child_index = value >> 4
                 direction = child_index_to_direction(children, child_index)
 
                 if direction is not None:

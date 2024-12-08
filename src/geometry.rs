@@ -1464,7 +1464,7 @@ impl SquareCache {
             .len()
             .try_into()
             .ok()
-            .filter(|&squares| squares < 64)
+            .filter(|&squares| squares <= 64)
             .expect("`SquareCache` contained more than 64 squares");
         (0..num_squares).map(Square)
     }

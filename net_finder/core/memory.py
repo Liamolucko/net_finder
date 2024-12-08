@@ -122,8 +122,10 @@ class ChunkedMemory(wiring.Component):
 
             # Give the chunk a port corresponding to each of our outer ports, and hook up
             # their inputs.
-            for port_index, ((read_port, _), write_port) in enumerate(self._sdp_ports):
-                inner_read_port = chunk.read_port()
+            for port_index, ((read_port, read_domain), write_port) in enumerate(
+                self._sdp_ports
+            ):
+                inner_read_port = chunk.read_port(domain=read_domain)
                 inner_write_port = chunk.write_port()
 
                 m.d.comb += inner_write_port.en.eq(
@@ -215,9 +217,10 @@ class ConfigMemory(wiring.Component):
 
         super().__init__(
             {
-                # TODO: I think this should be `Out`.
-                "write_port": In(
-                    WritePort.Signature(addr_width=ceil_log2(depth), shape=shape)
+                "write_port": Out(
+                    WritePort.Signature(
+                        addr_width=ceil_log2(data.depth), shape=data.shape
+                    )
                 )
             }
         )

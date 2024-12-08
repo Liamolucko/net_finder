@@ -6,7 +6,7 @@ use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter};
-use std::iter::zip;
+use std::iter::{self, zip};
 use std::num::{NonZeroU8, NonZeroUsize};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "no-trie")]
@@ -23,6 +23,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
+use crate::fpga::clog2;
 #[cfg(not(feature = "no-trie"))]
 use crate::SkipSet;
 use crate::{
@@ -65,7 +66,7 @@ pub struct FinderCtx<const CUBOIDS: usize> {
     /// same family of equivalence classes as `fixed_class`.
     maybe_skipped_lookup: [u64; 4],
     /// The equivalence classes of mappings that we build `Finder`s out of.
-    equivalence_classes: Vec<FxHashSet<ClassMapping<CUBOIDS>>>,
+    pub equivalence_classes: Vec<FxHashSet<ClassMapping<CUBOIDS>>>,
     /// For each equivalence class, the set of mappings in previous equivalence
     /// classes, which `Finder`s starting from that equivalence class should
     /// skip.
@@ -179,16 +180,21 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
         })
     }
 
+    pub fn start_mappings(&self) -> impl ExactSizeIterator<Item = ClassMapping<CUBOIDS>> + '_ {
+        self.equivalence_classes.iter().map(|class| {
+            *class
+                .iter()
+                .min_by_key(|&&mapping| self.to_inner(mapping).index())
+                .unwrap()
+        })
+    }
+
     /// Generates a list of `Finder`s to use for finding the common nets of this
     /// `FinderCtx`'s cuboids.
     pub fn gen_finders(&self) -> Vec<FinderInfo<CUBOIDS>> {
-        self.equivalence_classes
-            .iter()
-            .map(|class| FinderInfo {
-                start_mapping: *class
-                    .iter()
-                    .min_by_key(|&&mapping| self.to_inner(mapping).index())
-                    .unwrap(),
+        self.start_mappings()
+            .map(|start_mapping| FinderInfo {
+                start_mapping,
                 decisions: vec![true],
                 base_decision: NonZeroUsize::new(1).unwrap(),
             })
@@ -381,7 +387,8 @@ pub struct FinderInfo<const CUBOIDS: usize> {
     ///
     /// This can't be 0 because there'd be no reason to ever do that: if you
     /// don't run the first instruction that's it, there's nothing else to run
-    /// and so you certainly aren't going to get a solution.
+    /// and so you certainly aren't going to get a solution. This also
+    /// implicitly means that `decisions` has to have a length of at least 1.
     ///
     /// Enforcing that gets rid of some annoying edge cases on the FPGA.
     pub base_decision: NonZeroUsize,
@@ -416,7 +423,7 @@ impl<'a, const CUBOIDS: usize> Arbitrary<'a> for FinderInfo<CUBOIDS> {
 
 impl<const CUBOIDS: usize> FinderInfo<CUBOIDS> {
     /// Converts a `FinderInfo` to the encoded representation used by the FPGA.
-    pub fn to_bits(&self, ctx: &FinderCtx<CUBOIDS>) -> Vec<bool> {
+    pub fn to_bits(&self, ctx: &FinderCtx<CUBOIDS>, max_area: usize, cuboids: usize) -> Vec<bool> {
         /// Returns an iterator over the lower `bits` bits of `int`, from MSB to
         /// LSB.
         fn bits(int: impl Into<usize>, bits: u32) -> impl Iterator<Item = bool> {
@@ -424,33 +431,48 @@ impl<const CUBOIDS: usize> FinderInfo<CUBOIDS> {
             (0..bits).rev().map(move |bit| int & (1 << bit) != 0)
         }
 
+        let start_mapping = ctx.to_inner(self.start_mapping);
+
         // First figure out the bits we need to actually send to the core.
         let mut result = Vec::new();
 
-        let start_mapping = self.start_mapping.sample(&ctx.outer_square_caches);
-        // `mapping_t` on the FPGA is a packed array, which means higher indices come
-        // first and so we need to add these in reverse order.
-        for cursor in start_mapping.cursors.into_iter().rev() {
-            result.extend(bits(cursor.0, clog2(4 * ctx.target_area)));
-        }
+        result.extend(bits(
+            self.base_decision,
+            clog2(max_decisions_len(max_area) + 1),
+        ));
 
         // Mapping indexes on the FPGA don't work the same way as the ones on
         // the CPU: they don't include the class of the cursor on the fixed
         // cuboid.
-        for (cuboid, class) in self
-            .start_mapping
-            .classes
-            .into_iter()
-            .enumerate()
-            .filter(|&(cuboid, _)| cuboid != ctx.fixed_cuboid)
+        for class in start_mapping.classes[1..]
+            .iter()
+            .copied()
+            // Even though a particular instantation of the FPGA implementation only supports
+            // a fixed number of cuboids, we can still use it to find solutions for less
+            // cuboids than that: if we fill in the free spaces with copies of the fixed cuboid,
+            // those spaces will always end up with the same values as the actual fixed cuboid.
+            .chain(iter::repeat(start_mapping.classes[0]))
+            .take(cuboids - 1)
         {
-            result.extend(bits(
-                class.index(),
-                clog2(ctx.outer_square_caches[cuboid].classes().len()),
-            ));
+            result.extend(bits(class.index(), clog2(max_area)));
         }
 
-        result.extend(bits(self.base_decision, clog2(4 * ctx.target_area)));
+        let start_mapping = start_mapping.sample(&ctx.square_caches);
+        // The FPGA expects these to go from LSB to MSB, but we're going from the MSB
+        // downwards, so we need to reverse them.
+        for cursor in start_mapping
+            .cursors
+            .into_iter()
+            .chain(iter::repeat(start_mapping.cursors[0]))
+            .take(cuboids)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            result.extend(bits(cursor.0, clog2(4 * max_area)));
+        }
+
+        result.extend(bits(ctx.target_area, clog2(max_area + 1)));
 
         result.extend(&self.decisions);
 
@@ -458,7 +480,12 @@ impl<const CUBOIDS: usize> FinderInfo<CUBOIDS> {
     }
 
     /// Creates a `FinderInfo` from the encoded representation used by the FPGA.
-    pub fn from_bits(ctx: &FinderCtx<CUBOIDS>, bits: impl IntoIterator<Item = bool>) -> Self {
+    pub fn from_bits(
+        ctx: &FinderCtx<CUBOIDS>,
+        max_area: usize,
+        cuboids: usize,
+        bits: impl IntoIterator<Item = bool>,
+    ) -> Self {
         let mut bits = bits.into_iter();
 
         /// Consumes the first `bits` bits from `iter` and returns them as an
@@ -480,37 +507,37 @@ impl<const CUBOIDS: usize> FinderInfo<CUBOIDS> {
             result.try_into().unwrap()
         }
 
+        let base_decision = take_bits(&mut bits, clog2(max_decisions_len(max_area)));
+
+        // Skip over `start_mapping_index`, we don't need it.
+        take_bits::<usize>(&mut bits, (cuboids - 1) as u32 * clog2(max_area));
+
+        for _ in CUBOIDS..cuboids {
+            take_bits::<usize>(&mut bits, clog2(4 * max_area));
+        }
         let mut start_mapping = Mapping {
-            cursors: array::from_fn(|_| Cursor(take_bits(&mut bits, clog2(4 * ctx.target_area)))),
+            cursors: array::from_fn(|_| Cursor(take_bits(&mut bits, clog2(4 * max_area)))),
         };
         // `mapping_t` goes from highest index to lowest, so we need to reverse it.
         start_mapping.cursors.reverse();
 
-        // Skip over `start_mapping_index`, we don't need it.
-        take_bits::<usize>(
-            &mut bits,
-            ctx.outer_square_caches
-                .iter()
-                .enumerate()
-                .filter(|&(cuboid, _)| cuboid != ctx.fixed_cuboid)
-                .map(|(_, cache)| clog2(cache.classes().len()))
-                .sum(),
-        );
+        let area = take_bits::<usize>(&mut bits, clog2(max_area + 1));
+        assert_eq!(area, ctx.target_area);
 
         FinderInfo {
-            start_mapping: start_mapping.to_classes(&ctx.outer_square_caches),
-            base_decision: take_bits(&mut bits, clog2(4 * ctx.target_area)),
+            start_mapping: ctx.to_outer(start_mapping.to_classes(&ctx.square_caches)),
+            base_decision,
             decisions: bits.collect(),
         }
     }
 }
 
-fn clog2(x: usize) -> u32 {
-    usize::BITS - (x - 1).leading_zeros()
+fn max_decisions_len(max_area: usize) -> usize {
+    1 + 4 * (max_area - 1)
 }
 
 /// An instruction to add a square.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 // Aligning this to 8 bytes lets the compiler pack it into a 32-bit integer.
 #[repr(align(8))]
 pub struct Instruction<const CUBOIDS: usize> {
@@ -827,6 +854,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
         // it to the queue in the first place if that was the case.
         if !zip(&self.surfaces, instruction.mapping.cursors())
             .any(|(surface, cursor)| surface.filled(cursor.square()))
+            && !self.skip(ctx, instruction.mapping)
         {
             let old_len = self.queue.len();
             // Add any follow-up instructions.
@@ -862,7 +890,7 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
 
             for i in 0..4 {
                 if valid[i] {
-                    self.add_followup(ctx, neighbours[i]);
+                    self.add_followup(neighbours[i]);
                 }
             }
 
@@ -911,11 +939,9 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
 
     /// Adds the given follow-up instruction to the queue, if it's valid.
     #[inline]
-    fn add_followup(&mut self, ctx: &FinderCtx<CUBOIDS>, instruction: Instruction<CUBOIDS>) {
-        if !self.skip(ctx, instruction.mapping)
-            && self.net[usize::from(instruction.net_pos.x % 64)]
-                & (1 << (instruction.net_pos.y % 64))
-                == 0
+    fn add_followup(&mut self, instruction: Instruction<CUBOIDS>) {
+        if self.net[usize::from(instruction.net_pos.x % 64)] & (1 << (instruction.net_pos.y % 64))
+            == 0
         {
             self.net[usize::from(instruction.net_pos.x % 64)] |= 1 << (instruction.net_pos.y % 64);
             self.queue.push(instruction);
@@ -1065,6 +1091,17 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
     }
 }
 
+impl<const CUBOIDS: usize> Debug for Instruction<CUBOIDS> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let pos = self.net_pos;
+        let mapping = self.mapping;
+        let followup = self
+            .followup_index
+            .map_or(String::new(), |index| format!(" fu {index}"));
+        write!(f, "{pos} -> {mapping}{followup}")
+    }
+}
+
 impl<const CUBOIDS: usize> Debug for Finder<CUBOIDS> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         struct QueueDebug<'a, const CUBOIDS: usize>(&'a Finder<CUBOIDS>);
@@ -1074,13 +1111,8 @@ impl<const CUBOIDS: usize> Debug for Finder<CUBOIDS> {
                 for (index, instruction) in self.0.queue.iter().enumerate() {
                     let base_char = if index == self.0.base_index { 'b' } else { ' ' };
                     let target_char = if index == self.0.index { '>' } else { ' ' };
-                    let pos = instruction.net_pos;
-                    let mapping = instruction.mapping;
-                    let followup = instruction
-                        .followup_index
-                        .map_or(String::new(), |index| format!(" fu {index}"));
                     d.entry(&format_args!(
-                        "{base_char}{target_char} {index}: {pos} -> {mapping}{followup}"
+                        "{base_char}{target_char} {index}: {instruction:?}"
                     ));
                 }
                 d.finish()

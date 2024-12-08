@@ -85,7 +85,7 @@ class SkipChecker(wiring.Component):
         prev_fixed_family = pipe(m, self.fixed_family)
 
         indices = [
-            Cat(Cat(port.data.lo[i], port.data.hi) for port in self.ports)
+            Cat(Cat(port.data.lo[i], port.data.hi) for port in self.ports[::-1])
             for i in range(2)
         ]
 

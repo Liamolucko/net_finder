@@ -34,6 +34,7 @@ pkgs.mkShell {
 
     openocd
     pkgs.yosys
+    pkgs.verilator
 
     # Needed by Verilator simulations
     pkgs.json_c
