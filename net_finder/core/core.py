@@ -82,13 +82,13 @@ class CoreInterface(wiring.Signature):
     def __init__(self, max_area: int):
         super().__init__(
             {
-                "input": In(stream.Signature(core_in_layout())),
-                "output": Out(stream.Signature(core_out_layout())),
+                "sink": In(stream.Signature(core_in_layout())),
+                "source": Out(stream.Signature(core_out_layout())),
                 "req_pause": In(1),
                 "req_split": In(1),
                 "wants_finder": Out(1),
                 "stepping": Out(1),
-                "active": Out(1),
+                "state": Out(State),
                 "base_decision": Out(range(max_decisions_len(max_area) + 1)),
             }
         )
@@ -99,6 +99,8 @@ class State(enum.Enum):
     Receive = 1
     Run = 2
     Check = 3
+    # TODO: seems like someone's solution is getting misinterpreted as a Split. Probably something to do with SafeDemux locking in the wrong thing?
+    # I think we fixed this but I forget how, I'm gonna leave this here until I spot it in the diff
     Solution = 4
     Pause = 5
     Split = 6
@@ -178,19 +180,21 @@ class Core(wiring.Component):
         out_fifos = []
 
         for i in range(FINDERS_PER_CORE):
+            # TODO: we don't actually need this, since valid is guaranteed to stay 1 once
+            # it's been asserted anyway and it's fine for ready to change willy-nilly.
             in_fifo = SyncFIFO(width=2, depth=1)
             m.submodules[f"in_fifo_{i}"] = in_fifo
 
-            wiring.connect(
-                m, wiring.flipped(self.interfaces[i].input), in_fifo.w_stream
-            )
+            wiring.connect(m, wiring.flipped(self.interfaces[i].sink), in_fifo.w_stream)
             in_fifos.append(in_fifo)
 
+            # TODO: maybe replace this with PipeValid/PipeReady? It wouldn't have any effect
+            # on throughput like it would for the input.
             out_fifo = SyncFIFO(width=4, depth=1)
             m.submodules[f"out_fifo_{i}"] = out_fifo
 
             wiring.connect(
-                m, out_fifo.r_stream, wiring.flipped(self.interfaces[i].output)
+                m, out_fifo.r_stream, wiring.flipped(self.interfaces[i].source)
             )
             out_fifos.append(out_fifo)
 
@@ -316,19 +320,6 @@ class Core(wiring.Component):
         )
 
         decision_sent = if_prev_sent & if_prev_prefix_done
-        # This needs to be able to go up to `max_decisions_len` so that we can use
-        # `decision_index == decisions_len` as a check for whether we're done
-        # transmitting.
-        if_decision_index = Signal(range(max_decisions_len(self._max_area) + 1))
-        with m.Switch(if_prev_state):
-            with m.Case(State.Solution, State.Pause):
-                m.d.comb += if_decision_index.eq(if_prev_decision_index + decision_sent)
-            with m.Case(State.Split):
-                m.d.comb += if_decision_index.eq(
-                    if_prev_decision_index + (decision_sent | if_prev_finder_done)
-                )
-            with m.Default():
-                m.d.comb += if_decision_index.eq(0)
 
         if_state = Signal(State)
         if_prefix = Signal.like(if_initial_prefix)
@@ -400,7 +391,10 @@ class Core(wiring.Component):
                 with m.Else():
                     m.d.comb += if_state.eq(State.Check)
             with m.Case(State.Solution):
-                with m.If(if_decision_index == if_decisions_len):
+                with m.If(
+                    (if_prev_finder_done | decision_sent)
+                    & (if_prev_decision_index == if_decisions_len - 1)
+                ):
                     run_transitions(allow_check=False)
                 with m.Else():
                     m.d.comb += if_state.eq(State.Solution)
@@ -414,7 +408,7 @@ class Core(wiring.Component):
                 # set it to, or hit the end of `decisions` if there aren't any.
                 with m.If(
                     (if_prev_finder_done & if_prev_read_decision)
-                    | (if_decision_index == if_decisions_len)
+                    | (decision_sent & (if_prev_decision_index == if_decisions_len - 1))
                 ):
                     run_transitions()
                 with m.Else():
@@ -428,6 +422,20 @@ class Core(wiring.Component):
             0,
             if_prev_clear_index + 1,
         )
+
+        if_decision_index = Signal(range(max_decisions_len(self._max_area)))
+        # Note: technically this is still incorrect, since it'd be possible to go
+        # directly from one split into another if `req_split` was already asserted when
+        # finishing the first one. That shouldn't happen in practice since our SoC won't
+        # ask anyone to split while there's already a split happening, but we might
+        # still want to fix it at some point.
+        with m.If(if_state != if_prev_state):
+            m.d.comb += if_decision_index.eq(0)
+        with m.Else():
+            m.d.comb += if_decision_index.eq(
+                if_prev_decision_index
+                + (decision_sent | ((if_state == State.Split) & if_prev_finder_done))
+            )
 
         m.d.comb += potential_read.chunk.eq(if_finder)
         m.d.comb += potential_read.addr.eq(if_potential_index)
@@ -514,7 +522,7 @@ class Core(wiring.Component):
             for i in range(self._cuboids)
         ]
         nl_prefix_done = nl_prefix_bits_left == 0
-        nl_target = pipe(m, if_target)
+        nl_target = Mux(local_reset, 0, pipe(m, if_target))
         nl_potential_index = pipe(m, if_potential_index)
         nl_clear_index = Mux(local_reset, 0, pipe(m, if_clear_index))
         nl_child_index = pipe(m, if_child_index)
@@ -766,7 +774,10 @@ class Core(wiring.Component):
                     (wb_state == State.Split)
                     & ~(
                         (wb_finder_done & wb_read_decision)
-                        | (wb_prefix_done & (wb_decision_index == wb_decisions_len - 1))
+                        | (
+                            (wb_finder_done | (wb_prefix_done & wb_sent))
+                            & (wb_decision_index == wb_decisions_len - 1)
+                        )
                     )
                 ),
                 wb_prefix_bits_left - shift_prefix,
@@ -784,8 +795,8 @@ class Core(wiring.Component):
         with m.Elif(
             (wb_state == State.Split)
             # Unlike the previous case, this can actually occur on the same cycle as
-            # wb_out.last is set, so wb_finder_done wouldn't work here.
-            & wb_prefix_done
+            # wb_out.last is set, so just wb_finder_done wouldn't work here.
+            & (wb_finder_done | (wb_prefix_done & wb_sent))
             & (wb_decision_index == wb_decisions_len - 1)
         ):
             m.d.comb += wb_next_prefix.base_decision.eq(wb_decisions_len)
@@ -863,9 +874,7 @@ class Core(wiring.Component):
             m.d.comb += self.interfaces[i].wants_finder.eq(
                 (state == State.Receive) & (prefix_bits_left == prefix.shape().size)
             )
-            m.d.comb += self.interfaces[i].active.eq(
-                (state != State.Clear) & (state != State.Receive)
-            )
+            m.d.comb += self.interfaces[i].state.eq(state)
             m.d.comb += self.interfaces[i].base_decision.eq(prefix.base_decision)
 
         m.d.comb += self.state.eq(wb_state)

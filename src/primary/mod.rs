@@ -23,7 +23,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
-use crate::fpga::clog2;
+use crate::fpga::{clog2, max_decisions_len};
 #[cfg(not(feature = "no-trie"))]
 use crate::SkipSet;
 use crate::{
@@ -530,14 +530,6 @@ impl<const CUBOIDS: usize> FinderInfo<CUBOIDS> {
             decisions: bits.collect(),
         }
     }
-}
-
-fn max_run_stack_len(max_area: usize) -> usize {
-    max_area - 1
-}
-
-fn max_decisions_len(max_area: usize) -> usize {
-    1 + 4 + 3 * (max_run_stack_len(max_area) - 1)
 }
 
 /// An instruction to add a square.
@@ -1538,7 +1530,6 @@ pub fn read_state<const CUBOIDS: usize>(
 /// deduplicated externally.
 pub trait Runtime<const CUBOIDS: usize>: Send + 'static {
     /// Gets the cuboids the `Runtime` is finding common nets of.
-
     // I considered making this return a `FinderCtx` instead, but that wouldn't
     // work because `drive` needs to set its `prior_search_time`.
     fn cuboids(&self) -> [Cuboid; CUBOIDS];

@@ -1,6 +1,3 @@
-import os
-import subprocess
-
 from liteeth.mac import LiteEthMAC
 from liteeth.phy.gmii import LiteEthPHYGMII
 from liteeth.phy.model import LiteEthPHYModel
@@ -16,7 +13,7 @@ from litex.soc.integration.soc_core import *
 from litex.tools.litex_sim import generate_gtkw_savefile
 from migen.genlib.resetsync import AsyncResetSynchronizer
 
-from .core import CoreManager, Cuboid
+from .core import CoreManager
 
 # IOs ----------------------------------------------------------------------------------------------
 
@@ -125,7 +122,8 @@ class CRG(Module):
 class BaseSoC(SoCCore):
     def __init__(
         self,
-        cuboids: list[Cuboid],
+        cuboids: int,
+        max_area: int,
         cores: int,
         sys_clk_freq=int(1e6),
         with_ethernet=False,
@@ -208,11 +206,9 @@ class BaseSoC(SoCCore):
         else:
             self.comb += platform.trace.eq(1)
 
-        for cuboid in cuboids:
-            assert cuboid.surface_area() == cuboids[0].surface_area()
-        # I would use commas here but that breaks CSV export.
-        self.add_config("CUBOIDS", ";".join(map(str, cuboids)))
-        self.core_mgr = CoreManager(cuboids, cores, with_analyzer=with_analyzer)
+        self.core_mgr = CoreManager(
+            platform, cuboids, max_area, cores, with_analyzer=with_analyzer
+        )
 
 
 # Build --------------------------------------------------------------------------------------------
@@ -262,7 +258,16 @@ def main():
     )
 
     parser.add_target_argument(
-        "--cuboids", nargs="+", help="The cuboids to find nets of."
+        "--cuboids",
+        default=3,
+        type=int,
+        help="The number of cuboids to find common nets of.",
+    )
+    parser.add_target_argument(
+        "--max-area",
+        default=64,
+        type=int,
+        help="The maximum area of cuboids to find common nets of.",
     )
     parser.add_target_argument(
         "--cores",
@@ -284,8 +289,6 @@ def main():
     )
 
     args = parser.parse_args()
-
-    cuboids = [Cuboid(s) for s in args.cuboids]
 
     soc_kwargs = soc_core_argdict(args)
 
@@ -328,34 +331,10 @@ def main():
         sim_debug=args.sim_debug,
         trace_reset_on=int(float(args.trace_start)) > 0
         or int(float(args.trace_end)) > 0,
-        cuboids=cuboids,
+        cuboids=args.cuboids,
+        max_area=args.max_area,
         cores=args.cores,
         **soc_kwargs,
-    )
-
-    sources_dir = os.path.join(
-        os.path.dirname(__file__),
-        "net-finder.srcs/sources_1/new",
-    )
-    subprocess.run(
-        [
-            "cargo",
-            "run",
-            "--bin",
-            "fpga_gen",
-            sources_dir,
-            *args.cuboids,
-        ]
-    )
-    soc.platform.add_sources(
-        sources_dir,
-        "generated.svh",
-        "types.svh",
-        "generated.sv",
-        "instruction_neighbour.sv",
-        "valid_checker.sv",
-        "core.sv",
-        copy=True,
     )
 
     if args.with_ethernet:

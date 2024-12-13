@@ -365,11 +365,11 @@ class MainPipeline(wiring.Component):
         for i in range(4):
             with m.If(wb_task == Task.Clear):
                 coord_bits = ceil_log2(net_size(self._max_area))
-                m.d.comb += net.write_port.neighbours[i].x.eq(
+                m.d.comb += net.write_port.neighbours[i].y.eq(
                     wb_clear_index[:coord_bits]
                 )
-                m.d.comb += net.write_port.neighbours[i].y.eq(
-                    wb_clear_index[coord_bits:]
+                m.d.comb += (
+                    net.write_port.neighbours[i].x[2:].eq(wb_clear_index[coord_bits:])
                 )
             with m.Else():
                 m.d.comb += net.write_port.neighbours[i].eq(wb_neighbours[i].pos)

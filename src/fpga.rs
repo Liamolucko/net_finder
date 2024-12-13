@@ -9,6 +9,14 @@ pub fn clog2(x: usize) -> u32 {
     usize::BITS - (x - 1).leading_zeros()
 }
 
+pub fn max_run_stack_len(max_area: usize) -> usize {
+    max_area - 1
+}
+
+pub fn max_decisions_len(max_area: usize) -> usize {
+    1 + 4 + 3 * (max_run_stack_len(max_area) - 1)
+}
+
 /// Returns the contents of all the cuboids' neighbour lookups.
 pub fn neighbour_lookups<const CUBOIDS: usize>(
     ctx: &FinderCtx<CUBOIDS>,

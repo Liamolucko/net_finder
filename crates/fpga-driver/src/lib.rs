@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use indicatif::ProgressBar;
 use litex_bridge::{csr_struct, CsrGroup, CsrRo, CsrRw, DynCsrRo, DynCsrRw, SocInfo};
+use net_finder::fpga::{self, clog2, max_decisions_len};
 use net_finder::{Cuboid, Finder, FinderInfo, Runtime};
 use wishbone_bridge::Bridge;
 
@@ -15,6 +16,12 @@ csr_struct! {
         output: DynCsrRo<'a>,
         output_consume: CsrRw<'a>,
         flow: CsrRo<'a>,
+        neighbour_lookups_addr: CsrRw<'a>,
+        neighbour_lookups_data: CsrRw<'a, 2>,
+        neighbour_lookups_sel: CsrRw<'a>,
+        undo_lookups_addr: CsrRw<'a>,
+        undo_lookups_data: CsrRw<'a>,
+        undo_lookups_sel: CsrRw<'a>,
         active: CsrRo<'a>,
         req_pause: CsrRw<'a>,
         split_finders: CsrRo<'a>,
@@ -22,15 +29,15 @@ csr_struct! {
         clear_count: CsrRo<'a, 2>,
         receive_count: CsrRo<'a, 2>,
         run_count: CsrRo<'a, 2>,
-        backtrack_count: CsrRo<'a, 2>,
-        check_wait_count: CsrRo<'a, 2>,
         check_count: CsrRo<'a, 2>,
         solution_count: CsrRo<'a, 2>,
-        stall_count: CsrRo<'a, 2>,
         split_count: CsrRo<'a, 2>,
         pause_count: CsrRo<'a, 2>,
     }
 }
+
+const MAX_CUBOIDS: usize = 3;
+const MAX_AREA: usize = 64;
 
 /// A `Runtime` which runs finders on an FPGA running a custom SoC.
 pub struct FpgaRuntime<const CUBOIDS: usize> {
@@ -43,8 +50,7 @@ pub struct FpgaRuntime<const CUBOIDS: usize> {
     ///
     /// This is the case when communicating to it via. PCIe.
     pub csr_only: bool,
-    /// The cuboids the SoC is hard-coded to find nets for (parsed from
-    /// `soc_info` so that `Self::cuboids()` is infallible).
+    /// The cuboids we're solving for.
     pub cuboids: [Cuboid; CUBOIDS],
 }
 
@@ -69,18 +75,38 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
         let reg_addrs = CoreManagerRegisters::addrs(&self.soc_info, self.csr_only, "core_mgr")?;
         let regs = CoreManagerRegisters::backed_by(&self.bridge, reg_addrs);
 
-        let square_bits = clog2(ctx.target_area);
-        let cursor_bits = square_bits + 2;
-        let mapping_bits = u32::try_from(self.cuboids.len())? * cursor_bits;
-        let mapping_index_bits: u32 = ctx
-            .outer_square_caches
-            .iter()
-            .map(|cache| clog2(cache.classes().len()))
-            .sum();
-        let decision_index_bits = clog2(4 * ctx.target_area);
+        for (i, contents) in fpga::neighbour_lookups(ctx, MAX_AREA, MAX_CUBOIDS)
+            .into_iter()
+            .enumerate()
+        {
+            for (j, entry) in contents.into_iter().enumerate() {
+                regs.neighbour_lookups_addr()
+                    .write([j.try_into().unwrap()])?;
+                regs.neighbour_lookups_data()
+                    .write([(entry >> 32) as u32, entry as u32])?;
+                regs.neighbour_lookups_sel()
+                    .write([i.try_into().unwrap()])?;
+            }
+        }
 
-        let prefix_bits = mapping_bits + mapping_index_bits + decision_index_bits;
-        let finder_bits = prefix_bits + 4 * u32::try_from(ctx.target_area)?;
+        for (i, contents) in fpga::undo_lookups(ctx, MAX_CUBOIDS).into_iter().enumerate() {
+            for (j, entry) in contents.into_iter().enumerate() {
+                regs.undo_lookups_addr().write([j.try_into().unwrap()])?;
+                regs.undo_lookups_data().write([entry.into()])?;
+                regs.undo_lookups_sel().write([i.try_into().unwrap()])?;
+            }
+        }
+
+        let area_bits = clog2(MAX_AREA + 1);
+        let square_bits = clog2(MAX_AREA);
+        let cursor_bits = square_bits + 2;
+        let mapping_bits = u32::try_from(MAX_CUBOIDS)? * cursor_bits;
+        let class_bits = clog2(MAX_AREA);
+        let mapping_index_bits = u32::try_from(MAX_CUBOIDS - 1)? * class_bits;
+        let decision_index_bits = clog2(max_decisions_len(MAX_AREA));
+
+        let prefix_bits = area_bits + mapping_bits + mapping_index_bits + decision_index_bits;
+        let finder_bits = prefix_bits + u32::try_from(max_decisions_len(MAX_AREA))?;
         let finder_len_bits = clog2(usize::try_from(finder_bits)? + 1);
 
         let num_input_finders = u64::try_from(input_finders.len())?;
@@ -100,7 +126,7 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
                 if let Some((finder, rest)) = input_finders.split_first() {
                     input_finders = rest;
 
-                    let mut bits = finder.to_bits(ctx);
+                    let mut bits = finder.to_bits(ctx, MAX_AREA, MAX_CUBOIDS);
                     let len = bits.len();
                     bits.resize(finder_bits.try_into()?, false);
                     // `Finder::to_bits` outputs the bits in big-endian order, but from here on
@@ -151,7 +177,7 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
                 // them.
                 bits.reverse();
                 bits.truncate(len);
-                let info = FinderInfo::from_bits(ctx, bits);
+                let info = FinderInfo::from_bits(ctx, MAX_AREA, MAX_CUBOIDS, bits);
 
                 if is_pause {
                     paused_finders.push(info);
@@ -189,10 +215,6 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
         // be empty like it should be.
         Ok(paused_finders)
     }
-}
-
-fn clog2(x: usize) -> u32 {
-    usize::BITS - (x - 1).leading_zeros()
 }
 
 // Note: these are different from the versions used to implement

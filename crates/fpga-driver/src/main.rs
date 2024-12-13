@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::bail;
 use clap::Parser;
-use litex_bridge::{CsrGroup, SocConstant, SocInfo};
+use litex_bridge::{CsrGroup, SocInfo};
 use net_finder::Cuboid;
 use net_finder_fpga_driver::{CoreManagerRegisters, FpgaRuntime};
 use wishbone_bridge::{EthernetBridge, EthernetBridgeProtocol, PCIeBridge};
@@ -15,6 +15,7 @@ struct Args {
     resume: bool,
     /// The path of the `soc_info.json` file for the SoC we're driving.
     soc_info: PathBuf,
+    cuboids: Vec<Cuboid>,
     /// If the SoC is connected via. PCIe, the path to its folder in
     /// `/sys/bus/pci/devices`.
     #[arg(long, group = "bridge")]
@@ -33,15 +34,6 @@ fn main() -> anyhow::Result<()> {
 
     let soc_info_json = fs::read_to_string(args.soc_info)?;
     let soc_info: SocInfo = serde_json::from_str(&soc_info_json)?;
-
-    let Some(Some(SocConstant::String(cuboids))) = soc_info.constants.get("config_cuboids") else {
-        bail!("unable to read cuboids")
-    };
-
-    let cuboids: Vec<Cuboid> = cuboids
-        .split(';')
-        .map(|s| s.parse::<Cuboid>())
-        .collect::<Result<_, _>>()?;
 
     let bridge = if let Some(ref device) = args.pcie_device {
         PCIeBridge::new(device.join("resource0"))?.create()?
@@ -62,7 +54,7 @@ fn main() -> anyhow::Result<()> {
 
     let csr_only = args.pcie_device.is_some();
 
-    match *cuboids.as_slice() {
+    match *args.cuboids.as_slice() {
         [] => bail!("must specify at least 1 cuboid"),
         [a] => net_finder::drive(
             FpgaRuntime {
@@ -104,38 +96,29 @@ fn main() -> anyhow::Result<()> {
     let clear_count = to_u64(regs.clear_count().read()?);
     let receive_count = to_u64(regs.receive_count().read()?);
     let run_count = to_u64(regs.run_count().read()?);
-    let backtrack_count = to_u64(regs.backtrack_count().read()?);
-    let check_wait_count = to_u64(regs.check_wait_count().read()?);
     let check_count = to_u64(regs.check_count().read()?);
     let solution_count = to_u64(regs.solution_count().read()?);
-    let stall_count = to_u64(regs.stall_count().read()?);
     let split_count = to_u64(regs.split_count().read()?);
     let pause_count = to_u64(regs.pause_count().read()?);
 
     let total_cycles = clear_count
         + receive_count
         + run_count
-        + backtrack_count
-        + check_wait_count
         + check_count
         + solution_count
-        + stall_count
         + split_count
         + pause_count;
 
     let percentage = |count: u64| 100.0 * count as f64 / total_cycles as f64;
 
     println!("Time spent in each state:");
-    println!("  CLEAR:      {:5.2}%", percentage(clear_count));
-    println!("  RECEIVE:    {:5.2}%", percentage(receive_count));
-    println!("  RUN:        {:5.2}%", percentage(run_count));
-    println!("  BACKTRACK:  {:5.2}%", percentage(backtrack_count));
-    println!("  CHECK_WAIT: {:5.2}%", percentage(check_wait_count));
-    println!("  CHECK:      {:5.2}%", percentage(check_count));
-    println!("  SOLUTION:   {:5.2}%", percentage(solution_count));
-    println!("  STALL:      {:5.2}%", percentage(stall_count));
-    println!("  SPLIT:      {:5.2}%", percentage(split_count));
-    println!("  PAUSE:      {:5.2}%", percentage(pause_count));
+    println!("  Clear:    {:5.2}%", percentage(clear_count));
+    println!("  Receive:  {:5.2}%", percentage(receive_count));
+    println!("  Run:      {:5.2}%", percentage(run_count));
+    println!("  Check:    {:5.2}%", percentage(check_count));
+    println!("  Solution: {:5.2}%", percentage(solution_count));
+    println!("  Split:    {:5.2}%", percentage(split_count));
+    println!("  Pause:    {:5.2}%", percentage(pause_count));
 
     Ok(())
 }

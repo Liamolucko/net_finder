@@ -1,5 +1,4 @@
 import os
-import subprocess
 
 from litepcie.phy.s7pciephy import S7PCIEPHY
 from litepcie.software import generate_litepcie_software
@@ -12,7 +11,7 @@ from litex.soc.integration.soc_core import *
 from litex_boards.platforms import sqrl_acorn
 from litex_boards.targets.sqrl_acorn import CRG
 
-from .core import CoreManager, Cuboid
+from .core import CoreManager
 
 
 class Platform(sqrl_acorn.Platform):
@@ -62,7 +61,8 @@ class CRG(LiteXModule):
 class SoC(SoCCore):
     def __init__(
         self,
-        cuboids: list[Cuboid],
+        cuboids: int,
+        max_area: int,
         cores: int,
         variant="cle-215",
         sys_clk_freq=66.67e6,
@@ -70,9 +70,6 @@ class SoC(SoCCore):
         with_analyzer: bool = False,
         **kwargs,
     ):
-        for cuboid in cuboids:
-            assert cuboid.surface_area() == cuboids[0].surface_area()
-
         platform = Platform(variant=variant)
 
         # CRG --------------------------------------------------------------------------------------
@@ -83,7 +80,7 @@ class SoC(SoCCore):
             self,
             platform,
             sys_clk_freq,
-            ident=f"net-finder LiteX SoC on Acorn CLE-101/215(+) (solving {', '.join(map(str, cuboids))})",
+            ident="net-finder LiteX SoC on Acorn CLE-101/215(+)",
             **kwargs,
         )
 
@@ -116,9 +113,9 @@ class SoC(SoCCore):
         self.flash_cs_n = GPIOOut(platform.request("flash_cs_n"))
         self.flash = S7SPIFlash(platform.request("flash"), sys_clk_freq, 25e6)
 
-        # I would use commas here but that breaks CSV export.
-        self.add_config("CUBOIDS", ";".join(map(str, cuboids)))
-        self.core_mgr = CoreManager(cuboids, cores, with_analyzer=with_analyzer)
+        self.core_mgr = CoreManager(
+            platform, cuboids, max_area, cores, with_analyzer=with_analyzer
+        )
 
 
 # Build --------------------------------------------------------------------------------------------
@@ -148,7 +145,16 @@ def main():
         "--driver", action="store_true", help="Generate PCIe driver."
     )
     parser.add_target_argument(
-        "--cuboids", nargs="+", help="The cuboids to find nets of."
+        "--cuboids",
+        default=3,
+        type=int,
+        help="The number of cuboids to find common nets of.",
+    )
+    parser.add_target_argument(
+        "--max-area",
+        default=64,
+        type=int,
+        help="The maximum area of cuboids to find common nets of.",
     )
     parser.add_target_argument(
         "--cores", default=75, type=int, help="The number of cores to include."
@@ -174,13 +180,12 @@ def main():
 
     args = parser.parse_args()
 
-    cuboids = [Cuboid(s) for s in args.cuboids]
-
     soc = SoC(
         variant=args.variant,
         sys_clk_freq=args.sys_clk_freq,
         core_clk_freq=args.core_clk_freq,
-        cuboids=cuboids,
+        cuboids=args.cuboids,
+        max_area=args.max_area,
         cores=args.cores,
         with_analyzer=args.with_analyzer,
         **parser.soc_argdict,
@@ -188,30 +193,6 @@ def main():
 
     builder = Builder(soc, **parser.builder_argdict)
     if args.build:
-        sources_dir = os.path.join(
-            os.path.dirname(__file__),
-            "net-finder.srcs/sources_1/new",
-        )
-        subprocess.run(
-            [
-                "cargo",
-                "run",
-                "--bin",
-                "fpga_gen",
-                sources_dir,
-                *args.cuboids,
-            ]
-        )
-        soc.platform.add_sources(
-            sources_dir,
-            "generated.svh",
-            "types.svh",
-            "generated.sv",
-            "instruction_neighbour.sv",
-            "valid_checker.sv",
-            "core.sv",
-            copy=True,
-        )
         builder.build(**parser.toolchain_argdict)
     else:
         # This allows generating the LitePCIe driver without performing a build.
