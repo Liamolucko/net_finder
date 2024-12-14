@@ -23,7 +23,7 @@ jobs:
       - run: sudo apt install verilator libevent-dev libjson-c-dev
       - run: pip install -r requirements.txt
       - run: |
-          python3 -m net_finder.soc.sim --cuboids 1x1x5 1x2x3 --non-interactive &
+          python3 -m net_finder.soc.sim --non-interactive &
           while ! nc -z localhost 1111; do
             sleep 1
           done
@@ -33,7 +33,7 @@ jobs:
             sleep 1
           done
 
-          cargo run --release -p net-finder-fpga-driver -- --addr 127.0.0.1:1234 --tcp sim_soc_info.json
+          cargo run --release -p net-finder-fpga-driver -- --addr 127.0.0.1:1234 --tcp sim_soc_info.json 1x1x5 1x2x3
 
           kill %2
           kill %1
