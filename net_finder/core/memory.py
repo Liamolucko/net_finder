@@ -116,7 +116,12 @@ class ChunkedMemory(wiring.Component):
         inner_sdp_read_ports = [[] for _ in self._sdp_ports]
         inner_read_ports = [[] for _ in self._read_ports]
         for chunk_index in range(self._chunks):
-            chunk = Memory(shape=self._shape, depth=self._depth, init=[])
+            chunk = Memory(
+                shape=self._shape,
+                depth=self._depth,
+                init=[],
+                attrs={"ram_style": "distributed"},
+            )
             # Register the chunk as a submodule.
             m.submodules[f"chunk{chunk_index}"] = chunk
 

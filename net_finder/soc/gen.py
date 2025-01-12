@@ -194,9 +194,6 @@ def main():
     builder = Builder(soc, **parser.builder_argdict)
     if args.build:
         builder.build(**parser.toolchain_argdict)
-    else:
-        # This allows generating the LitePCIe driver without performing a build.
-        soc.finalize()
 
     if args.driver:
         generate_litepcie_software(soc, os.path.join(builder.output_dir, "driver"))

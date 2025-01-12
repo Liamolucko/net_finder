@@ -137,11 +137,6 @@ class CoreGroup(LiteXModule):
         )
 
     def do_finalize(self):
-        if self.platform.output_dir is None:
-            print(
-                "We seem to be finalizing without building; skipping core_group.v generation"
-            )
-            return
         verilog_path = path.join(self.platform.output_dir, "gateware", "core_group.v")
         with open(verilog_path, "w") as f:
             f.write(

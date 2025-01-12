@@ -87,8 +87,11 @@ class Merge(wiring.Component):
         m.d.comb += self.source.payload.eq(Array(self.sinks)[sel].payload)
 
         packet_end = self.source.valid & self.source.ready & self.source.p.last
-        candidates = Cat(
-            sink.valid & ~(active & (sel == i)) for i, sink in enumerate(self.sinks)
+        candidates = Signal(len(self.sinks))
+        m.d.comb += candidates.eq(
+            Cat(
+                sink.valid & ~(active & (sel == i)) for i, sink in enumerate(self.sinks)
+            )
         )
 
         m.d.sync += active.eq((active & ~packet_end) | candidates.any())

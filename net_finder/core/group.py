@@ -74,6 +74,12 @@ class CoreGroup(wiring.Component):
 
         neighbour_lookups = []
         for i, port in enumerate(self.neighbour_lookups):
+            # TODO: this should be a regular Memory: using ConfigMemory requires using the
+            # BRAMs in TDP mode, but since the neighbour lookups are 36 bits wide that
+            # requires jumping up to a 36Kib BRAM. This doesn't actually change the resource
+            # usage at all, since it halves the number of replicas we need at the same time
+            # as making those replicas bigger, but if a plain memory has the same resource
+            # usage then we should obviously use that rather than this hacky approach.
             neighbour_lookup = ConfigMemory(
                 data=neighbour_lookup_layout(self._max_area)
             )
@@ -182,14 +188,15 @@ class CoreGroup(wiring.Component):
         )
 
         # Whether or not each core is currently running something.
-        cores_active = Cat(
-            (core.state != State.Clear) & (core.state != State.Receive)
-            for core in cores
+        cores_active = Signal(len(cores))
+        m.d.sync += cores_active.eq(
+            Cat((core.state != State.Clear) & ~core.wants_finder for core in cores)
         )
         # Whether or not each core was running something during the previous clock cycle.
         prev_cores_active = Signal.like(cores_active)
 
         m.d.sync += prev_cores_active.eq(cores_active)
+
         m.d.comb += self.active.eq(self.sink.valid | cores_active.any())
 
         # The `base_decision` that a core has to have in order to be split.
@@ -199,10 +206,13 @@ class CoreGroup(wiring.Component):
         splittable_base = Signal.like(cores[0].base_decision)
         # Whether or not each core is splittable (is active and has a `base_decision` of
         # `splittable_base`).
-        splittable = Cat(
-            # TODO: base_decision is garbage while sending, so this decision-making might be a bit off.
-            cores_active[i] & (core.base_decision == splittable_base)
-            for i, core in enumerate(cores)
+        splittable = Signal(len(cores))
+        m.d.sync += splittable.eq(
+            Cat(
+                # TODO: base_decision is garbage while sending, so this decision-making might be a bit off.
+                cores_active[i] & (core.base_decision == splittable_base)
+                for i, core in enumerate(cores)
+            )
         )
         with m.If(
             Cat(
@@ -231,7 +241,8 @@ class CoreGroup(wiring.Component):
                     m.d.sync += splittee.eq(i)
 
         # We only want to split next clock cycle if:
-        split_wanted = (
+        split_wanted = Signal()
+        m.d.comb += split_wanted.eq(
             # - There's actually a splittable core.
             splittable.any()
             # - There aren't already more finders coming in from outside.
