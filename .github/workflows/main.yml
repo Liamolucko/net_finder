@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt install verilator libevent-dev libjson-c-dev
-      - run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt amaranth-yosys
       - run: |
           python3 -m net_finder.soc.sim --non-interactive &
           while ! nc -z localhost 1111; do
