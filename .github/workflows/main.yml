@@ -38,3 +38,4 @@ jobs:
           kill %2
           kill %1
       - run: test "$(cat state/1x1x5,1x2x3.json | jq '.solutions | length')" = 2263
+# TODO: add GPU testing

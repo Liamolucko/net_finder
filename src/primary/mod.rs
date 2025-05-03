@@ -656,6 +656,10 @@ impl<const CUBOIDS: usize> Finder<CUBOIDS> {
                 // backtrack.
                 if !info.decisions[decision_index] {
                     // Reset this to make sure we can backtrack.
+                    // TODO: does this do anything? area 22 at least still works fine without it.
+                    //
+                    // I think it might be here because it does do stuff in `into_info` and we
+                    // copied it from there?
                     this.base_index = 0;
                     assert!(this.backtrack());
                 }

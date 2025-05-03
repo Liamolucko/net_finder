@@ -105,7 +105,7 @@ fn neighbour_lookup(
     t_mode.chain(normal_mode).collect()
 }
 
-/// Returns the contents of all the cuboids' neighbour lookups.
+/// Returns the contents of all the cuboids' undo lookups.
 pub fn undo_lookups<const CUBOIDS: usize>(
     ctx: &FinderCtx<CUBOIDS>,
     cuboids: usize,

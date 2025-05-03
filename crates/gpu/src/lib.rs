@@ -1,24 +1,25 @@
-use std::num::{NonZeroU64, NonZeroU8};
+use std::iter;
+use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::{array, iter, mem};
 
 use anyhow::{bail, Context};
 use indicatif::ProgressBar;
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
-    Backends, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding, BufferBindingType,
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, ComputePassDescriptor,
-    ComputePipeline, ComputePipelineDescriptor, Device, DeviceDescriptor, Dx12Compiler, Features,
-    Instance, InstanceDescriptor, Limits, Maintain, MapMode, PipelineLayoutDescriptor, Queue,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages,
+    ComputePipeline, ComputePipelineDescriptor, Device, DeviceDescriptor, Instance, Limits,
+    Maintain, MapMode, PipelineLayoutDescriptor, Queue, ShaderModuleDescriptor, ShaderSource,
+    ShaderStages,
 };
 
 use net_finder::{
-    Cuboid, Cursor, Finder, FinderCtx, FinderInfo, Instruction, Mapping, Pos, Runtime, Solution,
-    Surface,
+    Class, Cuboid, Cursor, Direction, Finder, FinderCtx, FinderInfo, Mapping, Runtime, Solution,
+    SquareCache,
 };
+use Direction::*;
 
 /// The number of `Finder`s we always give to the GPU.
 const NUM_FINDERS: u32 = 13440;
@@ -82,107 +83,25 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for GpuRuntime<CUBOIDS> {
 }
 
 /// Various useful constants that are often needed when talking to the GPU.
-///
-/// The first batch of them are the constants that we actually prepend to the
-/// GPU shader; then there's the sizes in bytes of various things.
 #[derive(Debug, Clone, Copy)]
-// even if some fields are unused, I still want to keep them around since they're needed to
-// calculate the rest.
-#[allow(unused)]
 struct Constants {
-    // The three fundamental numbers from which everything else is computed.
-    /// The number of cuboids we're finding common nets for.
-    num_cuboids: u32,
-    /// The shared area of those cuboids.
-    area: u32,
-
-    /// The number of squares on the surfaces of the cuboids (`area`).
-    num_squares: u32,
-    /// The number of cursors on the surfaces of the cuboids (`4 *
-    /// num_squares`).
-    num_cursors: u32,
-    /// The capacity of `Finder`'s queue (`4 * num_squares`).
-    ///
-    /// This is `4 * num_squares` because there can be at most 4 instructions
-    /// trying to set each square, one coming from each direction.
-    queue_capacity: u32,
-
-    /// The index of the start of the page where searching should start in the
-    /// trie (`num_cursors`).
-    ///
-    /// This is `num_cursors` because that's the length of each normal page in
-    /// the trie.
-    trie_start: u32,
-
-    /// The number of `u32`s needed to represent the squares filled on the
-    /// surface (`num_squares.div_ceil(32)`).
-    surface_words: u32,
-    /// How many bytes an `Instruction` takes up (`4 * (2 + num_cuboids)`).
-    instruction_size: u32,
-
-    /// How many bytes a `Queue` takes up (`queue_capacity * instruction_size +
-    /// 4`).
-    queue_size: u32,
-    /// How many bytes `Finder::potential` + `Finder::potential_len` takes up
-    /// (`4 * (queue_capacity + 1)`).
-    potential_size: u32,
-    /// How many bytes `Finder::surfaces` takes up (`4 * surface_words *
-    /// num_cuboids`).
-    surfaces_size: u32,
-    /// How many bytes of padding there are before `Finder::queued`.
-    queued_padding: u32,
-    /// How many bytes `Finder::queued` takes up (`4 * 4 * num_squares`).
-    queued_size: u32,
-
-    /// How many bytes a `Finder` takes up (`trie_size + queue_size +
-    /// potential_size + 8 + surfaces_size + queued_padding + queued_size`).
-    finder_size: u32,
-    /// The size of a `MaybeSolution` (`2 * queue_size`).
-    solution_size: u32,
+    /// The number of `u32`s needed to represent a list of decisions.
+    decision_words: u32,
+    /// How many bytes a `FinderInfo` takes up.
+    finder_info_size: u32,
 }
 
 impl Constants {
-    /// Computes a full set of `GpuConstants` from the fundamental three.
+    /// Computes a full set of `GpuConstants` from the fundamental two.
     fn compute(num_cuboids: u32, area: u32) -> Constants {
-        let num_squares = area;
-        let num_cursors = 4 * num_squares;
-        let queue_capacity = 4 * num_squares;
+        let queue_capacity = 4 * area;
 
-        let trie_start = num_cursors;
-
-        let surface_words = (num_squares + 31) / 32;
-
-        let instruction_size = 4 * (2 + num_cuboids);
-
-        let queue_size = queue_capacity * instruction_size + 4;
-        let potential_size = 4 * (queue_capacity + 1);
-        let surfaces_size = 4 * surface_words * num_cuboids;
-        let queued_size = 4 * 4 * num_squares;
-
-        let unpadded_finder_size = queue_size + potential_size + 8 + surfaces_size + queued_size;
-        let queued_padding = match unpadded_finder_size % 16 {
-            0 => 0,
-            x => 16 - x,
-        };
-        let finder_size = unpadded_finder_size + queued_padding;
-        let solution_size = 2 * queue_size;
+        let decision_words = queue_capacity.div_ceil(32);
+        let finder_info_size = 4 * num_cuboids + 4 * decision_words + 8;
 
         Constants {
-            num_cuboids,
-            area,
-            num_squares,
-            num_cursors,
-            queue_capacity,
-            trie_start,
-            surface_words,
-            instruction_size,
-            queue_size,
-            potential_size,
-            surfaces_size,
-            queued_padding,
-            queued_size,
-            finder_size,
-            solution_size,
+            decision_words,
+            finder_info_size,
         }
     }
 }
@@ -224,23 +143,19 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             bail!("must specify at least one `Finder`");
         }
 
-        let instance = Instance::new(InstanceDescriptor {
-            backends: Backends::PRIMARY,
-            dx12_shader_compiler: Dx12Compiler::Fxc,
-        });
+        let instance = Instance::new(&Default::default());
         let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None)
             .await
             .context("unable to create GPU adapter")?;
         let (device, queue) = adapter
             .request_device(
                 &DeviceDescriptor {
-                    label: None,
-                    features: Features::empty(),
-                    limits: Limits {
+                    required_limits: Limits {
                         max_compute_workgroup_size_x: WORKGROUP_SIZE,
                         max_compute_invocations_per_workgroup: WORKGROUP_SIZE,
-                        ..Limits::default()
+                        ..Default::default()
                     },
+                    ..Default::default()
                 },
                 None,
             )
@@ -251,38 +166,54 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
         let area = ctx.target_area.try_into().unwrap();
 
         let Constants {
-            num_squares,
-            num_cursors,
-            queue_capacity,
-            trie_start,
-            surface_words,
-            finder_size,
-            solution_size,
-            ..
+            finder_info_size, ..
         } = Constants::compute(num_cuboids, area);
 
-        let mut lookup_buf_contents = Vec::new();
-        for cache in &ctx.outer_square_caches {
-            for cursor in &cache.neighbour_lookup {
-                lookup_buf_contents.extend_from_slice(&u32::to_le_bytes(cursor.0.into()));
+        let mut neighbour_lookup_buf_contents = Vec::new();
+        for cache in &ctx.square_caches {
+            for square in cache.squares() {
+                for direction in [Left, Up, Right, Down] {
+                    neighbour_lookup_buf_contents.extend_from_slice(&u32::to_le_bytes(
+                        Cursor::new(square, 0).moved_in(cache, direction).0.into(),
+                    ));
+                }
             }
         }
-        let lookup_buf = device.create_buffer_init(&BufferInitDescriptor {
+        let neighbour_lookup_buf = device.create_buffer_init(&BufferInitDescriptor {
             label: Some("neighbour lookup buffer"),
-            contents: &lookup_buf_contents,
+            contents: &neighbour_lookup_buf_contents,
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let mut class_lookup_buf_contents = Vec::new();
+        for cache in &ctx.square_caches {
+            for cursor in cache.cursors() {
+                class_lookup_buf_contents
+                    .extend_from_slice(&u32::to_le_bytes(cursor.class(cache).index().into()));
+            }
+        }
+        let class_lookup_buf = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("class lookup buffer"),
+            contents: &class_lookup_buf_contents,
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let undo_lookup_buf = device.create_buffer_init(&BufferInitDescriptor {
+            label: Some("undo lookup buffer"),
+            contents: bytemuck::cast_slice(&undo_lookups(&ctx)),
             usage: BufferUsages::UNIFORM,
         });
 
         let finder_buf = device.create_buffer(&BufferDescriptor {
             label: Some("finder buffer"),
-            size: u64::from(NUM_FINDERS * finder_size),
+            size: u64::from(NUM_FINDERS * finder_info_size),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let solution_buf = device.create_buffer(&BufferDescriptor {
             label: Some("solution buffer"),
-            size: u64::from(4 + SOLUTION_CAPACITY * solution_size),
+            size: u64::from(4 + SOLUTION_CAPACITY * finder_info_size),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -292,14 +223,14 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
         // into these buffers, then map and read from them instead.
         let cpu_finder_buf = device.create_buffer(&BufferDescriptor {
             label: Some("CPU finder buffer"),
-            size: u64::from(NUM_FINDERS * finder_size),
+            size: u64::from(NUM_FINDERS * finder_info_size),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
         let cpu_solution_buf = device.create_buffer(&BufferDescriptor {
             label: Some("CPU solution buffer"),
-            size: u64::from(4 + SOLUTION_CAPACITY * solution_size),
+            size: u64::from(4 + SOLUTION_CAPACITY * finder_info_size),
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -313,12 +244,32 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: Some(lookup_buf.size().try_into().unwrap()),
+                        min_binding_size: Some(neighbour_lookup_buf.size().try_into().unwrap()),
                     },
                     count: None,
                 },
                 BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(class_lookup_buf.size().try_into().unwrap()),
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(undo_lookup_buf.size().try_into().unwrap()),
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
                     visibility: ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: false },
@@ -328,7 +279,7 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
                     count: None,
                 },
                 BindGroupLayoutEntry {
-                    binding: 2,
+                    binding: 4,
                     visibility: ShaderStages::COMPUTE,
                     ty: BindingType::Buffer {
                         ty: BufferBindingType::Storage { read_only: false },
@@ -347,7 +298,7 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
                 BindGroupEntry {
                     binding: 0,
                     resource: BindingResource::Buffer(BufferBinding {
-                        buffer: &lookup_buf,
+                        buffer: &neighbour_lookup_buf,
                         offset: 0,
                         size: None,
                     }),
@@ -355,13 +306,29 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
                 BindGroupEntry {
                     binding: 1,
                     resource: BindingResource::Buffer(BufferBinding {
-                        buffer: &finder_buf,
+                        buffer: &class_lookup_buf,
                         offset: 0,
                         size: None,
                     }),
                 },
                 BindGroupEntry {
                     binding: 2,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &undo_lookup_buf,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::Buffer(BufferBinding {
+                        buffer: &finder_buf,
+                        offset: 0,
+                        size: None,
+                    }),
+                },
+                BindGroupEntry {
+                    binding: 4,
                     resource: BindingResource::Buffer(BufferBinding {
                         buffer: &solution_buf,
                         offset: 0,
@@ -377,37 +344,26 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             push_constant_ranges: &[],
         });
 
-        let shader_source = format!(
-            "\
-            const num_cuboids = {num_cuboids}u;
-            const area = {area}u;
-
-            const num_squares = {num_squares}u;
-            const num_cursors = {num_cursors}u;
-            const queue_capacity = {queue_capacity}u;
-
-            const trie_start = {trie_start}u;
-
-            const surface_words = {surface_words}u;
-
-            {}",
-            include_str!("shader.wgsl")
+        let shader_source = include_str!("shader.wgsl").replace(
+            "const num_cuboids: u32 = 2;\nconst area: u32 = 22;",
+            &format!(
+                "const num_cuboids: u32 = {};\nconst area: u32 = {};",
+                CUBOIDS, ctx.target_area
+            ),
         );
 
-        // Bounds checks in Metal are currently broken (https://github.com/gfx-rs/naga/issues/2437),
-        // so don't include them.
-        let shader = unsafe {
-            device.create_shader_module_unchecked(ShaderModuleDescriptor {
-                label: None,
-                source: ShaderSource::Wgsl(shader_source.into()),
-            })
-        };
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: None,
+            source: ShaderSource::Wgsl(shader_source.into()),
+        });
 
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("finder pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: "run_finder",
+            entry_point: Some("run_finder"),
+            compilation_options: Default::default(),
+            cache: None,
         });
 
         Ok(Self {
@@ -472,8 +428,8 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
 
         // Write the finders into the GPU's buffer.
         let mut gpu_finders = Vec::new();
-        for finder in finders.iter() {
-            finder.to_gpu(self, &mut gpu_finders);
+        for finder in finders.into_iter() {
+            finder.into_info(&self.ctx).to_gpu(self, &mut gpu_finders);
         }
         self.queue.write_buffer(&self.finder_buf, 0, &gpu_finders);
 
@@ -481,11 +437,12 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             .device
             .create_command_encoder(&CommandEncoderDescriptor { label: None });
         // Clear the `len` field of the solutions to 0.
-        encoder.clear_buffer(&self.solution_buf, 0, Some(NonZeroU64::new(4).unwrap()));
+        encoder.clear_buffer(&self.solution_buf, 0, Some(4));
 
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("finder pass"),
+                ..Default::default()
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
@@ -532,51 +489,25 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
         let raw_solutions = self.cpu_solution_buf.slice(..).get_mapped_range();
 
         let Constants {
-            instruction_size,
-            queue_size,
-            finder_size,
-            solution_size,
-            ..
+            finder_info_size, ..
         } = self.constants();
 
         let num_solutions = u32::from_le_bytes(raw_solutions[0..4].try_into().unwrap());
         solutions.extend(
             raw_solutions[4..]
-                .chunks(solution_size.try_into().unwrap())
+                .chunks(finder_info_size.try_into().unwrap())
                 .take(num_solutions.try_into().unwrap())
                 .flat_map(|bytes| {
-                    let queue_size: usize = queue_size.try_into().unwrap();
-
-                    let completed_offset = 0;
-                    let potential_offset = queue_size;
-                    let end_offset = 2 * queue_size;
-
-                    let completed_len = u32::from_le_bytes(
-                        bytes[potential_offset - 4..potential_offset]
-                            .try_into()
-                            .unwrap(),
-                    );
-                    let potential_len =
-                        u32::from_le_bytes(bytes[end_offset - 4..end_offset].try_into().unwrap());
-
-                    let completed: Vec<_> = bytes[completed_offset..potential_offset - 4]
-                        .chunks(instruction_size.try_into().unwrap())
-                        .take(completed_len.try_into().unwrap())
-                        .map(|bytes| Instruction::from_gpu(self, bytes))
-                        .collect();
-                    let potential: Vec<_> = bytes[potential_offset..end_offset - 4]
-                        .chunks(instruction_size.try_into().unwrap())
-                        .take(potential_len.try_into().unwrap())
-                        .map(|bytes| Instruction::from_gpu(self, bytes))
-                        .collect();
-
-                    self.ctx.finalize(completed, potential)
+                    let info = FinderInfo::from_gpu(self, bytes);
+                    let mut finder = Finder::new(&self.ctx, &info).unwrap();
+                    finder.finish_and_finalize(&self.ctx)
                 }),
         );
 
         let mut finders: Vec<Finder<CUBOIDS>> = raw_finders
-            .chunks(finder_size.try_into().unwrap())
-            .map(|bytes| Finder::from_gpu(self, bytes))
+            .chunks(finder_info_size.try_into().unwrap())
+            .map(|bytes| FinderInfo::from_gpu(self, bytes))
+            .map(|info| Finder::new(&self.ctx, &info).unwrap())
             .collect();
 
         // Get rid of any finders that are finished.
@@ -606,197 +537,121 @@ trait FromGpu<const CUBOIDS: usize> {
     fn from_gpu(pipeline: &Pipeline<CUBOIDS>, bytes: &[u8]) -> Self;
 }
 
-impl<const CUBOIDS: usize> ToGpu<CUBOIDS> for Finder<CUBOIDS> {
+impl<const CUBOIDS: usize> ToGpu<CUBOIDS> for FinderInfo<CUBOIDS> {
     fn to_gpu(&self, pipeline: &Pipeline<CUBOIDS>, buffer: &mut Vec<u8>) {
-        let Constants {
-            queue_capacity,
-            queued_padding,
-            ..
-        } = pipeline.constants();
-
-        // Write `queue`.
-        for i in 0..queue_capacity {
-            if let Some(instruction) = self.queue.get(usize::try_from(i).unwrap()) {
-                instruction.to_gpu(pipeline, buffer);
-            } else {
-                buffer.extend(iter::repeat(0).take(4 * (2 + CUBOIDS)));
+        let Constants { decision_words, .. } = pipeline.constants();
+        // TODO: maybe we should pull out the equivalence classes and make sure this has
+        // the minimal index
+        //
+        // although, I don't think it particularly matters anyway... it'll break the
+        // fact that we compute fixed_class by just taking that class of
+        // start_mapping[0], but that's fixable (mask out the transform bits).
+        for cursor in pipeline
+            .ctx
+            .to_inner(self.start_mapping)
+            .sample(&pipeline.ctx.square_caches)
+            .cursors
+        {
+            buffer.extend_from_slice(&u32::to_le_bytes(cursor.0.into()));
+        }
+        for chunk in self
+            .decisions
+            .chunks(32)
+            .chain(iter::repeat(&[] as &[bool]))
+            .take(decision_words.try_into().unwrap())
+        {
+            let mut word = 0;
+            for (i, &decision) in chunk.iter().enumerate() {
+                word |= (decision as u32) << i;
             }
+            buffer.extend_from_slice(&u32::to_le_bytes(word));
         }
-        buffer.extend_from_slice(&u32::to_le_bytes(self.queue.len().try_into().unwrap()));
-
-        // Write `potential` and `potential_len`.
-        for i in 0..queue_capacity {
-            buffer.extend_from_slice(&u32::to_le_bytes(
-                if let Some(&index) = self.potential.get(usize::try_from(i).unwrap()) {
-                    index.try_into().unwrap()
-                } else {
-                    0
-                },
-            ));
-        }
-        buffer.extend_from_slice(&u32::to_le_bytes(self.potential.len().try_into().unwrap()));
-
-        // Write `index` and `base_index`.
-        buffer.extend_from_slice(&u32::to_le_bytes(self.index.try_into().unwrap()));
-        buffer.extend_from_slice(&u32::to_le_bytes(self.base_index.try_into().unwrap()));
-
-        // Write `surfaces`.
-        for surface in &self.surfaces {
-            if pipeline.area > 32 {
-                // Since the first 32 squares correspond to the first `u32` on the GPU and the
-                // lower 32 bits of the surface on the CPU, just encoding the whole integer as
-                // little-endian happens to lay it out correctly.
-                buffer.extend_from_slice(&surface.0.to_le_bytes());
-            } else {
-                // Otherwise, since we pack everything into the lowest `area` bits, this should
-                // be able to fit into a `u32`.
-                buffer.extend_from_slice(&u32::to_le_bytes(surface.0.try_into().unwrap()));
-            }
-        }
-
-        // Write `queued`.
-        // buffer.extend(iter::repeat(0).take(queued_padding.try_into().
-        // unwrap())); for &(length, positions) in &self.queued.elements
-        // {     let mut positions = bytemuck::cast::<u64, [Pos;
-        // 4]>(positions);     if cfg!(target_endian = "big") {
-        //         positions.reverse();
-        //     }
-        //     let encoded_positions: [u32; 4] = array::from_fn(|i| {
-        //         let mut result = 0;
-        //         if i == 0 {
-        //             result |= length << 28;
-        //         }
-        //         if i < length.try_into().unwrap() {
-        //             result |= 0x80000000;
-        //             result |= (positions[i].x as u32) << 8;
-        //             result |= positions[i].y as u32;
-        //         }
-        //         result
-        //     });
-        //     for word in encoded_positions {
-        //         buffer.extend_from_slice(&u32::to_le_bytes(word));
-        //     }
-        // }
+        buffer.extend_from_slice(&u32::to_le_bytes(self.decisions.len().try_into().unwrap()));
+        buffer.extend_from_slice(&u32::to_le_bytes(
+            self.base_decision.get().try_into().unwrap(),
+        ));
     }
 }
-impl<const CUBOIDS: usize> FromGpu<CUBOIDS> for Finder<CUBOIDS> {
+
+impl<const CUBOIDS: usize> FromGpu<CUBOIDS> for FinderInfo<CUBOIDS> {
     fn from_gpu(pipeline: &Pipeline<CUBOIDS>, mut bytes: &[u8]) -> Self {
-        let Constants {
-            num_cursors,
-            surface_words,
-            instruction_size,
-            queue_size,
-            potential_size,
-            surfaces_size,
-            queued_padding,
-            queued_size,
-            ..
-        } = pipeline.constants();
+        let Constants { decision_words, .. } = pipeline.constants();
 
-        let queue_size: usize = queue_size.try_into().unwrap();
-        let queue_len = u32::from_le_bytes(bytes[queue_size - 4..queue_size].try_into().unwrap());
-        let queue = bytes[0..queue_size - 4]
-            .chunks(instruction_size.try_into().unwrap())
-            .take(queue_len.try_into().unwrap())
-            .map(|bytes| Instruction::from_gpu(pipeline, bytes))
-            .collect();
-        bytes = &bytes[queue_size..];
-
-        let potential_size: usize = potential_size.try_into().unwrap();
-        let potential_len = u32::from_le_bytes(
-            bytes[potential_size - 4..potential_size]
+        let start_mapping = Mapping {
+            cursors: bytes[..4 * CUBOIDS]
+                .chunks(4)
+                .map(|chunk| {
+                    Cursor(
+                        u32::from_le_bytes(chunk.try_into().unwrap())
+                            .try_into()
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
                 .try_into()
                 .unwrap(),
-        );
-        let potential: Vec<usize> = bytemuck::cast_slice(&bytes[..potential_size])
-            [..potential_len.try_into().unwrap()]
-            .iter()
-            .map(|&index| u32::from_le(index).try_into().unwrap())
+        };
+        bytes = &bytes[4 * CUBOIDS..];
+
+        let decisions: Vec<_> = bytes[..4 * usize::try_from(decision_words).unwrap()]
+            .chunks(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        bytes = &bytes[potential_size..];
+        bytes = &bytes[4 * usize::try_from(decision_words).unwrap()..];
 
-        let index = u32::from_le_bytes(bytes[0..4].try_into().unwrap())
-            .try_into()
-            .unwrap();
-        let base_index = u32::from_le_bytes(bytes[4..8].try_into().unwrap())
-            .try_into()
-            .unwrap();
-        bytes = &bytes[8..];
+        let decisions_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let base_decision = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
 
-        let surfaces_size: usize = surfaces_size.try_into().unwrap();
-        let surfaces = match surface_words {
-            1 => bytemuck::from_bytes::<[u32; CUBOIDS]>(&bytes[..surfaces_size])
-                .map(u32::from_le)
-                .map(u64::from),
-            2 => bytemuck::from_bytes::<[u64; CUBOIDS]>(&bytes[..surfaces_size]).map(u64::from_le),
-            _ => unreachable!("area > 64"),
-        }
-        .map(Surface);
-        bytes = &bytes[surfaces_size..];
-
-        // bytes = &bytes[queued_padding.try_into().unwrap()..];
-        // let queued_size: usize = queued_size.try_into().unwrap();
-        // let elements = bytes[..queued_size]
-        //     .chunks(4 * 4)
-        //     .map(|bytes| {
-        //         let positions = bytemuck::from_bytes::<[u32;
-        // 4]>(bytes).map(u32::from_le);         let length = (positions[0] >>
-        // 28) & 0x7;         let mut positions = positions.map(|pos| Pos { x: (pos >>
-        //     8) as u8, y: pos as u8, }); if cfg!(target_endian = "big") {
-        //     positions.reverse(); } let positions: u64 = bytemuck::cast(positions);
-        //     (length, positions) }) .collect();
-        // let queued = InstructionSet { elements };
-
-        Self {
-            skip: todo!(),
-            start_mapping_index: todo!(),
-            queue,
-            potential,
-            net: todo!(),
-            surfaces,
-            index,
-            base_index,
+        FinderInfo {
+            start_mapping: pipeline
+                .ctx
+                .to_outer(start_mapping.to_classes(&pipeline.ctx.square_caches)),
+            decisions: (0..usize::try_from(decisions_len).unwrap())
+                .map(|i| decisions[i / 32] & (1 << (i % 32)) != 0)
+                .collect(),
+            base_decision: usize::try_from(base_decision).unwrap().try_into().unwrap(),
         }
     }
 }
 
-impl<const CUBOIDS: usize> ToGpu<CUBOIDS> for Instruction<CUBOIDS> {
-    fn to_gpu(&self, _: &Pipeline<CUBOIDS>, buffer: &mut Vec<u8>) {
-        buffer.extend_from_slice(&u32::to_le_bytes(
-            ((self.net_pos.x as u32) << 8) | (self.net_pos.y as u32),
-        ));
-        buffer.extend(
-            self.mapping
-                .cursors()
-                .iter()
-                .flat_map(|&cursor| u32::to_le_bytes(cursor.0.into())),
-        );
-        buffer.extend_from_slice(&u32::to_le_bytes(
-            self.followup_index.map_or(0, NonZeroU8::get).into(),
-        ))
-    }
+/// Returns the contents of all the cuboids' undo lookups.
+pub fn undo_lookups<const CUBOIDS: usize>(ctx: &FinderCtx<CUBOIDS>) -> Vec<u16> {
+    ctx.square_caches
+        .iter()
+        .skip(1)
+        .flat_map(|cache| undo_lookup(&ctx.square_caches[0], cache, ctx.fixed_class))
+        .collect()
 }
 
-impl<const CUBOIDS: usize> FromGpu<CUBOIDS> for Instruction<CUBOIDS> {
-    fn from_gpu(_: &Pipeline<CUBOIDS>, bytes: &[u8]) -> Self {
-        let encoded_net_pos = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let net_pos = Pos {
-            x: (encoded_net_pos >> 8) as u8,
-            y: encoded_net_pos as u8,
-        };
-        let mapping = Mapping {
-            cursors: array::from_fn(|i| {
-                let offset = 4 + 4 * i;
-                let index = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-                Cursor(index.try_into().unwrap())
-            }),
-        };
-        let offset = 4 + 4 * CUBOIDS;
-        let followup_index = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        Self {
-            net_pos,
-            mapping,
-            followup_index: NonZeroU8::new(followup_index.try_into().unwrap()),
-        }
-    }
+/// Returns the contents of a specific cuboid's undo lookup.
+fn undo_lookup(
+    fixed_square_cache: &SquareCache,
+    cache: &SquareCache,
+    fixed_class: Class,
+) -> Vec<u16> {
+    assert!(
+        fixed_class.transform_bits() >= 2,
+        "The GPU's skip checker assumes the fixed class has at least 2 transform bits (which is \
+         true in practice until at least area 64)"
+    );
+    cache
+        .cursors()
+        .flat_map(|cursor| {
+            (0..8).map(move |transform| {
+                let class = cursor.class(cache);
+                let options = fixed_class
+                    .with_transform(transform)
+                    .alternate_transforms(fixed_square_cache)
+                    .map(|transform| class.undo_transform(cache, transform))
+                    .collect::<Vec<_>>();
+
+                assert!(options.len() <= 2);
+
+                let hi = options[0].index() as u16;
+                let lo = options.get(1).unwrap_or(&options[0]).index() as u16;
+
+                (hi << 8) | lo
+            })
+        })
+        .collect()
 }

@@ -11,6 +11,7 @@ struct Options {
 }
 
 fn main() -> anyhow::Result<()> {
+    env_logger::init();
     let options = Options::parse();
     match *options.cuboids.as_slice() {
         [] => bail!("must specify at least 1 cuboid"),
