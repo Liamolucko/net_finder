@@ -15,6 +15,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo run --release -p net-finder-cpu 1x1x5 1x2x3
       - run: test "$(cat state/1x1x5,1x2x3.json | jq '.solutions | length')" = 2263
+  test_gpu:
+    name: Test net-finder-gpu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt install libvulkan1 mesa-vulkan-drivers
+      - run: cargo run --release -p net-finder-gpu 1x1x5 1x2x3
+      - run: test "$(cat state/1x1x5,1x2x3.json | jq '.solutions | length')" = 2263
   test_soc:
     name: Test SoC
     runs-on: ubuntu-latest
@@ -37,11 +45,4 @@ jobs:
 
           kill %2
           kill %1
-      - run: test "$(cat state/1x1x5,1x2x3.json | jq '.solutions | length')" = 2263
-  test_gpu:
-    name: Test net-finder-gpu
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: cargo run --release -p net-finder-gpu 1x1x5 1x2x3
       - run: test "$(cat state/1x1x5,1x2x3.json | jq '.solutions | length')" = 2263
