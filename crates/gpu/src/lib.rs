@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::iter;
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,14 +6,15 @@ use std::sync::mpsc;
 
 use anyhow::{bail, Context};
 use indicatif::ProgressBar;
+use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{
     util::{BufferInitDescriptor, DeviceExt},
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding, BufferBindingType,
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, ComputePassDescriptor,
     ComputePipeline, ComputePipelineDescriptor, Device, DeviceDescriptor, Instance, Limits,
-    Maintain, MapMode, PipelineLayoutDescriptor, Queue, ShaderModuleDescriptor, ShaderSource,
-    ShaderStages,
+    Maintain, MapMode, PipelineCompilationOptions, PipelineLayoutDescriptor, Queue,
+    ShaderModuleDescriptor, ShaderSource, ShaderStages,
 };
 
 use net_finder::{
@@ -357,12 +359,21 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
             source: ShaderSource::Wgsl(shader_source.into()),
         });
 
+        let mut constants = HashMap::new();
+        constants.insert(
+            "fixed_family_transform_mask".to_owned(),
+            ctx.fixed_class.transform_mask() as f64,
+        );
+
         let pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("finder pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: Some("run_finder"),
-            compilation_options: Default::default(),
+            compilation_options: PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            },
             cache: None,
         });
 

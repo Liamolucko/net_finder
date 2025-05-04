@@ -18,6 +18,8 @@ const surface_words = (num_squares + 31) / 32;
 
 const decision_words = (queue_capacity + 31) / 32;
 
+override fixed_family_transform_mask: u32 = 7;
+
 // Use a `vec4<Cursor>` rather than just storing 4 cursors directly to satisfy
 // the requirement that arrays in uniform buffers have a stride of at least 16
 // bytes.
@@ -119,8 +121,7 @@ fn skip(fixed_class: u32, start_mapping_index: u32, instruction: Instruction) ->
     var mapping = instruction.mapping;
     var mapping_indices = array<u32, 2>(0, 0);
     let class0 = cursor_class(0, mapping[0]);
-    // TODO: this also needs to be fixed to use the correct transform mask.
-    let to_undo = class0 & 7;
+    let to_undo = class0 & fixed_family_transform_mask;
     for (var cuboid = 1u; cuboid < num_cuboids; cuboid++) {
         let choices = (undo_lookups[cuboid - 1][mapping[cuboid]][to_undo >> 1u] >> (16 * (to_undo & 1))) & 0xffff;
         for (var choice = 0u; choice < 2; choice++) {
@@ -129,9 +130,7 @@ fn skip(fixed_class: u32, start_mapping_index: u32, instruction: Instruction) ->
         }
     }
 
-    // TODO: this assumes we always have 3 transform bits, which is wrong.
-    // we can fix this by adding a `fixed_family_mask` field to `FinderInfo` and `Finder`.
-    return (class0 & 0x38) == fixed_class && (mapping_indices[0] < start_mapping_index || mapping_indices[1] < start_mapping_index);
+    return (class0 & ~fixed_family_transform_mask) == fixed_class && (mapping_indices[0] < start_mapping_index || mapping_indices[1] < start_mapping_index);
 }
 
 /// A single unit of work for trying combinations of net squares.
