@@ -8,7 +8,6 @@ use anyhow::{bail, Context};
 use indicatif::ProgressBar;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{
-    util::{BufferInitDescriptor, DeviceExt},
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Buffer, BufferBinding, BufferBindingType,
     BufferDescriptor, BufferUsages, CommandEncoderDescriptor, ComputePassDescriptor,
