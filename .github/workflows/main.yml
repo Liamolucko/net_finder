@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt install libvulkan1 mesa-vulkan-drivers
+      - run: sudo apt install mesa-vulkan-drivers
       - run: cargo run --release -p net-finder-gpu 1x1x5 1x2x3
       - run: test "$(cat state/1x1x5,1x2x3.json | jq '.solutions | length')" = 2263
   test_soc:

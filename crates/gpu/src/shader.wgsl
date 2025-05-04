@@ -211,7 +211,7 @@ struct MaybeSolutions {
 
 @group(0) @binding(4) var<storage, read_write> maybe_solutions: MaybeSolutions;
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(32)
 fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
     let info = finders[id.x];
 
@@ -265,7 +265,7 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
         finder.base_index = finder.index;
     }
 
-    for (var i = 0u; i < 1000u; i++) {
+    for (var i = 0u; i < 100000; i++) {
         if finder.index < finder.queue_len {
             handle_instruction(&finder);
         } else {

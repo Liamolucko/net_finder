@@ -23,9 +23,9 @@ use net_finder::{
 use Direction::*;
 
 /// The number of `Finder`s we always give to the GPU.
-const NUM_FINDERS: u32 = 13440;
+const NUM_FINDERS: u32 = 4 * 1792;
 /// The size of the compute shader's workgroups.
-const WORKGROUP_SIZE: u32 = 64;
+const WORKGROUP_SIZE: u32 = 32;
 /// The capacity of the buffer into which our shader writes the solutions it
 /// finds.
 const SOLUTION_CAPACITY: u32 = 10000;
