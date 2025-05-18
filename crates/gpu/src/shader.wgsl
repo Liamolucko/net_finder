@@ -74,7 +74,7 @@ fn set_cursor(instruction: ptr<function, Instruction>, n: u32, value: u32) {
 /// (No instruction could actually have a followup index of 0, since that'd mean
 /// it had an index less than 0.)
 fn followup_index(instruction: Instruction) -> u32 {
-    return (instruction.other >> 24u) & 0x3f;
+    return (instruction.other >> 24u) & 0xff;
 }
 
 fn set_followup_index(instruction: ptr<function, Instruction>, value: u32) {
