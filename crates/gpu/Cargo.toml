@@ -12,3 +12,10 @@ indicatif = "0.17.7"
 net-finder = { path = "../..", features = ["no-trie"] }
 pollster = "0.4.0"
 wgpu = "24.0.3"
+
+[[bench]]
+name = "run_finders"
+harness = false
+
+[dev-dependencies]
+divan = "0.1.21"

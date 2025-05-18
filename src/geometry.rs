@@ -3,7 +3,7 @@
 use std::array;
 use std::cmp::Reverse;
 use std::collections::HashSet;
-use std::fmt::{self, Display, Formatter, Write};
+use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::hash::{Hash, Hasher};
 use std::iter::zip;
 use std::ops::{Index, IndexMut};
@@ -14,7 +14,7 @@ use arbitrary::Arbitrary;
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Cuboid {
     pub width: u8,
     pub depth: u8,
@@ -54,6 +54,12 @@ impl FromStr for Cuboid {
 impl Display for Cuboid {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}x{}x{}", self.width, self.depth, self.height)
+    }
+}
+
+impl Debug for Cuboid {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Display::fmt(self, f)
     }
 }
 

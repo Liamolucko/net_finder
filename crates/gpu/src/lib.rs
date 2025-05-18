@@ -4,7 +4,7 @@ use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use indicatif::ProgressBar;
 use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{
@@ -59,7 +59,7 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for GpuRuntime<CUBOIDS> {
             .map(|finder| Finder::new(ctx, finder))
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        let mut pipeline = pollster::block_on(Pipeline::new(ctx.clone(), &finders))?;
+        let mut pipeline = pollster::block_on(Pipeline::new(ctx.clone(), 100000))?;
 
         while !finders.is_empty() && !pause.load(Ordering::Relaxed) {
             let (solutions, new_finders, finders_created, finders_finished) =
@@ -108,7 +108,7 @@ impl Constants {
 }
 
 /// A GPU pipeline set up for running `Finder`s.
-struct Pipeline<const CUBOIDS: usize> {
+pub struct Pipeline<const CUBOIDS: usize> {
     device: Device,
     queue: Queue,
 
@@ -130,20 +130,8 @@ struct Pipeline<const CUBOIDS: usize> {
 }
 
 impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
-    /// Creates a new GPU pipeline capable of running the given list of
-    /// `Finder`s.
-    ///
-    /// The reason that the actual `Finder`s are needed rather than, say, a
-    /// list of cuboids is to find out what the largest trie we need to allocate
-    /// space for is.
-    ///
-    /// All the `Finder`s need to be searching for the common nets of the
-    /// same list of cuboids.
-    async fn new(ctx: FinderCtx<CUBOIDS>, finders: &[Finder<CUBOIDS>]) -> anyhow::Result<Self> {
-        if finders.is_empty() {
-            bail!("must specify at least one `Finder`");
-        }
-
+    /// Creates a new GPU pipeline.
+    pub async fn new(ctx: FinderCtx<CUBOIDS>, iters: u32) -> anyhow::Result<Self> {
         let instance = Instance::new(&Default::default());
         let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, None)
             .await
@@ -346,10 +334,10 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
         });
 
         let shader_source = include_str!("shader.wgsl").replace(
-            "const num_cuboids: u32 = 2;\nconst area: u32 = 22;",
+            "const num_cuboids: u32 = 2;\nconst area: u32 = 22;\nconst iters: u32 = 100000;",
             &format!(
-                "const num_cuboids: u32 = {};\nconst area: u32 = {};",
-                CUBOIDS, ctx.target_area
+                "const num_cuboids: u32 = {};\nconst area: u32 = {};\nconst iters: u32 = {};",
+                CUBOIDS, ctx.target_area, iters
             ),
         );
 
@@ -403,7 +391,7 @@ impl<const CUBOIDS: usize> Pipeline<CUBOIDS> {
     ///
     /// Note that the number of finders returned may not be the same as the
     /// number passed in, since some finders may be split or finish.
-    fn run_finders(
+    pub fn run_finders(
         &mut self,
         mut finders: Vec<Finder<CUBOIDS>>,
     ) -> (Vec<Solution>, Vec<Finder<CUBOIDS>>, u64, u64) {

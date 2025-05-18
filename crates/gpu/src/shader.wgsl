@@ -3,6 +3,7 @@
 // structs.
 const num_cuboids: u32 = 2;
 const area: u32 = 22;
+const iters: u32 = 100000;
 
 const num_squares = area;
 const num_cursors = 4 * num_squares;
@@ -294,7 +295,7 @@ fn run_finder(@builtin(global_invocation_id) id: vec3<u32>) {
         finder.base_index = finder.index;
     }
 
-    for (var i = 0u; i < 100000; i++) {
+    for (var i = 0u; i < iters; i++) {
         if finder.index < finder.queue_len {
             handle_instruction(&finder);
         } else {
@@ -426,15 +427,6 @@ fn valid(finder: ptr<function, Finder>, instruction: Instruction) -> bool {
         result &= !filled(finder, i, cursor(instruction, i) >> 2u);
     }
 
-    return result;
-}
-
-/// Returns whether two mappings are equal.
-fn mapping_eq(a: array<u32, num_cuboids>, b: array<u32, num_cuboids>) -> bool {
-    var result = true;
-    for (var i = 0u; i < num_cuboids; i++) {
-        result &= a[i] == b[i];
-    }
     return result;
 }
 
