@@ -36,6 +36,8 @@ def undo_lookup_entry_layout(max_area: int):
     )
 
 
+# TODO: is there a way that we could include the classes for all 4 neighbours in an undo lookup?
+#
 def undo_lookup_layout(max_area: int, init=[]):
     return MemoryData(
         shape=undo_lookup_entry_layout(max_area),

@@ -27,15 +27,17 @@ let
     ];
   });
 in
-pkgs.mkShell {
+pkgs.libcxxStdenv.mkDerivation {
+  name = "nix-shell";
   venvDir = ".venv";
-  packages = [
+  nativeBuildInputs = [
     pkgs.python311.pkgs.venvShellHook
 
     openocd
     pkgs.yosys
     pkgs.verilator
-
+  ];
+  buildInputs = [
     # Needed by Verilator simulations
     pkgs.json_c
     pkgs.libevent

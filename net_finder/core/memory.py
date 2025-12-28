@@ -39,7 +39,8 @@ class ChunkedMemory(wiring.Component):
 
     The reason for this type's existence is the `sdp_port` method, which provides a
     simple-dual-port interface implemented using a single port that works as long as
-    its read and write ports are never used on the same chunk at the same time.
+    its read and write ports are never used on the same chunk at the same time (even
+    if `en` is unset).
 
     This assumption is correct in our use case (accessing the net) because each
     finder gets its own chunk, is only being processed by one pipeline stage at a
@@ -64,45 +65,47 @@ class ChunkedMemory(wiring.Component):
 
         super().__init__({})
 
-    def read_port(self, domain="sync") -> PureInterface:
+    def read_port(self, domain="sync", src_loc_at=0) -> PureInterface:
         # Return a disconnected interface, which we then add to an array and hook up
         # during `elaborate`.
         port = ChunkedReadPortSignature(
             chunk_width=ceil_log2(self._chunks),
             addr_width=ceil_log2(self._depth),
             shape=self._shape,
-        ).create()
+        ).create(src_loc_at=1 + src_loc_at)
 
         self._read_ports.append((port, domain))
 
         return port
 
-    def write_port(self) -> PureInterface:
+    def write_port(self, src_loc_at=0) -> PureInterface:
         # Return a disconnected interface, which we then add to an array and hook up
         # during `elaborate`.
         port = ChunkedWritePortSignature(
             chunk_width=ceil_log2(self._chunks),
             addr_width=ceil_log2(self._depth),
             shape=self._shape,
-        ).create()
+        ).create(src_loc_at=1 + src_loc_at)
 
         self._write_ports.append(port)
 
         return port
 
-    def sdp_port(self, read_domain="sync") -> tuple[PureInterface, PureInterface]:
+    def sdp_port(
+        self, read_domain="sync", src_loc_at=0
+    ) -> tuple[PureInterface, PureInterface]:
         # Return disconnected interfaces, which we then add to an array and hook up
         # during `elaborate`.
         read_port = ChunkedReadPortSignature(
             chunk_width=ceil_log2(self._chunks),
             addr_width=ceil_log2(self._depth),
             shape=self._shape,
-        ).create()
+        ).create(src_loc_at=1 + src_loc_at)
         write_port = ChunkedWritePortSignature(
             chunk_width=ceil_log2(self._chunks),
             addr_width=ceil_log2(self._depth),
             shape=self._shape,
-        ).create()
+        ).create(src_loc_at=1 + src_loc_at)
 
         self._sdp_ports.append(((read_port, read_domain), write_port))
 
@@ -140,7 +143,9 @@ class ChunkedMemory(wiring.Component):
 
                 # Make sure that the read and write ports always use the same address so that
                 # they can infer a single port of a true-dual-port BRAM.
-                addr = Mux(inner_write_port.en, write_port.addr, read_port.addr)
+                addr = Mux(
+                    write_port.chunk == chunk_index, write_port.addr, read_port.addr
+                )
                 m.d.comb += inner_write_port.addr.eq(addr)
                 m.d.comb += inner_read_port.addr.eq(addr)
 

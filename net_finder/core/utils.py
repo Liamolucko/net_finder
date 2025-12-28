@@ -13,6 +13,16 @@ def pipe(m: Module, input: ValueLike, **kwargs) -> Signal:
     return output
 
 
+def sig(m: Module, input: ValueLike, **kwargs) -> Signal:
+    """
+    Rather than writing `sig = <expr>`, write `sig = sig(m, <expr>)`, since that
+    results in the signal name actually showing up in the Verilog.
+    """
+    output = Signal.like(input, src_loc_at=1, **kwargs)
+    m.d.comb += output.eq(input)
+    return output
+
+
 class SafeDemux(wiring.Component):
     """
     A component that lets you choose which of its sinks you want to connect its
