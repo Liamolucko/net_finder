@@ -209,7 +209,7 @@ impl<T: Clone + Default> Iterator for Rotations<T> {
     }
 }
 
-impl<T: Clone + Default + Filled + PartialEq> PartialEq for Net<T> {
+impl PartialEq for Net<bool> {
     fn eq(&self, other: &Self) -> bool {
         let a = self.shrink();
         let b = other.shrink();
@@ -218,13 +218,35 @@ impl<T: Clone + Default + Filled + PartialEq> PartialEq for Net<T> {
     }
 }
 
-impl<T: Clone + Default + Filled + Eq> Eq for Net<T> {}
+impl Eq for Net<bool> {}
 
-impl<T: Clone + Default + Filled + Hash> Hash for Net<T> {
+impl Hash for Net<bool> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Create the 'canonical' version of this net by finding the rotation which
         // results in the lexicographically 'largest' value of `squares`.
         let canon = self.canon();
+
+        canon.width.hash(state);
+        canon.squares.hash(state);
+    }
+}
+
+impl PartialEq for ColoredNet {
+    fn eq(&self, other: &Self) -> bool {
+        let a = self.color_canon();
+        let b = other.color_canon();
+
+        a.width == b.width && a.squares == b.squares
+    }
+}
+
+impl Eq for ColoredNet {}
+
+impl Hash for ColoredNet {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Create the 'canonical' version of this net by finding the rotation which
+        // results in the lexicographically 'largest' value of `squares`.
+        let canon = self.color_canon();
 
         canon.width.hash(state);
         canon.squares.hash(state);
@@ -611,6 +633,70 @@ impl Net<bool> {
 /// A version of `Net` which stores which face each of its squares are on.
 pub type ColoredNet = Net<Option<Face>>;
 
+impl ColoredNet {
+    pub fn permute_colors(&mut self, perm: [Face; 6]) {
+        for square in self.squares.iter_mut() {
+            if let Some(square) = square {
+                *square = perm[*square as usize];
+            }
+        }
+    }
+
+    pub fn color_canon(&self) -> ColoredNet {
+        // want to enumerate all valid transformations of the cuboid, not just of the net.
+        let nets = [self.canon()];
+        let nets: Vec<_> = nets
+            .into_iter()
+            .flat_map(|net1| {
+                let mut net2 = net1.clone();
+                net2.permute_colors([East, Bottom, North, Top, South, West]);
+                [net1, net2]
+            })
+            .collect();
+        let nets: Vec<_> = nets
+            .into_iter()
+            .flat_map(|net1| {
+                let mut net2 = net1.clone();
+                net2.permute_colors([Bottom, South, West, North, East, Top]);
+                [net1, net2]
+            })
+            .collect();
+        let nets: Vec<_> = nets
+            .into_iter()
+            .flat_map(|net1| {
+                let mut net2 = net1.clone();
+                net2.permute_colors([North, West, Top, East, Bottom, South]);
+                [net1, net2]
+            })
+            .collect();
+        let nets: Vec<_> = nets
+            .into_iter()
+            .flat_map(|net1| {
+                let mut net2 = net1.clone();
+                net2.permute_colors([Bottom, West, South, East, North, Top]);
+                [net1, net2]
+            })
+            .collect();
+        let nets: Vec<_> = nets
+            .into_iter()
+            .flat_map(|net1| {
+                let mut net2 = net1.clone();
+                net2.permute_colors([Top, West, North, East, South, Bottom]);
+                [net1, net2]
+            })
+            .collect();
+        let nets: Vec<_> = nets
+            .into_iter()
+            .flat_map(|net1| {
+                let mut net2 = net1.clone();
+                net2.permute_colors([Bottom, East, North, West, South, Top]);
+                [net1, net2]
+            })
+            .collect();
+        nets.iter().min_by_key(|net| &net.squares).unwrap().clone()
+    }
+}
+
 impl Display for ColoredNet {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let shrunk = self.shrink();
@@ -801,7 +887,7 @@ impl Direction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Face {
     Bottom,
