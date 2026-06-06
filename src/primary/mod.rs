@@ -1358,7 +1358,7 @@ impl Solution {
                         .iter()
                         .position(|&other_cuboid| other_cuboid == cuboid)
                         .unwrap();
-                    colored[index].color_canon()
+                    colored[index].color_canon(cuboid)
                 })
                 .into(),
             time: SystemTime::now(),

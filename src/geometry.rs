@@ -209,7 +209,7 @@ impl<T: Clone + Default> Iterator for Rotations<T> {
     }
 }
 
-impl PartialEq for Net<bool> {
+impl<T: Clone + Default + Filled + PartialEq> PartialEq for Net<T> {
     fn eq(&self, other: &Self) -> bool {
         let a = self.shrink();
         let b = other.shrink();
@@ -218,35 +218,13 @@ impl PartialEq for Net<bool> {
     }
 }
 
-impl Eq for Net<bool> {}
+impl<T: Clone + Default + Filled + Eq> Eq for Net<T> {}
 
-impl Hash for Net<bool> {
+impl<T: Clone + Default + Filled + Hash> Hash for Net<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Create the 'canonical' version of this net by finding the rotation which
         // results in the lexicographically 'largest' value of `squares`.
         let canon = self.canon();
-
-        canon.width.hash(state);
-        canon.squares.hash(state);
-    }
-}
-
-impl PartialEq for ColoredNet {
-    fn eq(&self, other: &Self) -> bool {
-        let a = self.color_canon();
-        let b = other.color_canon();
-
-        a.width == b.width && a.squares == b.squares
-    }
-}
-
-impl Eq for ColoredNet {}
-
-impl Hash for ColoredNet {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        // Create the 'canonical' version of this net by finding the rotation which
-        // results in the lexicographically 'largest' value of `squares`.
-        let canon = self.color_canon();
 
         canon.width.hash(state);
         canon.squares.hash(state);
@@ -642,34 +620,44 @@ impl ColoredNet {
         }
     }
 
-    pub fn color_canon(&self) -> ColoredNet {
+    pub fn color_canon(&self, cuboid: Cuboid) -> ColoredNet {
         // want to enumerate all valid transformations of the cuboid, not just of the net.
-        let nets = [self.canon()];
-        let nets: Vec<_> = nets
-            .into_iter()
-            .flat_map(|net1| {
-                let mut net2 = net1.clone();
-                net2.permute_colors([East, Bottom, North, Top, South, West]);
-                [net1, net2]
-            })
-            .collect();
-        let nets: Vec<_> = nets
-            .into_iter()
-            .flat_map(|net1| {
-                let mut net2 = net1.clone();
-                net2.permute_colors([Bottom, South, West, North, East, Top]);
-                [net1, net2]
-            })
-            .collect();
-        let nets: Vec<_> = nets
-            .into_iter()
-            .flat_map(|net1| {
-                let mut net2 = net1.clone();
-                net2.permute_colors([North, West, Top, East, Bottom, South]);
-                [net1, net2]
-            })
-            .collect();
-        let nets: Vec<_> = nets
+        let mut nets = vec![self.canon()];
+        // r_s
+        if cuboid.width == cuboid.height {
+            nets = nets
+                .into_iter()
+                .flat_map(|net1| {
+                    let mut net2 = net1.clone();
+                    net2.permute_colors([East, Bottom, North, Top, South, West]);
+                    [net1, net2]
+                })
+                .collect();
+        }
+        // r_t
+        if cuboid.width == cuboid.depth {
+            nets = nets
+                .into_iter()
+                .flat_map(|net1| {
+                    let mut net2 = net1.clone();
+                    net2.permute_colors([Bottom, South, West, North, East, Top]);
+                    [net1, net2]
+                })
+                .collect();
+        }
+        // r_e
+        if cuboid.depth == cuboid.height {
+            nets = nets
+                .into_iter()
+                .flat_map(|net1| {
+                    let mut net2 = net1.clone();
+                    net2.permute_colors([North, West, Top, East, Bottom, South]);
+                    [net1, net2]
+                })
+                .collect();
+        }
+        // f_z
+        nets = nets
             .into_iter()
             .flat_map(|net1| {
                 let mut net2 = net1.clone();
@@ -677,7 +665,8 @@ impl ColoredNet {
                 [net1, net2]
             })
             .collect();
-        let nets: Vec<_> = nets
+        // f_y
+        nets = nets
             .into_iter()
             .flat_map(|net1| {
                 let mut net2 = net1.clone();
@@ -685,7 +674,8 @@ impl ColoredNet {
                 [net1, net2]
             })
             .collect();
-        let nets: Vec<_> = nets
+        // f_x
+        nets = nets
             .into_iter()
             .flat_map(|net1| {
                 let mut net2 = net1.clone();
