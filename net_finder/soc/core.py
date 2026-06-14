@@ -5,8 +5,7 @@ from litescope import LiteScopeAnalyzer
 from litex.gen import *
 from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import *
-from migen.genlib.cdc import BusSynchronizer, MultiReg, PulseSynchronizer
-from migen.genlib.fifo import AsyncFIFO
+from migen.genlib.fifo import SyncFIFO
 
 from ..core import group
 from ..core.core import State
@@ -90,8 +89,10 @@ class CoreGroup(LiteXModule):
 
         self.specials += Instance(
             "core_group",
-            i_clk=ClockSignal("core"),
-            i_rst=ResetSignal("core"),
+            i_core_clk=ClockSignal("core"),
+            i_core_rst=ResetSignal("core"),
+            i_sys_clk=ClockSignal("sys"),
+            i_sys_rst=ResetSignal("sys"),
             i_sink__payload=raw_sink_payload.raw_bits(),
             i_sink__valid=self.sink.valid,
             o_sink__ready=self.sink.ready,
@@ -129,7 +130,7 @@ class CoreGroup(LiteXModule):
 
         out_first = Signal(reset=1)
         self.comb += self.source.first.eq(out_first)
-        self.sync.core += If(
+        self.sync.sys += If(
             self.source.valid & self.source.ready,
             # The next bit is the first bit of a packet whenever the bit we've just
             # outputted was the last bit of the previous packet.
@@ -173,22 +174,10 @@ class LookupManager(LiteXModule):
 
         # # #
 
-        addr = Signal.like(self.addr.storage)
-        data = Signal.like(self.data.storage)
-        sel = Signal.like(self.sel.storage)
-        en = Signal()
-
-        self.specials += MultiReg(self.addr.storage, addr, "core")
-        self.specials += MultiReg(self.data.storage, data, "core")
-        self.specials += MultiReg(self.sel.storage, sel, "core")
-        self.en_sync = PulseSynchronizer("sys", "core")
-        self.comb += self.en_sync.i.eq(self.sel.re)
-        self.comb += en.eq(self.en_sync.o)
-
         for i, port in enumerate(ports):
-            self.comb += port.addr.eq(addr)
-            self.comb += port.data.eq(data)
-            self.comb += port.en.eq(en & (sel == i))
+            self.comb += port.addr.eq(self.addr.storage)
+            self.comb += port.data.eq(self.data.storage)
+            self.comb += port.en.eq(self.sel.re & (self.sel.storage == i))
 
 
 class CoreManager(LiteXModule):
@@ -322,17 +311,15 @@ class CoreManager(LiteXModule):
         fifo_depth = 256
 
         # Code for getting finders from `input` to the cores.
-        input_fifo = AsyncFIFO(self.input.size, fifo_depth)
-        self.input_fifo = ClockDomainsRenamer({"write": "sys", "read": "core"})(
-            input_fifo
-        )
+        input_fifo = SyncFIFO(self.input.size, fifo_depth)
+        self.input_fifo = ClockDomainsRenamer("sys")(input_fifo)
 
         self.comb += self.input_fifo.din.eq(self.input.storage)
         self.comb += self.flow.fields.input_ready.eq(self.input_fifo.writable)
         self.comb += self.input_fifo.we.eq(self.input_submit.re)
 
         input_conv = Flatten(finder_bits)
-        self.input_conv = ClockDomainsRenamer("core")(input_conv)
+        self.input_conv = ClockDomainsRenamer("sys")(input_conv)
         self.comb += self.input_conv.source.connect(self.cores.sink)
 
         input_fifo_out = Record(
@@ -350,10 +337,8 @@ class CoreManager(LiteXModule):
         )
 
         # Code for getting finders from the cores to `output`.
-        output_fifo = AsyncFIFO(self.output.size, fifo_depth)
-        self.output_fifo = ClockDomainsRenamer({"write": "core", "read": "sys"})(
-            output_fifo
-        )
+        output_fifo = SyncFIFO(self.output.size, fifo_depth)
+        self.output_fifo = ClockDomainsRenamer("sys")(output_fifo)
 
         # Ideally I'd just set `self.output.status` directly instead of doing all this,
         # but it gets overridden by `self.output.fields`.
@@ -370,7 +355,7 @@ class CoreManager(LiteXModule):
         self.comb += self.flow.fields.output_valid.eq(self.output_fifo.readable)
         self.comb += self.output_fifo.re.eq(self.output_consume.re)
 
-        self.output_conv = ClockDomainsRenamer("core")(
+        self.output_conv = ClockDomainsRenamer("sys")(
             Collect(finder_bits, [("kind", 1)])
         )
         self.comb += self.cores.source.connect(self.output_conv.sink)
@@ -389,24 +374,15 @@ class CoreManager(LiteXModule):
             self.output_conv.source.valid & self.output_conv.source.ready
         )
 
-        self.specials += MultiReg(self.cores.active, self.active.status, "sys")
-        self.specials += MultiReg(self.req_pause.storage, self.cores.req_pause, "core")
-
-        self.split_finders_sync = BusSynchronizer(32, "core", "sys")
-        self.comb += self.split_finders_sync.i.eq(self.cores.split_finders)
-        self.comb += self.split_finders.status.eq(self.split_finders_sync.o)
-
-        self.completed_finders_sync = BusSynchronizer(32, "core", "sys")
-        self.comb += self.completed_finders_sync.i.eq(self.cores.completed_finders)
-        self.comb += self.completed_finders.status.eq(self.completed_finders_sync.o)
+        self.comb += self.active.status.eq(self.cores.active)
+        self.comb += self.cores.req_pause.eq(self.req_pause.storage)
+        self.comb += self.split_finders.status.eq(self.cores.split_finders)
+        self.comb += self.completed_finders.status.eq(self.cores.completed_finders)
 
         for state in State.__members__:
             csr = getattr(self, f"{state.lower()}_count")
             counter = getattr(self.cores, f"{state.lower()}_count")
-            sync = BusSynchronizer(64, "core", "sys")
-            setattr(self, f"{state.lower()}_count_sync", sync)
-            self.comb += sync.i.eq(counter)
-            self.comb += csr.status.eq(sync.o)
+            self.comb += csr.status.eq(counter)
 
         # Analyzer ---------------------------------------------------------------------------------
         if with_analyzer:
@@ -424,6 +400,6 @@ class CoreManager(LiteXModule):
             self.analyzer = LiteScopeAnalyzer(
                 analyzer_signals,
                 depth=512,
-                clock_domain="core",
+                clock_domain="sys",
                 csr_csv="core_mgr_analyzer.csv",
             )

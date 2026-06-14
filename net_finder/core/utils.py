@@ -1,3 +1,5 @@
+from typing import Any
+
 from amaranth import *
 from amaranth.hdl import ShapeLike, ValueLike
 from amaranth.lib import stream, wiring
@@ -166,3 +168,90 @@ class PipeReady(wiring.Component):
         m.d.comb += self.source.payload.eq(Mux(valid, payload, self.sink.payload))
 
         return m
+
+
+class StreamSync(wiring.Component):
+    """
+    Bridges a stream across two clock domains.
+
+    This makes use of _synchronous_ CDC, which only works if both clocks come from
+    the same PLL.
+    """
+
+    def __init__(self, payload_shape: ShapeLike, i_domain: str, o_domain: str):
+        super().__init__(
+            {
+                "sink": In(stream.Signature(payload_shape)),
+                "source": Out(stream.Signature(payload_shape)),
+            }
+        )
+
+        self._i_domain = i_domain
+        self._o_domain = o_domain
+
+    def elaborate(self, platform) -> Module:
+        m = Module()
+
+        m.d[self._o_domain] += self.source.payload.eq(self.sink.payload)
+
+        # Toggled each time a transaction is completed in o_domain.
+        o_next_trans_end = Signal(1)
+        o_trans_end = Signal(1)
+        i_o_trans_end = Signal(1)
+        i_prev_o_trans_end = Signal(1)
+
+        # Toggled each time a transaction begins (valid is asserted) in i_domain.
+        i_next_trans_start = Signal(1)
+        i_trans_start = Signal(1)
+        o_i_trans_start = Signal(1)
+        o_prev_i_trans_start = Signal(1)
+
+        i_prev_sink_valid = Signal(1)
+        i_prev_trans_end = Signal(1)
+
+        o_source_valid_comb = Signal(1)
+        o_source_valid_sync = Signal(1)
+
+        m.d[self._i_domain] += i_prev_sink_valid.eq(self.sink.valid)
+        m.d[self._i_domain] += i_prev_trans_end.eq(self.sink.valid & self.sink.ready)
+        with m.If((~i_prev_sink_valid | i_prev_trans_end) & self.sink.valid):
+            m.d.comb += i_next_trans_start.eq(~i_trans_start)
+        with m.Else():
+            m.d.comb += i_next_trans_start.eq(i_trans_start)
+        m.d[self._i_domain] += i_trans_start.eq(i_next_trans_start)
+
+        m.d[self._o_domain] += o_i_trans_start.eq(i_next_trans_start)
+        m.d[self._o_domain] += o_prev_i_trans_start.eq(o_i_trans_start)
+
+        with m.If(self.source.valid & self.source.ready):
+            m.d.comb += o_next_trans_end.eq(~o_trans_end)
+        with m.Else():
+            m.d.comb += o_next_trans_end.eq(o_trans_end)
+        m.d[self._o_domain] += o_trans_end.eq(o_next_trans_end)
+
+        m.d[self._i_domain] += i_o_trans_end.eq(o_next_trans_end)
+        m.d[self._i_domain] += i_prev_o_trans_end.eq(i_o_trans_end)
+
+        # The only way for the transaction to have ended in o_domain is if valid was
+        # asserted in i_domain, so if this fires we know that valid is set and don't
+        # have to worry about missing this signal.
+        m.d.comb += self.sink.ready.eq(i_o_trans_end != i_prev_o_trans_end)
+
+        m.d.comb += o_source_valid_comb.eq(o_i_trans_start != o_prev_i_trans_start)
+        with m.If(self.source.valid & self.source.ready):
+            m.d[self._o_domain] += o_source_valid_sync.eq(0)
+        with m.Else():
+            m.d[self._o_domain] += o_source_valid_sync.eq(self.source.valid)
+        m.d.comb += self.source.valid.eq(o_source_valid_comb | o_source_valid_sync)
+
+        return m
+
+
+def tree_sum(values: list[Any]):
+    if len(values) == 0:
+        return 0
+    elif len(values) == 1:
+        return values[0]
+    else:
+        mid = len(values) // 2
+        return tree_sum(values[:mid]) + tree_sum(values[mid:])

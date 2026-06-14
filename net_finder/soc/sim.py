@@ -295,7 +295,7 @@ def main():
     sys_clk_freq = int(10e6)
     sim_config = SimConfig()
     sim_config.add_clocker("sys_clk", freq_hz=sys_clk_freq)
-    sim_config.add_clocker("core_clk", freq_hz=0.8 * sys_clk_freq)
+    sim_config.add_clocker("core_clk", freq_hz=1.25 * sys_clk_freq)
     sim_config.add_module("serial2tcp", "serial", args={"port": 1111})
 
     # Configuration --------------------------------------------------------------------------------
@@ -327,6 +327,7 @@ def main():
         with_ethernet=args.with_ethernet,
         ethernet_phy_model=args.ethernet_phy_model,
         with_etherbone=args.with_etherbone,
+        etherbone_ip_address=args.local_ip,
         with_analyzer=args.with_analyzer,
         sim_debug=args.sim_debug,
         trace_reset_on=int(float(args.trace_start)) > 0

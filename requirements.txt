@@ -8,7 +8,7 @@ charset-normalizer==3.4.1
     # via requests
 colorama==0.4.6
     # via migen
-dearpygui==2.0.0
+dearpygui==2.3.1
     # via net-finder (pyproject.toml)
 idna==3.10
     # via requests
