@@ -8,7 +8,7 @@ dependencies = [
     "liteeth",
     "litepcie",
     "litescope",
-    "litex",
+    "litex @ git+https://github.com/Liamolucko/litex.git@2023.12-serial2tcp-fix",
     "litex-boards",
     "migen @ git+https://github.com/m-labs/migen.git@ccaee68e14d3636e1d8fb2e0864dd89b1b1f7384",
     "pytest",

@@ -28,7 +28,7 @@ litepcie==2023.12
     # via net-finder (pyproject.toml)
 litescope==2023.12
     # via net-finder (pyproject.toml)
-litex==2023.12
+litex @ git+https://github.com/Liamolucko/litex.git@fc5a353eeef232736dc9dbf30711a4d7bfe976cd
     # via
     #   net-finder (pyproject.toml)
     #   litedram
