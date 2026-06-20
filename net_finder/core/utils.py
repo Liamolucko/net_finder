@@ -23,7 +23,7 @@ def pipen(m: Module, input: ValueLike, n: int, domain="sync", **kwargs) -> Signa
 
     m.d[domain] += bufs[0].eq(input)
     for i in range(n - 1):
-        m.d[domain] += bufs[i + 1].eq(bufs[i + 1])
+        m.d[domain] += bufs[i + 1].eq(bufs[i])
     m.d.comb += output.eq(bufs[-1])
     return output
 

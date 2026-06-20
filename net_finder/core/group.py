@@ -86,12 +86,13 @@ class CoreGroup(wiring.Component):
 
         neighbour_lookup_read_ports = []
         for i, port in enumerate(self.neighbour_lookups):
+            neighbour_lookup_read_ports.append([])
             # If a memory has more than 16 ports, Vivado gives up on trying to implement it
             # properly regardless of what kinds of ports they are. Replicate it manually.
             for j in range(self._n):
                 neighbour_lookup = Memory(data=neighbour_lookup_layout(self._max_area))
                 m.submodules[f"neighbour_lookup_{i}_replica_{j}"] = neighbour_lookup
-                neighbour_lookup_read_ports.append(
+                neighbour_lookup_read_ports[i].append(
                     neighbour_lookup.read_port(domain="core")
                 )
 
@@ -148,10 +149,8 @@ class CoreGroup(wiring.Component):
                 cores.append(interface)
                 m.d.core += interface.req_pause.eq(self.req_pause)
 
-            for mem_port, core_port in zip(
-                neighbour_lookup_read_ports, core.neighbour_lookups
-            ):
-                wiring.connect(m, mem_port, core_port)
+            for j, port in enumerate(core.neighbour_lookups):
+                wiring.connect(m, neighbour_lookup_read_ports[j][i], port)
 
             for lookup, port in zip(undo_lookups, core.undo_lookups):
                 wiring.connect(m, lookup.read_port(), port)
@@ -210,8 +209,8 @@ class CoreGroup(wiring.Component):
 
         # Put a buffer in front of `output_merge` so that it's impossible for the
         # outputs of cores to affect the inputs of others.
-        pipe_valid = PipeValid(core_out_layout())
-        pipe_ready = PipeReady(core_out_layout())
+        pipe_valid = DomainRenamer("sys")(PipeValid(core_out_layout()))
+        pipe_ready = DomainRenamer("sys")(PipeReady(core_out_layout()))
         m.submodules.output_merge_pipe_valid = pipe_valid
         m.submodules.output_merge_pipe_ready = pipe_ready
         wiring.connect(m, output_merge.source, pipe_valid.sink)
