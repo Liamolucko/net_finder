@@ -1,9 +1,8 @@
-from typing import Any
-
 from amaranth import *
 from amaranth.hdl import ShapeLike, ValueLike
-from amaranth.lib import stream, wiring
+from amaranth.lib import data, stream, wiring
 from amaranth.lib.wiring import In, Out
+from amaranth.utils import ceil_log2
 
 
 def pipe(m: Module, input: ValueLike, **kwargs) -> Signal:
@@ -15,6 +14,20 @@ def pipe(m: Module, input: ValueLike, **kwargs) -> Signal:
     return output
 
 
+def pipen(m: Module, input: ValueLike, n: int, domain="sync", **kwargs) -> Signal:
+    # src_loc_at tells Signal how far up in the call chain to look for what to name
+    # the signal: so, setting it to 1 means we want it to use the name of the
+    # variable the caller's assigning our result to.
+    output = Signal.like(input, src_loc_at=1, **kwargs)
+    bufs = Signal(data.ArrayLayout(input.shape(), n))
+
+    m.d[domain] += bufs[0].eq(input)
+    for i in range(n - 1):
+        m.d[domain] += bufs[i + 1].eq(bufs[i + 1])
+    m.d.comb += output.eq(bufs[-1])
+    return output
+
+
 def sig(m: Module, input: ValueLike, **kwargs) -> Signal:
     """
     Rather than writing `sig = <expr>`, write `sig = sig(m, <expr>)`, since that
@@ -23,6 +36,19 @@ def sig(m: Module, input: ValueLike, **kwargs) -> Signal:
     output = Signal.like(input, src_loc_at=1, **kwargs)
     m.d.comb += output.eq(input)
     return output
+
+
+def tree_sum(nums):
+    if len(nums) == 0:
+        return 0
+    elif len(nums) == 1:
+        return nums[0]
+    else:
+        mid = len(nums) // 2
+        max = sum(2 ** sig.shape().width - 1 for sig in nums)
+        return (nums[0] + tree_sum(nums[1:mid]) + tree_sum(nums[mid:]))[
+            : ceil_log2(max + 1)
+        ]
 
 
 class SafeDemux(wiring.Component):
@@ -245,13 +271,3 @@ class StreamSync(wiring.Component):
         m.d.comb += self.source.valid.eq(o_source_valid_comb | o_source_valid_sync)
 
         return m
-
-
-def tree_sum(values: list[Any]):
-    if len(values) == 0:
-        return 0
-    elif len(values) == 1:
-        return values[0]
-    else:
-        mid = len(values) // 2
-        return tree_sum(values[:mid]) + tree_sum(values[mid:])

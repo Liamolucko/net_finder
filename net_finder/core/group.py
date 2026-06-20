@@ -8,14 +8,17 @@ from .core import Core, FinderType, State, core_in_layout, core_out_layout
 from .memory import ConfigMemory
 from .neighbour_lookup import neighbour_lookup_layout
 from .skip_checker import undo_lookup_layout
-from .utils import Merge, SafeDemux, StreamSync, tree_sum
+from .utils import Merge, PipeReady, PipeValid, SafeDemux, StreamSync, pipen, tree_sum
 
 # If we have any FPGA-spanning wires in the `core` clock domain (currently only
 # the case for measuring how many cycles were spent in each state), how many
 # buffers we should assert along those wires.
 #
 # We can increase this over time as our target clock speed gets higher.
-CORE_BUFS = 1
+CORE_BUFS = 2
+# If we have any FPGA-spanning wires in the `sys` clock domain, how many buffers
+# we should assert along those wires.
+SYS_BUFS = 1
 
 
 def core_group_out_layout():
@@ -28,6 +31,8 @@ def core_group_out_layout():
     )
 
 
+# TODO: splitting is looking really weird when running on the board, should probably investigate that
+# (this was written ages ago, idk if it's still true)
 class CoreGroup(wiring.Component):
     """
     A container for a bunch of `Core`s which provides roughly the same interface as
@@ -79,14 +84,25 @@ class CoreGroup(wiring.Component):
     def elaborate(self, platform) -> Module:
         m = Module()
 
-        neighbour_lookups = []
+        neighbour_lookup_read_ports = []
         for i, port in enumerate(self.neighbour_lookups):
-            neighbour_lookup = Memory(data=neighbour_lookup_layout(self._max_area))
-            m.submodules[f"neighbour_lookup_{i}"] = neighbour_lookup
-            wiring.connect(
-                m, neighbour_lookup.write_port(domain="sys"), wiring.flipped(port)
-            )
-            neighbour_lookups.append(neighbour_lookup)
+            # If a memory has more than 16 ports, Vivado gives up on trying to implement it
+            # properly regardless of what kinds of ports they are. Replicate it manually.
+            for j in range(self._n):
+                neighbour_lookup = Memory(data=neighbour_lookup_layout(self._max_area))
+                m.submodules[f"neighbour_lookup_{i}_replica_{j}"] = neighbour_lookup
+                neighbour_lookup_read_ports.append(
+                    neighbour_lookup.read_port(domain="core")
+                )
+
+                write_port = neighbour_lookup.write_port(domain="sys")
+                m.d.comb += write_port.en.eq(pipen(m, port.en, SYS_BUFS, domain="sys"))
+                m.d.comb += write_port.addr.eq(
+                    pipen(m, port.addr, SYS_BUFS, domain="sys")
+                )
+                m.d.comb += write_port.data.eq(
+                    pipen(m, port.data, SYS_BUFS, domain="sys")
+                )
 
         undo_lookups = []
         for i, port in enumerate(self.undo_lookups):
@@ -97,9 +113,15 @@ class CoreGroup(wiring.Component):
             # Since we're going from a slow clock domain to a fast clock domain, the worst
             # that could happen here is that we issue the same write for multiple cycles in
             # a row, which isn't a problem.
-            m.d.core += undo_lookup.write_port.en.eq(port.en)
-            m.d.core += undo_lookup.write_port.addr.eq(port.addr)
-            m.d.core += undo_lookup.write_port.data.eq(port.data)
+            m.d.core += undo_lookup.write_port.en.eq(
+                pipen(m, port.en, SYS_BUFS, domain="sys")
+            )
+            m.d.core += undo_lookup.write_port.addr.eq(
+                pipen(m, port.addr, SYS_BUFS, domain="sys")
+            )
+            m.d.core += undo_lookup.write_port.data.eq(
+                pipen(m, port.data, SYS_BUFS, domain="sys")
+            )
             undo_lookups.append(undo_lookup)
 
         # TODO: maybe rename to ifaces?
@@ -126,8 +148,10 @@ class CoreGroup(wiring.Component):
                 cores.append(interface)
                 m.d.core += interface.req_pause.eq(self.req_pause)
 
-            for lookup, port in zip(neighbour_lookups, core.neighbour_lookups):
-                wiring.connect(m, lookup.read_port(domain="core"), port)
+            for mem_port, core_port in zip(
+                neighbour_lookup_read_ports, core.neighbour_lookups
+            ):
+                wiring.connect(m, mem_port, core_port)
 
             for lookup, port in zip(undo_lookups, core.undo_lookups):
                 wiring.connect(m, lookup.read_port(), port)
@@ -140,9 +164,17 @@ class CoreGroup(wiring.Component):
             data.ArrayLayout(cores[0].base_decision.width, len(cores))
         )
         for i, core in enumerate(cores):
-            m.d.sys += wants_finders[i].eq(core.wants_finder)
-            m.d.sys += core_states[i].eq(core.state)
-            m.d.sys += core_base_decisions[i].eq(core.base_decision)
+            # The first buffer is to synchronise into `sys` in the first place, and the rest
+            # are to cross the FPGA.
+            m.d.comb += wants_finders[i].eq(
+                pipen(m, core.wants_finder, SYS_BUFS + 1, domain="sys")
+            )
+            m.d.comb += core_states[i].eq(
+                pipen(m, core.state, SYS_BUFS + 1, domain="sys")
+            )
+            m.d.comb += core_base_decisions[i].eq(
+                pipen(m, core.base_decision, SYS_BUFS + 1, domain="sys")
+            )
 
         output_mux = DomainRenamer("sys")(SafeDemux(core_out_layout(), 2))
         m.submodules.output_mux = output_mux
@@ -176,9 +208,18 @@ class CoreGroup(wiring.Component):
         output_merge = DomainRenamer("sys")(Merge(core_out_layout(), len(cores)))
         m.submodules.output_merge = output_merge
 
+        # Put a buffer in front of `output_merge` so that it's impossible for the
+        # outputs of cores to affect the inputs of others.
+        pipe_valid = PipeValid(core_out_layout())
+        pipe_ready = PipeReady(core_out_layout())
+        m.submodules.output_merge_pipe_valid = pipe_valid
+        m.submodules.output_merge_pipe_ready = pipe_ready
+        wiring.connect(m, output_merge.source, pipe_valid.sink)
+        wiring.connect(m, pipe_valid.source, pipe_ready.sink)
+
         for i in range(len(cores)):
             wiring.connect(m, core_sources[i], output_merge.sinks[i])
-        wiring.connect(m, output_merge.source, output_mux.sink)
+        wiring.connect(m, pipe_ready.source, output_mux.sink)
 
         m.d.comb += output_mux.sel.eq(output_mux.sink.p.type == FinderType.Split)
         # Which output something gets sent to is non-negotiable, we aren't going to
@@ -263,7 +304,9 @@ class CoreGroup(wiring.Component):
         for i, core in enumerate(cores):
             # Request that `splittee` split itself, assuming splitting is actually desired
             # in the first place.
-            m.d.core += core.req_split.eq((splittee == i) & split_wanted)
+            m.d.core += core.req_split.eq(
+                pipen(m, (splittee == i) & split_wanted, SYS_BUFS, domain="sys")
+            )
 
         # Add 1 to `split_finders` every time a split finder passes through `output_merge`.
         with m.If(
@@ -283,23 +326,21 @@ class CoreGroup(wiring.Component):
             )
         )
 
+        real_states = Signal(data.ArrayLayout(State, len(real_cores)))
+        for i, core in enumerate(real_cores):
+            m.d.comb += real_states[i].eq(
+                pipen(m, core.state, CORE_BUFS, domain="core")
+            )
         for name, state in State.__members__.items():
             counter = getattr(self, f"{name.lower()}_count")
-            state_bufs = Signal(
-                data.ArrayLayout(data.ArrayLayout(State, CORE_BUFS), len(real_cores))
+            core_counter = Signal.like(counter)
+            state_matches = Signal(len(real_cores))
+            for i in range(len(real_cores)):
+                m.d.core += state_matches[i].eq(real_states[i] == state)
+            m.d.core += core_counter.eq(
+                core_counter
+                + tree_sum([state_matches[i] for i in range(len(real_cores))])
             )
-            for i, core in enumerate(real_cores):
-                m.d.core += state_bufs[i][0].eq(core.state)
-                for j in range(CORE_BUFS - 1):
-                    m.d.core += state_bufs[i][j + 1].eq(state_bufs[i][j])
-            m.d.core += counter.eq(
-                counter
-                + tree_sum(
-                    [
-                        state_bufs[i][CORE_BUFS - 1] == state
-                        for i in range(len(real_cores))
-                    ]
-                )
-            )
+            m.d.sys += counter.eq(core_counter)
 
         return m

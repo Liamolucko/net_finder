@@ -9,7 +9,6 @@ from litex.soc.cores.xadc import XADC
 from litex.soc.integration.builder import *
 from litex.soc.integration.soc_core import *
 from litex_boards.platforms import sqrl_acorn
-from litex_boards.targets.sqrl_acorn import CRG
 
 from .core import CoreManager
 
@@ -51,6 +50,7 @@ class CRG(LiteXModule):
         pll.create_clkout(self.cd_sys, sys_clk_freq)
         pll.create_clkout(self.cd_core, core_clk_freq)
         pll.create_clkout(self.cd_idelay, 200e6)
+        # TODO: why not add a false path directly on those signals instead of between the entire clock domains?
         platform.add_false_path_constraints(
             self.cd_sys.clk, pll.clkin
         )  # Ignore sys_clk to pll.clkin path created by SoC's rst.
@@ -84,6 +84,9 @@ class SoC(SoCCore):
             **kwargs,
         )
 
+        platform.add_period_constraint(self.crg.cd_sys.clk, 1e9 / sys_clk_freq)
+        platform.add_period_constraint(self.crg.cd_core.clk, 1e9 / core_clk_freq)
+
         # XADC -------------------------------------------------------------------------------------
         self.xadc = XADC()
 
@@ -97,7 +100,6 @@ class SoC(SoCCore):
             platform, platform.request("pcie_x4"), data_width=128, bar0_size=0x20000
         )
         self.add_pcie(phy=self.pcie_phy, ndmas=0, address_width=64)
-        platform.add_period_constraint(self.crg.cd_sys.clk, 1e9 / sys_clk_freq)
 
         # ICAP (For FPGA reload over PCIe).
         from litex.soc.cores.icap import ICAP
@@ -175,7 +177,7 @@ def main():
         # timing (as well as making debugging timing much easier).
         #
         # Also this is an awful hacky way of doing it but I don't see an alternative.
-        vivado_synth_directive="default -flatten_hierarchy none",
+        vivado_synth_directive="default -global_retiming on",
     )
 
     args = parser.parse_args()

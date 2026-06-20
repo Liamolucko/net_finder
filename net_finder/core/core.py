@@ -504,6 +504,8 @@ class CoreNl(wiring.Component):
                 #
                 # hm, i guess it's not quite that simple since the base_decision is used to figure out which decision we can split on.
                 # you can solve that by just adding a counter of the number of 1s seen, though.
+                #
+                # another option would be not to store `decisions` at all, and instead keep track of how many 0s there were prior to each run stack entry
                 & (self.entry.decision_index < i.prefix.base_decision)
             ),
         )

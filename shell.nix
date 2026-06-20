@@ -27,7 +27,7 @@ let
     ];
   });
 in
-pkgs.libcxxStdenv.mkDerivation {
+pkgs.stdenv.mkDerivation {
   name = "nix-shell";
   venvDir = ".venv";
   nativeBuildInputs = [
