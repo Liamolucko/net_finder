@@ -27,6 +27,7 @@ let
     ];
   });
 in
+# set this to libcxxStdenv for fuzzing, regular stdenv for full-SoC simulation
 pkgs.stdenv.mkDerivation {
   name = "nix-shell";
   venvDir = ".venv";

@@ -145,6 +145,8 @@ def wb_if_layout(cuboids: int, max_area: int):
             "next_potential_len": range(max_potential_len(max_area) + 1),
             "next_decisions_len": range(max_decisions_len(max_area) + 1),
             "next_potential_areas": data.ArrayLayout(range(max_area + 1), cuboids),
+            # Whether the finder is now finished and we should reset.
+            "reset": 1,
         }
     )
 
@@ -278,9 +280,12 @@ class CoreIf(wiring.Component):
 
         # If WB stage processed its target, we can move on to the next one, otherwise we
         # need to keep trying to process `prev_target`.
-        m.d.comb += o.target.eq(
-            Mux(i.prev_target_processed, next_target, i.prev_target)
-        )
+        with m.If(i.reset):
+            m.d.comb += o.target.eq(0)
+        with m.Elif(i.prev_target_processed):
+            m.d.comb += o.target.eq(next_target)
+        with m.Else():
+            m.d.comb += o.target.eq(i.prev_target)
 
         backtrack = sig(
             m, (o.run_stack_len != 0) & (o.target.parent == o.run_stack_len)
@@ -329,73 +334,73 @@ class CoreIf(wiring.Component):
         decision_sent = sig(m, i.prev_sent & i.prev_prefix_done)
 
         m.d.comb += o.prefix.eq(i.next_prefix)
-        with m.Switch(i.prev_state):
-            with m.Case(State.Clear):
-                with m.If(i.prev_clear_index == shard_depth(self._max_area) - 1):
-                    m.d.comb += o.state.eq(State.Receive)
-                with m.Else():
-                    m.d.comb += o.state.eq(State.Clear)
-            with m.Case(State.Receive):
-                with m.If(i.prev_received & i.prev_in_data.last):
+        with m.If(i.reset):
+            m.d.comb += o.state.eq(State.Clear)
+        with m.Else():
+            with m.Switch(i.prev_state):
+                with m.Case(State.Clear):
+                    with m.If(i.prev_clear_index == shard_depth(self._max_area) - 1):
+                        m.d.comb += o.state.eq(State.Receive)
+                    with m.Else():
+                        m.d.comb += o.state.eq(State.Clear)
+                with m.Case(State.Receive):
+                    with m.If(i.prev_received & i.prev_in_data.last):
+                        run_transitions()
+                    with m.Else():
+                        m.d.comb += o.state.eq(State.Receive)
+                with m.Case(State.Run):
                     run_transitions()
-                with m.Else():
-                    m.d.comb += o.state.eq(State.Receive)
-            with m.Case(State.Run):
-                run_transitions()
-            with m.Case(State.Check):
-                all_squares_filled = sig(
-                    m,
-                    Cat(
-                        o.run_stack_len + o.potential_areas[k] == i.next_prefix.area
-                        for k in range(self._cuboids)
-                    ).all(),
-                )
-                with m.If(~i.prev_clearing & all_squares_filled):
-                    # All the squares are filled, which means we have a potential solution!
-                    m.d.comb += o.state.eq(State.Solution)
-                # Note: although `wb_potential_index` can only go up to `max_potential_len - 1`,
-                # this can go all the way up to `max_potential_len` thanks to Amaranth inferring
-                # a shape big enough to fit all possible values of `i.prev_potential_index +
-                # ~i.prev_clearing`.
-                with m.Elif(o.potential_index == o.potential_len):
-                    # We've run all the potential instructions and not all the squares are filled,
-                    # so this isn't a solution. Time to backtrack.
-                    run_transitions(allow_check=False)
-                with m.Else():
-                    m.d.comb += o.state.eq(State.Check)
-            with m.Case(State.Solution):
-                with m.If(
-                    (i.prev_finder_done | decision_sent)
-                    & (i.prev_decision_index == o.decisions_len - 1)
-                ):
-                    run_transitions(allow_check=False)
-                with m.Else():
-                    m.d.comb += o.state.eq(State.Solution)
-            with m.Case(State.Pause):
-                # We transition out of `State.Pause` via. `local_reset`, rather than via. a
-                # regular state transition.
-                m.d.comb += o.state.eq(State.Pause)
-            with m.Case(State.Split):
-                # We don't actually stop once the finder is sent like you might expect: since
-                # `base_decision` can't point to a 0, we have to keep going until we find a 1 to
-                # set it to, or hit the end of `decisions` if there aren't any.
-                with m.If(
-                    (i.prev_finder_done & i.prev_read_decision)
-                    | (
-                        (decision_sent | i.prev_finder_done)
-                        & (i.prev_decision_index == o.decisions_len - 1)
+                with m.Case(State.Check):
+                    all_squares_filled = sig(
+                        m,
+                        Cat(
+                            o.run_stack_len + o.potential_areas[k] == i.next_prefix.area
+                            for k in range(self._cuboids)
+                        ).all(),
                     )
-                ):
-                    run_transitions()
-                with m.Else():
-                    m.d.comb += o.state.eq(State.Split)
+                    with m.If(~i.prev_clearing & all_squares_filled):
+                        # All the squares are filled, which means we have a potential solution!
+                        m.d.comb += o.state.eq(State.Solution)
+                    # Note: although `wb_potential_index` can only go up to `max_potential_len - 1`,
+                    # this can go all the way up to `max_potential_len` thanks to Amaranth inferring
+                    # a shape big enough to fit all possible values of `i.prev_potential_index +
+                    # ~i.prev_clearing`.
+                    with m.Elif(o.potential_index == o.potential_len):
+                        # We've run all the potential instructions and not all the squares are filled,
+                        # so this isn't a solution. Time to backtrack.
+                        run_transitions(allow_check=False)
+                    with m.Else():
+                        m.d.comb += o.state.eq(State.Check)
+                with m.Case(State.Solution):
+                    with m.If(
+                        (i.prev_finder_done | decision_sent)
+                        & (i.prev_decision_index == o.decisions_len - 1)
+                    ):
+                        run_transitions(allow_check=False)
+                    with m.Else():
+                        m.d.comb += o.state.eq(State.Solution)
+                with m.Case(State.Pause):
+                    # We transition out of `State.Pause` via. `local_reset`, rather than via. a
+                    # regular state transition.
+                    m.d.comb += o.state.eq(State.Pause)
+                with m.Case(State.Split):
+                    # We don't actually stop once the finder is sent like you might expect: since
+                    # `base_decision` can't point to a 0, we have to keep going until we find a 1 to
+                    # set it to, or hit the end of `decisions` if there aren't any.
+                    with m.If(
+                        (i.prev_finder_done & i.prev_read_decision)
+                        | (
+                            (decision_sent | i.prev_finder_done)
+                            & (i.prev_decision_index == o.decisions_len - 1)
+                        )
+                    ):
+                        run_transitions()
+                    with m.Else():
+                        m.d.comb += o.state.eq(State.Split)
 
-        # We only get to Clear state via. resetting, which will reset this to 0 anyway:
-        # so the only time we actually need to reset it is when exiting Check state so
-        # that we don't waste time clearing addresses the potential surfaces don't have.
         m.d.comb += o.clear_index.eq(
             Mux(
-                (i.prev_state == State.Check) & (o.state != State.Check),
+                i.reset | ((i.prev_state == State.Check) & (o.state != State.Check)),
                 0,
                 i.prev_clear_index + 1,
             )
@@ -490,44 +495,22 @@ class CoreNl(wiring.Component):
         i = self.i
         o = self.o
 
-        local_reset = sig(
-            m,
-            (
-                (i.state == State.Pause)
-                & (i.prefix_bits_left == 0)
-                & (i.decision_index == i.decisions_len)
-            )
-            | (
-                (i.task == Task.Backtrack)
-                # TODO: hey, we could figure this out sooner if we made base_decision an index in the run stack instead.
-                # more importantly, we could avoid having to scan for the next 1 when splitting.
-                #
-                # hm, i guess it's not quite that simple since the base_decision is used to figure out which decision we can split on.
-                # you can solve that by just adding a counter of the number of 1s seen, though.
-                #
-                # another option would be not to store `decisions` at all, and instead keep track of how many 0s there were prior to each run stack entry
-                & (self.entry.decision_index < i.prefix.base_decision)
-            ),
-        )
-
-        m.d.comb += o.state.eq(Mux(local_reset, State.Clear, i.state))
+        m.d.comb += o.state.eq(i.state)
         m.d.comb += o.prefix.eq(i.prefix)
-        m.d.comb += o.prefix_bits_left.eq(
-            Mux(local_reset, o.prefix.shape().size, i.prefix_bits_left)
-        )
-        m.d.comb += o.run_stack_len.eq(Mux(local_reset, 0, i.run_stack_len))
-        m.d.comb += o.potential_len.eq(Mux(local_reset, 0, i.potential_len))
-        m.d.comb += o.decisions_len.eq(Mux(local_reset, 0, i.decisions_len))
-        m.d.comb += o.potential_areas.eq(Mux(local_reset, 0, i.potential_areas))
+        m.d.comb += o.prefix_bits_left.eq(i.prefix_bits_left)
+        m.d.comb += o.run_stack_len.eq(i.run_stack_len)
+        m.d.comb += o.potential_len.eq(i.potential_len)
+        m.d.comb += o.decisions_len.eq(i.decisions_len)
+        m.d.comb += o.potential_areas.eq(i.potential_areas)
         m.d.comb += o.prefix_done.eq(o.prefix_bits_left == 0)
-        m.d.comb += o.target.eq(Mux(local_reset, 0, i.target))
+        m.d.comb += o.target.eq(i.target)
         m.d.comb += o.potential_index.eq(i.potential_index)
         m.d.comb += o.decision_index.eq(i.decision_index)
-        m.d.comb += o.clear_index.eq(Mux(local_reset, 0, i.clear_index))
+        m.d.comb += o.clear_index.eq(i.clear_index)
         m.d.comb += o.child_index.eq(i.child_index)
         m.d.comb += o.in_rdy.eq(i.in_rdy)
         m.d.comb += o.in_data.eq(i.in_data)
-        m.d.comb += o.task.eq(Mux(local_reset, Task.Clear, i.task))
+        m.d.comb += o.task.eq(i.task)
         m.d.comb += o.entry.eq(self.entry)
 
         m.d.comb += self.pipeline_entry.eq(o.entry)
@@ -677,6 +660,19 @@ class CoreWb(wiring.Component):
         i = self.i
         o = self.o
 
+        m.d.comb += o.reset.eq(
+            (
+                (i.state == State.Pause)
+                & i.prefix_done
+                & (i.decision_index == i.decisions_len - 1)
+                & self.out_fifo_rdy
+            )
+            | (
+                (i.task == Task.Backtrack)
+                & (i.entry.decision_index < i.prefix.base_decision)
+            )
+        )
+
         m.d.comb += o.prev_state.eq(i.state)
         m.d.comb += o.prev_prefix_done.eq(i.prefix_done)
         m.d.comb += o.prev_target.eq(i.target)
@@ -745,11 +741,7 @@ class CoreWb(wiring.Component):
             )
         )
         m.d.comb += self.out_fifo_data.last.eq(
-            Mux(
-                i.prefix_done,
-                (i.decision_index == i.decisions_len - 1) | split_reached,
-                (i.decisions_len == 0) & (i.prefix_bits_left == 1),
-            )
+            i.prefix_done & ((i.decision_index == i.decisions_len - 1) | split_reached)
         )
         with m.Switch(i.state):
             with m.Case(State.Solution):
@@ -761,7 +753,7 @@ class CoreWb(wiring.Component):
             # It doesn't really matter what this is in other states, leave it as 0.
 
         m.d.comb += self.out_fifo_en.eq(sent)
-        m.d.comb += self.stepping.eq(run | (i.task == Task.Backtrack))
+        m.d.comb += self.stepping.eq(run | ((i.task == Task.Backtrack) & ~o.reset))
 
         last_child = sig(m, i.target.child_index == sum(i.entry.children) - 1)
         normalised_target = Signal.like(i.target)
@@ -826,6 +818,7 @@ class CoreWb(wiring.Component):
             Mux(
                 ((i.state == State.Receive) & ~(i.in_data.last & received))
                 | ((i.state == State.Solution) & ~(self.out_fifo_data.last & sent))
+                # We can let Clear state reset this for us when we reset.
                 | (i.state == State.Pause)
                 | (
                     (i.state == State.Split)
@@ -858,31 +851,37 @@ class CoreWb(wiring.Component):
         ):
             m.d.comb += o.next_prefix.base_decision.eq(i.decisions_len)
 
-        with m.If(i.task == Task.Backtrack):
+        with m.If(o.reset):
+            m.d.comb += o.next_run_stack_len.eq(0)
+            m.d.comb += o.next_potential_len.eq(0)
+        with m.Elif(i.task == Task.Backtrack):
             m.d.comb += o.next_run_stack_len.eq(i.run_stack_len - 1)
             m.d.comb += o.next_potential_len.eq(i.entry.potential_len)
         with m.Else():
             m.d.comb += o.next_run_stack_len.eq(i.run_stack_len + run)
             m.d.comb += o.next_potential_len.eq(i.potential_len + potential)
 
-        with m.Switch(i.state):
-            with m.Case(State.Receive):
-                m.d.comb += o.next_decisions_len.eq(
-                    i.decisions_len + (received & i.prefix_done)
-                )
-            with m.Case(State.Run):
-                with m.If(i.task == Task.Backtrack):
-                    m.d.comb += o.next_decisions_len.eq(i.entry.decision_index + 1)
-                with m.Else():
-                    m.d.comb += o.next_decisions_len.eq(i.decisions_len + run)
-            with m.Default():
-                m.d.comb += o.next_decisions_len.eq(i.decisions_len)
+        with m.If(o.reset):
+            m.d.comb += o.next_decisions_len.eq(0)
+        with m.Else():
+            with m.Switch(i.state):
+                with m.Case(State.Receive):
+                    m.d.comb += o.next_decisions_len.eq(
+                        i.decisions_len + (received & i.prefix_done)
+                    )
+                with m.Case(State.Run):
+                    with m.If(i.task == Task.Backtrack):
+                        m.d.comb += o.next_decisions_len.eq(i.entry.decision_index + 1)
+                    with m.Else():
+                        m.d.comb += o.next_decisions_len.eq(i.decisions_len + run)
+                with m.Default():
+                    m.d.comb += o.next_decisions_len.eq(i.decisions_len)
 
         for k in range(self._cuboids):
             read_data = self.potential_surface_data[k]
             write_port = self.potential_surface_writes[k]
             with m.If(i.state == State.Clear):
-                m.d.comb += o.next_potential_areas[k].eq(i.potential_areas[k])
+                m.d.comb += o.next_potential_areas[k].eq(0)
             with m.Elif(write_port.en & (read_data == 0) & (write_port.data == 1)):
                 m.d.comb += o.next_potential_areas[k].eq(i.potential_areas[k] + 1)
             with m.Elif(write_port.en & (read_data == 1) & (write_port.data == 0)):
@@ -966,6 +965,9 @@ class Core(wiring.Component):
         m.submodules.potential = potential
         potential_read, potential_write = potential.sdp_port(read_domain="comb")
 
+        # TODO: perhaps we could avoid storing `decisions` at all, and instead keep track of how many 0s there were prior to each run stack entry
+        #
+        # note that you would then have to store both base_decision and the matching run stack index (or you could add a bit to the run stack entry)
         decisions = ChunkedMemory(
             shape=1, depth=max_decisions_len(self._max_area), chunks=FINDERS_PER_CORE
         )

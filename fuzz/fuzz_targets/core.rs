@@ -75,8 +75,9 @@ fn main<const CUBOIDS: usize>(
     ctx: &FinderCtx<CUBOIDS>,
     input: [(u16, Vec<bool>, NonZero<u8>, u8, u8); 4],
 ) -> anyhow::Result<()> {
-    let core_ctx = VerilatedContext::new(false);
-    let core = Core::new(&core_ctx, None);
+    let trace = env::var_os("TRACE").is_some();
+    let core_ctx = VerilatedContext::new(trace);
+    let core = Core::new(&core_ctx, trace.then_some(c"core.fst"));
     core.reset();
     core.fill_mems(&ctx);
 

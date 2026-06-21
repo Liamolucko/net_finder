@@ -105,25 +105,22 @@ class CoreGroup(wiring.Component):
                     pipen(m, port.data, SYS_BUFS, domain="sys")
                 )
 
-        undo_lookups = []
+        undo_lookup_read_ports = []
         for i, port in enumerate(self.undo_lookups):
-            undo_lookup = DomainRenamer("core")(
-                ConfigMemory(data=undo_lookup_layout(self._max_area))
-            )
-            m.submodules[f"undo_lookup_{i}"] = undo_lookup
-            # Since we're going from a slow clock domain to a fast clock domain, the worst
-            # that could happen here is that we issue the same write for multiple cycles in
-            # a row, which isn't a problem.
-            m.d.core += undo_lookup.write_port.en.eq(
-                pipen(m, port.en, SYS_BUFS, domain="sys")
-            )
-            m.d.core += undo_lookup.write_port.addr.eq(
-                pipen(m, port.addr, SYS_BUFS, domain="sys")
-            )
-            m.d.core += undo_lookup.write_port.data.eq(
-                pipen(m, port.data, SYS_BUFS, domain="sys")
-            )
-            undo_lookups.append(undo_lookup)
+            undo_lookup_read_ports.append([])
+            for j in range(self._n):
+                undo_lookup = Memory(data=undo_lookup_layout(self._max_area))
+                m.submodules[f"undo_lookup_{i}_replica_{j}"] = undo_lookup
+                undo_lookup_read_ports[i].append(undo_lookup.read_port(domain="core"))
+
+                write_port = undo_lookup.write_port(domain="sys")
+                m.d.comb += write_port.en.eq(pipen(m, port.en, SYS_BUFS, domain="sys"))
+                m.d.comb += write_port.addr.eq(
+                    pipen(m, port.addr, SYS_BUFS, domain="sys")
+                )
+                m.d.comb += write_port.data.eq(
+                    pipen(m, port.data, SYS_BUFS, domain="sys")
+                )
 
         # TODO: maybe rename to ifaces?
         cores = []
@@ -152,8 +149,8 @@ class CoreGroup(wiring.Component):
             for j, port in enumerate(core.neighbour_lookups):
                 wiring.connect(m, neighbour_lookup_read_ports[j][i], port)
 
-            for lookup, port in zip(undo_lookups, core.undo_lookups):
-                wiring.connect(m, lookup.read_port(), port)
+            for j, port in enumerate(core.undo_lookups):
+                wiring.connect(m, undo_lookup_read_ports[j][i], port)
 
             real_cores.append(core)
 
@@ -333,13 +330,11 @@ class CoreGroup(wiring.Component):
         for name, state in State.__members__.items():
             counter = getattr(self, f"{name.lower()}_count")
             core_counter = Signal.like(counter)
-            state_matches = Signal(len(real_cores))
-            for i in range(len(real_cores)):
-                m.d.core += state_matches[i].eq(real_states[i] == state)
-            m.d.core += core_counter.eq(
-                core_counter
-                + tree_sum([state_matches[i] for i in range(len(real_cores))])
+            num_matches = Signal(range(len(real_cores) + 1))
+            m.d.core += num_matches.eq(
+                tree_sum([real_states[i] == state for i in range(len(real_cores))])
             )
+            m.d.core += core_counter.eq(core_counter + num_matches)
             m.d.sys += counter.eq(core_counter)
 
         return m
