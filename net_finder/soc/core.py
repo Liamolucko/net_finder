@@ -5,7 +5,7 @@ from litescope import LiteScopeAnalyzer
 from litex.gen import *
 from litex.soc.interconnect import stream
 from litex.soc.interconnect.csr import *
-from migen.genlib.fifo import SyncFIFO
+from migen.genlib.fifo import SyncFIFOBuffered
 
 from ..core import group
 from ..core.core import State
@@ -311,7 +311,7 @@ class CoreManager(LiteXModule):
         fifo_depth = 256
 
         # Code for getting finders from `input` to the cores.
-        input_fifo = SyncFIFO(self.input.size, fifo_depth)
+        input_fifo = SyncFIFOBuffered(self.input.size, fifo_depth)
         self.input_fifo = ClockDomainsRenamer("sys")(input_fifo)
 
         self.comb += self.input_fifo.din.eq(self.input.storage)
@@ -337,7 +337,7 @@ class CoreManager(LiteXModule):
         )
 
         # Code for getting finders from the cores to `output`.
-        output_fifo = SyncFIFO(self.output.size, fifo_depth)
+        output_fifo = SyncFIFOBuffered(self.output.size, fifo_depth)
         self.output_fifo = ClockDomainsRenamer("sys")(output_fifo)
 
         # Ideally I'd just set `self.output.status` directly instead of doing all this,

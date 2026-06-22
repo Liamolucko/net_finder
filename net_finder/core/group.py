@@ -330,7 +330,10 @@ class CoreGroup(wiring.Component):
         for name, state in State.__members__.items():
             counter = getattr(self, f"{name.lower()}_count")
             core_counter = Signal.like(counter)
+            state_matches = Signal(len(real_cores))
             num_matches = Signal(range(len(real_cores) + 1))
+            for i in range(len(real_cores)):
+                m.d.core += state_matches[i].eq(real_states[i] == state)
             m.d.core += num_matches.eq(
                 tree_sum([real_states[i] == state for i in range(len(real_cores))])
             )

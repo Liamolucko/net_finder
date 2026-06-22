@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 
 from litepcie.phy.s7pciephy import S7PCIEPHY
 from litepcie.software import generate_litepcie_software
@@ -13,9 +14,72 @@ from litex_boards.platforms import sqrl_acorn
 from .core import CoreManager
 
 
+@dataclass
+class PBlock:
+    slice_start_x: int
+    slice_start_y: int
+    slice_end_x: int
+    slice_end_y: int
+    # In terms of RAMB36s; we multiply the y positions by 2 to get the RAMB18 coordinates.
+    bram_start_x: int
+    bram_start_y: int
+    bram_end_x: int
+    bram_end_y: int
+
+    def slices(self):
+        return (self.slice_end_x - self.slice_start_x + 1) * (
+            self.slice_end_y - self.slice_start_y + 1
+        )
+
+    def luts(self):
+        return 4 * self.slices()
+
+
+PBLOCKS = [
+    PBlock(0, 100, 23, 249, 0, 20, 1, 49),
+    PBlock(0, 0, 51, 99, 0, 0, 2, 19),
+    PBlock(52, 50, 113, 74, 3, 10, 6, 14),
+    PBlock(52, 175, 113, 199, 3, 35, 6, 39),
+    PBlock(114, 0, 163, 249, 7, 0, 8, 49),
+]
+CORE_LUTS = 1476
+CORES = sum(pblock.luts() // CORE_LUTS for pblock in PBLOCKS)
+
+
 class Platform(sqrl_acorn.Platform):
     def __init__(self, variant="cle-215"):
         super().__init__(variant=variant)
+
+        cores_allocated = 0
+        for i, pblock in enumerate(PBLOCKS):
+            self.toolchain.pre_placement_commands.add(f"create_pblock pblock_cores_{i}")
+
+            start_slice = f"SLICE_X{pblock.slice_start_x}Y{pblock.slice_start_y}"
+            end_slice = f"SLICE_X{pblock.slice_end_x}Y{pblock.slice_end_y}"
+            start_ramb18 = f"RAMB18_X{pblock.bram_start_x}Y{2 * pblock.bram_start_y}"
+            end_ramb18 = f"RAMB18_X{pblock.bram_end_x}Y{2 * pblock.bram_end_y + 1}"
+            start_ramb36 = f"RAMB36_X{pblock.bram_start_x}Y{pblock.bram_start_y}"
+            end_ramb36 = f"RAMB36_X{pblock.bram_end_x}Y{pblock.bram_end_y}"
+
+            # We need 8 curly brackets to survive the processing by the f-strings and the
+            # two rounds (sigh) of processing done by LiteX.
+            self.toolchain.pre_placement_commands.add(
+                f"resize_pblock [get_pblocks pblock_cores_{i}] -add {{{{{{{{{start_slice}:{end_slice}}}}}}}}}"
+            )
+            self.toolchain.pre_placement_commands.add(
+                f"resize_pblock [get_pblocks pblock_cores_{i}] -add {{{{{{{{{start_ramb18}:{end_ramb18}}}}}}}}}"
+            )
+            self.toolchain.pre_placement_commands.add(
+                f"resize_pblock [get_pblocks pblock_cores_{i}] -add {{{{{{{{{start_ramb36}:{end_ramb36}}}}}}}}}"
+            )
+
+            cores = pblock.luts() // CORE_LUTS
+            for _ in range(cores):
+                # TODO: put in_sync / out_sync / synchroniser flip-flops in here too? Right now they seem to be getting placed quite far away
+                self.toolchain.pre_placement_commands.add(
+                    f"add_cells_to_pblock [get_pblocks pblock_cores_{i}] [get_cells -quiet [list core_group/core_{cores_allocated}]]"
+                )
+                cores_allocated += 1
 
         self.toolchain.bitstream_commands += [
             "set_property BITSTREAM.CONFIG.OVERTEMPPOWERDOWN ENABLE [current_design]",
@@ -65,8 +129,8 @@ class SoC(SoCCore):
         max_area: int,
         cores: int,
         variant="cle-215",
-        sys_clk_freq=66.67e6,
-        core_clk_freq=60e6,
+        sys_clk_freq=50e6,
+        core_clk_freq=100e6,
         with_analyzer: bool = False,
         **kwargs,
     ):
@@ -138,10 +202,10 @@ def main():
         help="Board variant (cle-215+, cle-215 or cle-101).",
     )
     parser.add_target_argument(
-        "--sys-clk-freq", default=56.25e6, type=float, help="System clock frequency."
+        "--sys-clk-freq", default=50e6, type=float, help="System clock frequency."
     )
     parser.add_target_argument(
-        "--core-clk-freq", default=56.25e6, type=float, help="Core clock frequency."
+        "--core-clk-freq", default=100e6, type=float, help="Core clock frequency."
     )
     parser.add_target_argument(
         "--driver", action="store_true", help="Generate PCIe driver."
@@ -157,9 +221,6 @@ def main():
         default=64,
         type=int,
         help="The maximum area of cuboids to find common nets of.",
-    )
-    parser.add_target_argument(
-        "--cores", default=75, type=int, help="The number of cores to include."
     )
     parser.add_argument(
         "--with-analyzer", action="store_true", help="Enable Analyzer support."
@@ -177,7 +238,7 @@ def main():
         # timing (as well as making debugging timing much easier).
         #
         # Also this is an awful hacky way of doing it but I don't see an alternative.
-        vivado_synth_directive="default -global_retiming on",
+        vivado_synth_directive="default -flatten_hierarchy none -global_retiming on",
     )
 
     args = parser.parse_args()
@@ -188,7 +249,7 @@ def main():
         core_clk_freq=args.core_clk_freq,
         cuboids=args.cuboids,
         max_area=args.max_area,
-        cores=args.cores,
+        cores=CORES,
         with_analyzer=args.with_analyzer,
         **parser.soc_argdict,
     )
