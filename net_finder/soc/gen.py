@@ -36,7 +36,7 @@ class PBlock:
 
 
 PBLOCKS = [
-    PBlock(0, 100, 23, 249, 0, 20, 1, 49),
+    PBlock(0, 100, 23, 199, 0, 20, 1, 39),
     PBlock(0, 0, 51, 99, 0, 0, 2, 19),
     PBlock(52, 50, 113, 74, 3, 10, 6, 14),
     PBlock(52, 175, 113, 199, 3, 35, 6, 39),
@@ -114,10 +114,6 @@ class CRG(LiteXModule):
         pll.create_clkout(self.cd_sys, sys_clk_freq)
         pll.create_clkout(self.cd_core, core_clk_freq)
         pll.create_clkout(self.cd_idelay, 200e6)
-        # TODO: why not add a false path directly on those signals instead of between the entire clock domains?
-        platform.add_false_path_constraints(
-            self.cd_sys.clk, pll.clkin
-        )  # Ignore sys_clk to pll.clkin path created by SoC's rst.
 
         self.idelayctrl = S7IDELAYCTRL(self.cd_idelay)
 
@@ -147,9 +143,6 @@ class SoC(SoCCore):
             ident="net-finder LiteX SoC on Acorn CLE-101/215(+)",
             **kwargs,
         )
-
-        platform.add_period_constraint(self.crg.cd_sys.clk, 1e9 / sys_clk_freq)
-        platform.add_period_constraint(self.crg.cd_core.clk, 1e9 / core_clk_freq)
 
         # XADC -------------------------------------------------------------------------------------
         self.xadc = XADC()

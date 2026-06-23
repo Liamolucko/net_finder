@@ -295,7 +295,7 @@ def main():
     sys_clk_freq = int(10e6)
     sim_config = SimConfig()
     sim_config.add_clocker("sys_clk", freq_hz=sys_clk_freq)
-    sim_config.add_clocker("core_clk", freq_hz=1.25 * sys_clk_freq)
+    sim_config.add_clocker("core_clk", freq_hz=2 * sys_clk_freq)
     sim_config.add_module("serial2tcp", "serial", args={"port": 1111})
 
     # Configuration --------------------------------------------------------------------------------

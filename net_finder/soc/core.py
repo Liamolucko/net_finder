@@ -389,11 +389,10 @@ class CoreManager(LiteXModule):
             analyzer_signals = [
                 self.cores.sink,
                 self.cores.source,
+                *(self.cores.neighbour_lookups[i] for i in range(cuboids)),
+                *(self.cores.undo_lookups[i] for i in range(cuboids - 1)),
                 self.cores.req_pause,
                 self.cores.active,
-                self.cores.input_merge.source,
-                self.cores.output_merge.source,
-                self.cores.output_mux.source1,
                 self.input_conv.sink,
                 self.output_conv.source,
             ]

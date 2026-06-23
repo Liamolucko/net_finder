@@ -373,8 +373,7 @@ class CoreIf(wiring.Component):
                         m.d.comb += o.state.eq(State.Check)
                 with m.Case(State.Solution):
                     with m.If(
-                        (i.prev_finder_done | decision_sent)
-                        & (i.prev_decision_index == o.decisions_len - 1)
+                        decision_sent & (i.prev_decision_index == o.decisions_len - 1)
                     ):
                         run_transitions(allow_check=False)
                     with m.Else():
