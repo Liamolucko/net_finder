@@ -105,22 +105,25 @@ class CoreGroup(wiring.Component):
                     pipen(m, port.data, SYS_BUFS, domain="sys")
                 )
 
-        undo_lookup_read_ports = []
+        undo_lookups = []
         for i, port in enumerate(self.undo_lookups):
-            undo_lookup_read_ports.append([])
-            for j in range(self._n):
-                undo_lookup = Memory(data=undo_lookup_layout(self._max_area))
-                m.submodules[f"undo_lookup_{i}_replica_{j}"] = undo_lookup
-                undo_lookup_read_ports[i].append(undo_lookup.read_port(domain="core"))
-
-                write_port = undo_lookup.write_port(domain="sys")
-                m.d.comb += write_port.en.eq(pipen(m, port.en, SYS_BUFS, domain="sys"))
-                m.d.comb += write_port.addr.eq(
-                    pipen(m, port.addr, SYS_BUFS, domain="sys")
-                )
-                m.d.comb += write_port.data.eq(
-                    pipen(m, port.data, SYS_BUFS, domain="sys")
-                )
+            undo_lookup = DomainRenamer("core")(
+                ConfigMemory(data=undo_lookup_layout(self._max_area))
+            )
+            m.submodules[f"undo_lookup_{i}"] = undo_lookup
+            # Since we're going from a slow clock domain to a fast clock domain, the worst
+            # that could happen here is that we issue the same write for multiple cycles in
+            # a row, which isn't a problem.
+            m.d.core += undo_lookup.write_port.en.eq(
+                pipen(m, port.en, SYS_BUFS, domain="sys")
+            )
+            m.d.core += undo_lookup.write_port.addr.eq(
+                pipen(m, port.addr, SYS_BUFS, domain="sys")
+            )
+            m.d.core += undo_lookup.write_port.data.eq(
+                pipen(m, port.data, SYS_BUFS, domain="sys")
+            )
+            undo_lookups.append(undo_lookup)
 
         # TODO: maybe rename to ifaces?
         cores = []
@@ -132,16 +135,22 @@ class CoreGroup(wiring.Component):
             m.submodules[f"core_{i}"] = core
 
             for j, interface in enumerate(core.interfaces):
+                in_pipe_valid = DomainRenamer("sys")(PipeValid(core_in_layout()))
                 in_sync = StreamSync(core_in_layout(), "sys", "core")
                 out_sync = StreamSync(core_out_layout(), "core", "sys")
+                out_pipe_ready = DomainRenamer("sys")(PipeReady(core_out_layout()))
 
+                m.submodules[f"core_{i}_in_pipe_valid_{j}"] = in_pipe_valid
                 m.submodules[f"core_{i}_in_sync_{j}"] = in_sync
                 m.submodules[f"core_{i}_out_sync_{j}"] = out_sync
+                m.submodules[f"core_{i}_out_pipe_ready_{j}"] = out_pipe_ready
 
+                wiring.connect(m, in_pipe_valid.source, in_sync.sink)
                 wiring.connect(m, in_sync.source, interface.sink)
                 wiring.connect(m, interface.source, out_sync.sink)
-                core_sinks.append(in_sync.sink)
-                core_sources.append(out_sync.source)
+                wiring.connect(m, out_sync.source, out_pipe_ready.sink)
+                core_sinks.append(in_pipe_valid.sink)
+                core_sources.append(out_pipe_ready.source)
 
                 cores.append(interface)
                 m.d.core += interface.req_pause.eq(self.req_pause)
@@ -149,8 +158,8 @@ class CoreGroup(wiring.Component):
             for j, port in enumerate(core.neighbour_lookups):
                 wiring.connect(m, neighbour_lookup_read_ports[j][i], port)
 
-            for j, port in enumerate(core.undo_lookups):
-                wiring.connect(m, undo_lookup_read_ports[j][i], port)
+            for lookup, port in zip(undo_lookups, core.undo_lookups):
+                wiring.connect(m, lookup.read_port(), port)
 
             real_cores.append(core)
 

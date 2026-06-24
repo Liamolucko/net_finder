@@ -1,5 +1,7 @@
 import os
 from dataclasses import dataclass
+from math import floor
+from os import path
 
 from litepcie.phy.s7pciephy import S7PCIEPHY
 from litepcie.software import generate_litepcie_software
@@ -12,6 +14,9 @@ from litex.soc.integration.soc_core import *
 from litex_boards.platforms import sqrl_acorn
 
 from .core import CoreManager
+
+CORE_LUTS = 1477
+CORE_BRAMS = 3.5
 
 
 @dataclass
@@ -34,52 +39,33 @@ class PBlock:
     def luts(self):
         return 4 * self.slices()
 
+    def brams(self):
+        return (self.bram_end_x - self.bram_start_x + 1) * (
+            self.bram_end_y - self.bram_start_y + 1
+        )
+
+    def cores(self):
+        return min(self.luts() // CORE_LUTS, floor(self.brams() / CORE_BRAMS))
+
 
 PBLOCKS = [
+    PBlock(0, 200, 15, 249, 0, 40, 0, 49),
     PBlock(0, 100, 23, 199, 0, 20, 1, 39),
-    PBlock(0, 0, 51, 99, 0, 0, 2, 19),
-    PBlock(52, 50, 113, 74, 3, 10, 6, 14),
-    PBlock(52, 175, 113, 199, 3, 35, 6, 39),
+    # The distribution of SLICEMs is uneven here, divide it up into columns which
+    # each have enough to stop cores accidentally starving each other.
+    PBlock(0, 0, 31, 99, 0, 0, 1, 19),
+    PBlock(32, 0, 51, 99, 2, 0, 2, 19),
+    #
+    PBlock(52, 50, 113, 99, 3, 10, 6, 19),
+    PBlock(52, 150, 113, 199, 3, 30, 6, 39),
     PBlock(114, 0, 163, 249, 7, 0, 8, 49),
 ]
-CORE_LUTS = 1476
-CORES = sum(pblock.luts() // CORE_LUTS for pblock in PBLOCKS)
+CORES = sum(pblock.cores() for pblock in PBLOCKS)
 
 
 class Platform(sqrl_acorn.Platform):
     def __init__(self, variant="cle-215"):
         super().__init__(variant=variant)
-
-        cores_allocated = 0
-        for i, pblock in enumerate(PBLOCKS):
-            self.toolchain.pre_placement_commands.add(f"create_pblock pblock_cores_{i}")
-
-            start_slice = f"SLICE_X{pblock.slice_start_x}Y{pblock.slice_start_y}"
-            end_slice = f"SLICE_X{pblock.slice_end_x}Y{pblock.slice_end_y}"
-            start_ramb18 = f"RAMB18_X{pblock.bram_start_x}Y{2 * pblock.bram_start_y}"
-            end_ramb18 = f"RAMB18_X{pblock.bram_end_x}Y{2 * pblock.bram_end_y + 1}"
-            start_ramb36 = f"RAMB36_X{pblock.bram_start_x}Y{pblock.bram_start_y}"
-            end_ramb36 = f"RAMB36_X{pblock.bram_end_x}Y{pblock.bram_end_y}"
-
-            # We need 8 curly brackets to survive the processing by the f-strings and the
-            # two rounds (sigh) of processing done by LiteX.
-            self.toolchain.pre_placement_commands.add(
-                f"resize_pblock [get_pblocks pblock_cores_{i}] -add {{{{{{{{{start_slice}:{end_slice}}}}}}}}}"
-            )
-            self.toolchain.pre_placement_commands.add(
-                f"resize_pblock [get_pblocks pblock_cores_{i}] -add {{{{{{{{{start_ramb18}:{end_ramb18}}}}}}}}}"
-            )
-            self.toolchain.pre_placement_commands.add(
-                f"resize_pblock [get_pblocks pblock_cores_{i}] -add {{{{{{{{{start_ramb36}:{end_ramb36}}}}}}}}}"
-            )
-
-            cores = pblock.luts() // CORE_LUTS
-            for _ in range(cores):
-                # TODO: put in_sync / out_sync / synchroniser flip-flops in here too? Right now they seem to be getting placed quite far away
-                self.toolchain.pre_placement_commands.add(
-                    f"add_cells_to_pblock [get_pblocks pblock_cores_{i}] [get_cells -quiet [list core_group/core_{cores_allocated}]]"
-                )
-                cores_allocated += 1
 
         self.toolchain.bitstream_commands += [
             "set_property BITSTREAM.CONFIG.OVERTEMPPOWERDOWN ENABLE [current_design]",
@@ -174,6 +160,81 @@ class SoC(SoCCore):
 
         self.core_mgr = CoreManager(
             platform, cuboids, max_area, cores, with_analyzer=with_analyzer
+        )
+
+        cores_allocated = 0
+        for i, pblock in enumerate(PBLOCKS):
+            self.platform.toolchain.pre_placement_commands.add(
+                f"create_pblock pblock_cores_{i}"
+            )
+
+            start_slice = f"SLICE_X{pblock.slice_start_x}Y{pblock.slice_start_y}"
+            end_slice = f"SLICE_X{pblock.slice_end_x}Y{pblock.slice_end_y}"
+            start_ramb18 = f"RAMB18_X{pblock.bram_start_x}Y{2 * pblock.bram_start_y}"
+            end_ramb18 = f"RAMB18_X{pblock.bram_end_x}Y{2 * pblock.bram_end_y + 1}"
+            start_ramb36 = f"RAMB36_X{pblock.bram_start_x}Y{pblock.bram_start_y}"
+            end_ramb36 = f"RAMB36_X{pblock.bram_end_x}Y{pblock.bram_end_y}"
+
+            # We need 8 curly brackets to survive the processing by the f-strings and the
+            # two rounds (sigh) of processing done by LiteX.
+            self.platform.toolchain.pre_placement_commands.add(
+                f"resize_pblock [get_pblocks pblock_cores_{i}] -add {{{{{{{{{start_slice}:{end_slice}}}}}}}}}"
+            )
+            self.platform.toolchain.pre_placement_commands.add(
+                f"resize_pblock [get_pblocks pblock_cores_{i}] -add {{{{{{{{{start_ramb18}:{end_ramb18}}}}}}}}}"
+            )
+            self.platform.toolchain.pre_placement_commands.add(
+                f"resize_pblock [get_pblocks pblock_cores_{i}] -add {{{{{{{{{start_ramb36}:{end_ramb36}}}}}}}}}"
+            )
+
+            cores = pblock.cores()
+            for _ in range(cores):
+                # TODO: put in_sync / out_sync / synchroniser flip-flops in here too? Right now
+                # they seem to be getting placed quite far away
+                self.platform.toolchain.pre_placement_commands.add(
+                    f"add_cells_to_pblock [get_pblocks pblock_cores_{i}] [get_cells -quiet [list core_group/core_{cores_allocated}]]"
+                )
+                cores_allocated += 1
+
+        self.platform.toolchain.pre_placement_commands.add("create_pblock pblock_pcie")
+        self.platform.toolchain.pre_placement_commands.add(
+            "resize_pblock [get_pblocks pblock_pcie] -add {{{{SLICE_X24Y200:SLICE_X51Y249}}}}"
+        )
+        self.platform.toolchain.pre_placement_commands.add(
+            "resize_pblock [get_pblocks pblock_pcie] -add {{{{RAMB18_X1Y80:RAMB18_X2Y99}}}}"
+        )
+        self.platform.toolchain.pre_placement_commands.add(
+            "resize_pblock [get_pblocks pblock_pcie] -add {{{{RAMB36_X1Y40:RAMB36_X2Y49}}}}"
+        )
+        self.platform.toolchain.pre_placement_commands.add(
+            "resize_pblock [get_pblocks pblock_pcie] -add {{{{PCIE_X0Y0:PCIE_X0Y0}}}}"
+        )
+        self.platform.toolchain.pre_placement_commands.add(
+            "resize_pblock [get_pblocks pblock_pcie] -add {{{{GTPE2_COMMON_X0Y1:GTPE2_COMMON_X0Y1}}}}"
+        )
+        self.platform.toolchain.pre_placement_commands.add(
+            "resize_pblock [get_pblocks pblock_pcie] -add {{{{GTPE2_CHANNEL_X0Y4:GTPE2_CHANNEL_X0Y7}}}}"
+        )
+        self.platform.toolchain.pre_placement_commands.add(
+            f"add_cells_to_pblock [get_pblocks pblock_pcie] [get_cells -quiet [list pcie_s7]]"
+        )
+
+    def do_finalize(self):
+        xdc_path = path.join(self.platform.output_dir, "gateware", "clocks.xdc")
+        with open(xdc_path, "w") as f:
+            f.write(
+                """\
+set_clock_groups \\
+    -group [get_clocks -include_generated_clocks clk200_p] \\
+    -group [get_clocks -include_generated_clocks dna_clk] \\
+    -group [get_clocks -include_generated_clocks icap_clk] \\
+    -group [get_clocks -include_generated_clocks pcie_x4_clk_p] \\
+    -group [get_clocks -include_generated_clocks txoutclk_x0y0] \\
+    -asynchronous"""
+            )
+        self.platform.toolchain.pre_synthesis_commands.add("read_xdc clocks.xdc")
+        self.platform.toolchain.pre_synthesis_commands.add(
+            "set_property PROCESSING_ORDER LATE [get_files clocks.xdc]"
         )
 
 
