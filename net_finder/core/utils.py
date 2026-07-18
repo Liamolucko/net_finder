@@ -141,6 +141,51 @@ class Merge(wiring.Component):
         return m
 
 
+class MaskedMerge(wiring.Component):
+    """
+    Like Merge, but accepts a mask specifying which sinks it's permitted to begin
+    receiving a packet from. Once it's begun receiving a packet from a sink, it will
+    finish it no matter what.
+    """
+
+    def __init__(self, payload_shape: ShapeLike, n: int):
+        super().__init__(
+            {
+                "sinks": In(stream.Signature(payload_shape)).array(n),
+                "source": Out(stream.Signature(payload_shape)),
+                "mask": In(n),
+            }
+        )
+
+    def elaborate(self, platform) -> Module:
+        m = Module()
+
+        sel = Signal(range(len(self.sinks)))
+        active = Signal()
+
+        for i, sink in enumerate(self.sinks):
+            m.d.comb += sink.ready.eq(active & (sel == i) & self.source.ready)
+
+        m.d.comb += self.source.valid.eq(active & Array(self.sinks)[sel].valid)
+        m.d.comb += self.source.payload.eq(Array(self.sinks)[sel].payload)
+
+        packet_end = self.source.valid & self.source.ready & self.source.p.last
+        candidates = Signal(len(self.sinks))
+        m.d.comb += candidates.eq(
+            Cat(
+                sink.valid & ~(active & (sel == i)) & self.mask[i] for i, sink in enumerate(self.sinks)
+            )
+        )
+
+        m.d.sync += active.eq((active & ~packet_end) | candidates.any())
+        with m.If(~active | packet_end):
+            for i, is_candidate in enumerate(candidates):
+                with m.If(is_candidate):
+                    m.d.sync += sel.eq(i)
+
+        return m
+
+
 # Yoinked and adapted from LiteX.
 class PipeValid(wiring.Component):
     """Pipe valid/payload to cut timing path"""

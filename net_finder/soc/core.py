@@ -68,6 +68,7 @@ class CoreGroup(LiteXModule):
         ]
 
         self.req_pause = Signal()
+        self.fifo_has_room = Signal()
 
         self.active = Signal()
         """Whether any of the cores in this group still have work left to do."""
@@ -111,6 +112,7 @@ class CoreGroup(LiteXModule):
                 for field in ["en", "addr", "data"]
                 for i in range(cuboids - 1)
             },
+            i_fifo_has_room=self.fifo_has_room,
             i_req_pause=self.req_pause,
             o_active=self.active,
             o_split_finders=self.split_finders,
@@ -372,6 +374,10 @@ class CoreManager(LiteXModule):
         self.comb += self.output_conv.source.ready.eq(self.output_fifo.writable)
         self.comb += self.output_fifo.we.eq(
             self.output_conv.source.valid & self.output_conv.source.ready
+        )
+
+        self.comb += self.cores.fifo_has_room.eq(
+            self.output_fifo.level <= fifo_depth - 2
         )
 
         self.comb += self.active.status.eq(self.cores.active)

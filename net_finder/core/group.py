@@ -8,7 +8,7 @@ from .core import Core, FinderType, State, core_in_layout, core_out_layout
 from .memory import ConfigMemory
 from .neighbour_lookup import neighbour_lookup_layout
 from .skip_checker import undo_lookup_layout
-from .utils import Merge, PipeReady, PipeValid, SafeDemux, StreamSync, pipen, tree_sum
+from .utils import MaskedMerge, Merge, PipeReady, PipeValid, SafeDemux, StreamSync, pipen, tree_sum
 
 # If we have any FPGA-spanning wires in the `core` clock domain (currently only
 # the case for measuring how many cycles were spent in each state), how many
@@ -67,6 +67,8 @@ class CoreGroup(wiring.Component):
                     )
                 ).array(cuboids - 1),
                 "req_pause": In(1),
+                # Whether the FIFO has room for at least 2 more finders.
+                "fifo_has_room": In(1),
                 # Whether any of the cores in this group still have work left to do.
                 "active": Out(1),
                 # The number of new finders that have been produced via. splitting.
@@ -210,7 +212,7 @@ class CoreGroup(wiring.Component):
 
         # Most outgoing packets get merged together into `self.source`, unless they're
         # of `SPLIT` kind: then they get routed back around into `self.split`.
-        output_merge = DomainRenamer("sys")(Merge(core_out_layout(), len(cores)))
+        output_merge = DomainRenamer("sys")(MaskedMerge(core_out_layout(), len(cores)))
         m.submodules.output_merge = output_merge
 
         # Put a buffer in front of `output_merge` so that it's impossible for the
@@ -224,6 +226,9 @@ class CoreGroup(wiring.Component):
 
         for i in range(len(cores)):
             wiring.connect(m, core_sources[i], output_merge.sinks[i])
+            m.d.comb += output_merge.mask[i].eq(
+                (core_sources[i].p.type == FinderType.Split) | self.fifo_has_room
+            )
         wiring.connect(m, pipe_ready.source, output_mux.sink)
 
         m.d.comb += output_mux.sel.eq(output_mux.sink.p.type == FinderType.Split)
