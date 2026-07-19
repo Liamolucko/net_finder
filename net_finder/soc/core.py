@@ -83,6 +83,61 @@ class CoreGroup(LiteXModule):
         for state in State.__members__:
             setattr(self, f"{state.lower()}_count", Signal(64))
 
+        FINDERS_PER_CORE = 4
+        self.output_merge_sel = Signal(bits_for(n * FINDERS_PER_CORE - 1))
+        self.output_merge_active = Signal(1)
+        self.output_merge_source_valid = Signal(1)
+        self.output_merge_source_ready = Signal(1)
+        self.output_merge_source_payload = Signal(4)
+        self.output_mux_active = Signal(1)
+        self.output_mux_latched_sel = Signal(1)
+        self.loopback_valid = Signal(1)
+        self.loopback_ready = Signal(1)
+        self.loopback_payload = Signal(2)
+        self.input_merge_sel = Signal(1)
+        self.input_merge_active = Signal(1)
+        self.input_mux_active = Signal(1)
+        self.input_mux_latched_sel = Signal(bits_for(n * FINDERS_PER_CORE - 1))
+        self.input_mux_sink_valid = Signal(1)
+        self.input_mux_sink_ready = Signal(1)
+        self.input_mux_sink_payload = Signal(2)
+        self.splittable_base = Signal(bits_for(max_decisions_len(max_area)))
+        self.splittee = Signal(bits_for(n * FINDERS_PER_CORE - 1))
+        self.split_wanted = Signal(1)
+        self.splittee_sink_valid = Signal(1)
+        self.splittee_sink_ready = Signal(1)
+        self.splittee_sink_payload = Signal(2)
+        self.splittee_source_valid = Signal(1)
+        self.splittee_source_ready = Signal(1)
+        self.splittee_source_payload = Signal(4)
+        self.splittee_req_pause = Signal(1)
+        self.splittee_req_split = Signal(1)
+        self.splittee_wants_finder = Signal(1)
+        self.splittee_state = Signal(3)
+        self.splittee_base_decision = Signal(bits_for(max_decisions_len(max_area)))
+        self.sender_sink_valid = Signal(1)
+        self.sender_sink_ready = Signal(1)
+        self.sender_sink_payload = Signal(2)
+        self.sender_source_valid = Signal(1)
+        self.sender_source_ready = Signal(1)
+        self.sender_source_payload = Signal(4)
+        self.sender_req_pause = Signal(1)
+        self.sender_req_split = Signal(1)
+        self.sender_wants_finder = Signal(1)
+        self.sender_state = Signal(3)
+        self.sender_base_decision = Signal(bits_for(max_decisions_len(max_area)))
+        self.receiver_sink_valid = Signal(1)
+        self.receiver_sink_ready = Signal(1)
+        self.receiver_sink_payload = Signal(2)
+        self.receiver_source_valid = Signal(1)
+        self.receiver_source_ready = Signal(1)
+        self.receiver_source_payload = Signal(4)
+        self.receiver_req_pause = Signal(1)
+        self.receiver_req_split = Signal(1)
+        self.receiver_wants_finder = Signal(1)
+        self.receiver_state = Signal(3)
+        self.receiver_base_decision = Signal(bits_for(max_decisions_len(max_area)))
+
         # # #
 
         raw_sink_payload = Record(CORE_IN_LAYOUT)
@@ -121,6 +176,59 @@ class CoreGroup(LiteXModule):
                 f"o_{state.lower()}_count": getattr(self, f"{state.lower()}_count")
                 for state in State.__members__
             },
+            o_output_merge_sel=self.output_merge_sel,
+            o_output_merge_active=self.output_merge_active,
+            o_output_merge_source_valid=self.output_merge_source_valid,
+            o_output_merge_source_ready=self.output_merge_source_ready,
+            o_output_merge_source_payload=self.output_merge_source_payload,
+            o_output_mux_active=self.output_mux_active,
+            o_output_mux_latched_sel=self.output_mux_latched_sel,
+            o_loopback_valid=self.loopback_valid,
+            o_loopback_ready=self.loopback_ready,
+            o_loopback_payload=self.loopback_payload,
+            o_input_merge_sel=self.input_merge_sel,
+            o_input_merge_active=self.input_merge_active,
+            o_input_mux_active=self.input_mux_active,
+            o_input_mux_latched_sel=self.input_mux_latched_sel,
+            o_input_mux_sink_valid=self.input_mux_sink_valid,
+            o_input_mux_sink_ready=self.input_mux_sink_ready,
+            o_input_mux_sink_payload=self.input_mux_sink_payload,
+            o_splittable_base=self.splittable_base,
+            o_splittee=self.splittee,
+            o_split_wanted=self.split_wanted,
+            o_splittee_sink_valid=self.splittee_sink_valid,
+            o_splittee_sink_ready=self.splittee_sink_ready,
+            o_splittee_sink_payload=self.splittee_sink_payload,
+            o_splittee_source_valid=self.splittee_source_valid,
+            o_splittee_source_ready=self.splittee_source_ready,
+            o_splittee_source_payload=self.splittee_source_payload,
+            o_splittee_req_pause=self.splittee_req_pause,
+            o_splittee_req_split=self.splittee_req_split,
+            o_splittee_wants_finder=self.splittee_wants_finder,
+            o_splittee_state=self.splittee_state,
+            o_splittee_base_decision=self.splittee_base_decision,
+            o_sender_sink_valid=self.sender_sink_valid,
+            o_sender_sink_ready=self.sender_sink_ready,
+            o_sender_sink_payload=self.sender_sink_payload,
+            o_sender_source_valid=self.sender_source_valid,
+            o_sender_source_ready=self.sender_source_ready,
+            o_sender_source_payload=self.sender_source_payload,
+            o_sender_req_pause=self.sender_req_pause,
+            o_sender_req_split=self.sender_req_split,
+            o_sender_wants_finder=self.sender_wants_finder,
+            o_sender_state=self.sender_state,
+            o_sender_base_decision=self.sender_base_decision,
+            o_receiver_sink_valid=self.receiver_sink_valid,
+            o_receiver_sink_ready=self.receiver_sink_ready,
+            o_receiver_sink_payload=self.receiver_sink_payload,
+            o_receiver_source_valid=self.receiver_source_valid,
+            o_receiver_source_ready=self.receiver_source_ready,
+            o_receiver_source_payload=self.receiver_source_payload,
+            o_receiver_req_pause=self.receiver_req_pause,
+            o_receiver_req_split=self.receiver_req_split,
+            o_receiver_wants_finder=self.receiver_wants_finder,
+            o_receiver_state=self.receiver_state,
+            o_receiver_base_decision=self.receiver_base_decision,
         )
 
         self.comb += raw_sink_payload.data.eq(self.sink.data)
@@ -401,6 +509,59 @@ class CoreManager(LiteXModule):
                 self.cores.active,
                 self.input_conv.sink,
                 self.output_conv.source,
+                self.cores.output_merge_sel,
+                self.cores.output_merge_active,
+                self.cores.output_merge_source_valid,
+                self.cores.output_merge_source_ready,
+                self.cores.output_merge_source_payload,
+                self.cores.output_mux_active,
+                self.cores.output_mux_latched_sel,
+                self.cores.loopback_valid,
+                self.cores.loopback_ready,
+                self.cores.loopback_payload,
+                self.cores.input_merge_sel,
+                self.cores.input_merge_active,
+                self.cores.input_mux_active,
+                self.cores.input_mux_latched_sel,
+                self.cores.input_mux_sink_valid,
+                self.cores.input_mux_sink_ready,
+                self.cores.input_mux_sink_payload,
+                self.cores.splittable_base,
+                self.cores.splittee,
+                self.cores.split_wanted,
+                self.cores.splittee_sink_valid,
+                self.cores.splittee_sink_ready,
+                self.cores.splittee_sink_payload,
+                self.cores.splittee_source_valid,
+                self.cores.splittee_source_ready,
+                self.cores.splittee_source_payload,
+                self.cores.splittee_req_pause,
+                self.cores.splittee_req_split,
+                self.cores.splittee_wants_finder,
+                self.cores.splittee_state,
+                self.cores.splittee_base_decision,
+                self.cores.sender_sink_valid,
+                self.cores.sender_sink_ready,
+                self.cores.sender_sink_payload,
+                self.cores.sender_source_valid,
+                self.cores.sender_source_ready,
+                self.cores.sender_source_payload,
+                self.cores.sender_req_pause,
+                self.cores.sender_req_split,
+                self.cores.sender_wants_finder,
+                self.cores.sender_state,
+                self.cores.sender_base_decision,
+                self.cores.receiver_sink_valid,
+                self.cores.receiver_sink_ready,
+                self.cores.receiver_sink_payload,
+                self.cores.receiver_source_valid,
+                self.cores.receiver_source_ready,
+                self.cores.receiver_source_payload,
+                self.cores.receiver_req_pause,
+                self.cores.receiver_req_split,
+                self.cores.receiver_wants_finder,
+                self.cores.receiver_state,
+                self.cores.receiver_base_decision,
             ]
             self.analyzer = LiteScopeAnalyzer(
                 analyzer_signals,

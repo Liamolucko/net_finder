@@ -68,6 +68,9 @@ class SafeDemux(wiring.Component):
                 # Whether you're okay with the current value of `sel` being locked in as the one
                 # to receive the next packet.
                 "en": In(1),
+                # litescope debugging
+                "active": Out(1),
+                "latched_sel": Out(range(n)),
             }
         )
 
@@ -95,6 +98,9 @@ class SafeDemux(wiring.Component):
         with m.If(~active | packet_end):
             m.d.sync += sel.eq(self.sel)
 
+        m.d.comb += self.active.eq(active)
+        m.d.comb += self.latched_sel.eq(sel)
+
         return m
 
 
@@ -109,6 +115,9 @@ class Merge(wiring.Component):
             {
                 "sinks": In(stream.Signature(payload_shape)).array(n),
                 "source": Out(stream.Signature(payload_shape)),
+                # litescope debugging
+                "sel": Out(range(n)),
+                "active": Out(1),
             }
         )
 
@@ -138,6 +147,9 @@ class Merge(wiring.Component):
                 with m.If(is_candidate):
                     m.d.sync += sel.eq(i)
 
+        m.d.comb += self.sel.eq(sel)
+        m.d.comb += self.active.eq(active)
+
         return m
 
 
@@ -154,6 +166,9 @@ class MaskedMerge(wiring.Component):
                 "sinks": In(stream.Signature(payload_shape)).array(n),
                 "source": Out(stream.Signature(payload_shape)),
                 "mask": In(n),
+                # litescope debugging
+                "sel": Out(range(n)),
+                "active": Out(1),
             }
         )
 
@@ -182,6 +197,9 @@ class MaskedMerge(wiring.Component):
             for i, is_candidate in enumerate(candidates):
                 with m.If(is_candidate):
                     m.d.sync += sel.eq(i)
+
+        m.d.comb += self.sel.eq(sel)
+        m.d.comb += self.active.eq(active)
 
         return m
 

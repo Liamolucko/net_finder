@@ -5,6 +5,7 @@ from amaranth.lib.wiring import In, Out
 from amaranth.utils import ceil_log2
 
 from .core import Core, FinderType, State, core_in_layout, core_out_layout
+from .main_pipeline import FINDERS_PER_CORE, max_decisions_len
 from .memory import ConfigMemory
 from .neighbour_lookup import neighbour_lookup_layout
 from .skip_checker import undo_lookup_layout
@@ -75,6 +76,60 @@ class CoreGroup(wiring.Component):
                 "split_finders": Out(32),
                 # The total number of finders that have finished running.
                 "completed_finders": Out(32),
+                # litescope debugging
+                "output_merge_sel": Out(range(n * FINDERS_PER_CORE)),
+                "output_merge_active": Out(1),
+                "output_merge_source_valid": Out(1),
+                "output_merge_source_ready": Out(1),
+                "output_merge_source_payload": Out(core_out_layout()),
+                "output_mux_active": Out(1),
+                "output_mux_latched_sel": Out(1),
+                "loopback_valid": Out(1),
+                "loopback_ready": Out(1),
+                "loopback_payload": Out(core_in_layout()),
+                "input_merge_sel": Out(1),
+                "input_merge_active": Out(1),
+                "input_mux_active": Out(1),
+                "input_mux_latched_sel": Out(range(n * FINDERS_PER_CORE)),
+                "input_mux_sink_valid": Out(1),
+                "input_mux_sink_ready": Out(1),
+                "input_mux_sink_payload": Out(core_in_layout()),
+                "splittable_base": Out(range(max_decisions_len(max_area) + 1)),
+                "splittee": Out(range(n * FINDERS_PER_CORE)),
+                "split_wanted": Out(1),
+                "splittee_sink_valid": Out(1),
+                "splittee_sink_ready": Out(1),
+                "splittee_sink_payload": Out(core_in_layout()),
+                "splittee_source_valid": Out(1),
+                "splittee_source_ready": Out(1),
+                "splittee_source_payload": Out(core_out_layout()),
+                "splittee_req_pause": Out(1),
+                "splittee_req_split": Out(1),
+                "splittee_wants_finder": Out(1),
+                "splittee_state": Out(State),
+                "splittee_base_decision": Out(range(max_decisions_len(max_area) + 1)),
+                "sender_sink_valid": Out(1),
+                "sender_sink_ready": Out(1),
+                "sender_sink_payload": Out(core_in_layout()),
+                "sender_source_valid": Out(1),
+                "sender_source_ready": Out(1),
+                "sender_source_payload": Out(core_out_layout()),
+                "sender_req_pause": Out(1),
+                "sender_req_split": Out(1),
+                "sender_wants_finder": Out(1),
+                "sender_state": Out(State),
+                "sender_base_decision": Out(range(max_decisions_len(max_area) + 1)),
+                "receiver_sink_valid": Out(1),
+                "receiver_sink_ready": Out(1),
+                "receiver_sink_payload": Out(core_in_layout()),
+                "receiver_source_valid": Out(1),
+                "receiver_source_ready": Out(1),
+                "receiver_source_payload": Out(core_out_layout()),
+                "receiver_req_pause": Out(1),
+                "receiver_req_split": Out(1),
+                "receiver_wants_finder": Out(1),
+                "receiver_state": Out(State),
+                "receiver_base_decision": Out(range(max_decisions_len(max_area) + 1)),
             }
             | {f"{state.lower()}_count": Out(64) for state in State.__members__}
         )
@@ -353,5 +408,89 @@ class CoreGroup(wiring.Component):
             )
             m.d.core += core_counter.eq(core_counter + num_matches)
             m.d.sys += counter.eq(core_counter)
+
+        m.d.comb += self.output_merge_sel.eq(output_merge.sel)
+        m.d.comb += self.output_merge_active.eq(output_merge.active)
+        m.d.comb += self.output_merge_source_valid.eq(output_merge.source.valid)
+        m.d.comb += self.output_merge_source_ready.eq(output_merge.source.ready)
+        m.d.comb += self.output_merge_source_payload.eq(output_merge.source.payload)
+        m.d.comb += self.output_mux_active.eq(output_mux.active)
+        m.d.comb += self.output_mux_latched_sel.eq(output_mux.latched_sel)
+        m.d.comb += self.loopback_valid.eq(input_merge.sinks[1].valid)
+        m.d.comb += self.loopback_ready.eq(input_merge.sinks[1].ready)
+        m.d.comb += self.loopback_payload.eq(input_merge.sinks[1].payload)
+        m.d.comb += self.input_merge_sel.eq(input_merge.sel)
+        m.d.comb += self.input_merge_active.eq(input_merge.active)
+        m.d.comb += self.input_mux_active.eq(input_mux.active)
+        m.d.comb += self.input_mux_latched_sel.eq(input_mux.latched_sel)
+        m.d.comb += self.input_mux_sink_valid.eq(input_mux.sink.valid)
+        m.d.comb += self.input_mux_sink_ready.eq(input_mux.sink.ready)
+        m.d.comb += self.input_mux_sink_payload.eq(input_mux.sink.payload)
+        m.d.comb += self.splittable_base.eq(splittable_base)
+        m.d.comb += self.splittee.eq(splittee)
+        m.d.comb += self.split_wanted.eq(split_wanted)
+
+        m.d.comb += self.splittee_sink_valid.eq(Array(core_sinks)[splittee].valid)
+        m.d.comb += self.splittee_sink_ready.eq(Array(core_sinks)[splittee].ready)
+        m.d.comb += self.splittee_sink_payload.eq(Array(core_sinks)[splittee].payload)
+        m.d.comb += self.splittee_source_valid.eq(Array(core_sources)[splittee].valid)
+        m.d.comb += self.splittee_source_ready.eq(Array(core_sources)[splittee].ready)
+        m.d.comb += self.splittee_source_payload.eq(
+            Array(core_sources)[splittee].payload
+        )
+        m.d.comb += self.splittee_req_split.eq(split_wanted)
+        m.d.comb += self.splittee_wants_finder.eq(Array(wants_finders)[splittee])
+        m.d.comb += self.splittee_state.eq(Array(core_states)[splittee])
+        m.d.comb += self.splittee_base_decision.eq(Array(core_base_decisions)[splittee])
+        m.d.comb += self.sender_sink_valid.eq(Array(core_sinks)[output_merge.sel].valid)
+        m.d.comb += self.sender_sink_ready.eq(Array(core_sinks)[output_merge.sel].ready)
+        m.d.comb += self.sender_sink_payload.eq(
+            Array(core_sinks)[output_merge.sel].payload
+        )
+        m.d.comb += self.sender_source_valid.eq(
+            Array(core_sources)[output_merge.sel].valid
+        )
+        m.d.comb += self.sender_source_ready.eq(
+            Array(core_sources)[output_merge.sel].ready
+        )
+        m.d.comb += self.sender_source_payload.eq(
+            Array(core_sources)[output_merge.sel].payload
+        )
+        m.d.comb += self.sender_req_split.eq(
+            (splittee == output_merge.sel) & split_wanted
+        )
+        m.d.comb += self.sender_wants_finder.eq(Array(wants_finders)[output_merge.sel])
+        m.d.comb += self.sender_state.eq(Array(core_states)[output_merge.sel])
+        m.d.comb += self.sender_base_decision.eq(
+            Array(core_base_decisions)[output_merge.sel]
+        )
+        m.d.comb += self.receiver_sink_valid.eq(
+            Array(core_sinks)[input_mux.latched_sel].valid
+        )
+        m.d.comb += self.receiver_sink_ready.eq(
+            Array(core_sinks)[input_mux.latched_sel].ready
+        )
+        m.d.comb += self.receiver_sink_payload.eq(
+            Array(core_sinks)[input_mux.latched_sel].payload
+        )
+        m.d.comb += self.receiver_source_valid.eq(
+            Array(core_sources)[input_mux.latched_sel].valid
+        )
+        m.d.comb += self.receiver_source_ready.eq(
+            Array(core_sources)[input_mux.latched_sel].ready
+        )
+        m.d.comb += self.receiver_source_payload.eq(
+            Array(core_sources)[input_mux.latched_sel].payload
+        )
+        m.d.comb += self.receiver_req_split.eq(
+            (splittee == input_mux.latched_sel) & split_wanted
+        )
+        m.d.comb += self.receiver_wants_finder.eq(
+            Array(wants_finders)[input_mux.latched_sel]
+        )
+        m.d.comb += self.receiver_state.eq(Array(core_states)[input_mux.latched_sel])
+        m.d.comb += self.receiver_base_decision.eq(
+            Array(core_base_decisions)[input_mux.latched_sel]
+        )
 
         return m
