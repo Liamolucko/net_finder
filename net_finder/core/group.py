@@ -9,7 +9,16 @@ from .main_pipeline import FINDERS_PER_CORE, max_decisions_len
 from .memory import ConfigMemory
 from .neighbour_lookup import neighbour_lookup_layout
 from .skip_checker import undo_lookup_layout
-from .utils import MaskedMerge, Merge, PipeReady, PipeValid, SafeDemux, StreamSync, pipen, tree_sum
+from .utils import (
+    MaskedMerge,
+    Merge,
+    PipeReady,
+    PipeValid,
+    SafeDemux,
+    StreamSync,
+    pipen,
+    tree_sum,
+)
 
 # If we have any FPGA-spanning wires in the `core` clock domain (currently only
 # the case for measuring how many cycles were spent in each state), how many
@@ -238,6 +247,90 @@ class CoreGroup(wiring.Component):
                 pipen(m, core.base_decision, SYS_BUFS + 1, domain="sys")
             )
 
+        ### Split handling ###
+
+        # Whether or not each core is currently running something.
+        cores_active = Signal(len(cores))
+        for i in range(len(cores)):
+            m.d.comb += cores_active[i].eq(
+                (core_states[i] != State.Clear) & ~wants_finders[i]
+            )
+
+        # Whether or not each core was running something during the previous clock cycle.
+        prev_cores_active = Signal.like(cores_active)
+        m.d.sys += prev_cores_active.eq(cores_active)
+
+        m.d.comb += self.active.eq(self.sink.valid | cores_active.any())
+
+        # The `base_decision` that a core has to have in order to be split.
+        #
+        # If no cores have this `base_decision`, it gets incremented until one does and
+        # we can split.
+        splittable_base = Signal.like(cores[0].base_decision)
+        # Whether or not each core is splittable (is active and has a `base_decision` of
+        # `splittable_base`).
+        splittable = Signal(len(cores))
+        m.d.comb += splittable.eq(
+            Cat(
+                # TODO: base_decision is garbage while sending, so this decision-making might be a bit off.
+                cores_active[i] & (core_base_decisions[i] == splittable_base)
+                | (core_states[i] == State.Split)
+                for i in range(len(cores))
+            )
+        )
+        with m.If(
+            Cat(
+                ~prev_cores_active[i] & cores_active[i] for i in range(len(cores))
+            ).any()
+        ):
+            # A new core's just become active and might have a `base_decision` below
+            # `splittable_base`, so reset it to 1.
+            m.d.sys += splittable_base.eq(1)
+        with m.Elif(~splittable.any()):
+            # There aren't any cores with this `base_decision`, so increment it until there
+            # are.
+            m.d.sys += splittable_base.eq(splittable_base + 1)
+
+        # The index of the core we're going to ask to split next (assuming we don't find
+        # a better candidate in the meantime).
+        splittee = Signal(range(len(cores)))
+        # Once we pick a `splittee`, lock it in until it's no longer splittable.
+        #
+        # This prevents `req_split` being moved to a different core on the same clock
+        # edge that the first core accepts it, causing both of them to split and the
+        # second one's split finder to have nowhere to go.
+        with m.If(~Array(splittable)[splittee]):
+            for i, is_splittable in enumerate(splittable):
+                with m.If(is_splittable):
+                    m.d.sys += splittee.eq(i)
+
+        # We only want to split next clock cycle if:
+        split_wanted = Signal()
+        m.d.sys += split_wanted.eq(
+            # - There's actually a splittable core.
+            splittable.any()
+            # - There aren't already more finders coming in from outside.
+            & ~self.sink.valid
+            # - We aren't in the middle of pausing.
+            & ~self.req_pause
+            # - There isn't another core that's already splitting (so that we don't
+            #   accidentally split twice to fulfil one request for a finder).
+            & ~Cat(
+                core_states[i] == State.Split for i in range(len(cores))
+            ).any()
+            # - There are actually cores that want finders.
+            & Cat(wants_finders[i] for i in range(len(cores))).any()
+        )
+
+        for i, core in enumerate(cores):
+            # Request that `splittee` split itself, assuming splitting is actually desired
+            # in the first place.
+            m.d.core += core.req_split.eq(
+                pipen(m, (splittee == i) & split_wanted, SYS_BUFS, domain="sys")
+            )
+
+        ### Wiring up streams ###
+
         output_mux = DomainRenamer("sys")(SafeDemux(core_out_layout(), 2))
         m.submodules.output_mux = output_mux
 
@@ -282,7 +375,7 @@ class CoreGroup(wiring.Component):
         for i in range(len(cores)):
             wiring.connect(m, core_sources[i], output_merge.sinks[i])
             m.d.comb += output_merge.mask[i].eq(
-                (core_sources[i].p.type == FinderType.Split) | self.fifo_has_room
+                (splittee == i) | (~split_wanted & self.fifo_has_room)
             )
         wiring.connect(m, pipe_ready.source, output_mux.sink)
 
@@ -298,80 +391,7 @@ class CoreGroup(wiring.Component):
             output_mux.sources[0].p.type == FinderType.Pause
         )
 
-        # Whether or not each core is currently running something.
-        cores_active = Signal(len(cores))
-        for i in range(len(cores)):
-            m.d.comb += cores_active[i].eq(
-                (core_states[i] != State.Clear) & ~wants_finders[i]
-            )
-
-        # Whether or not each core was running something during the previous clock cycle.
-        prev_cores_active = Signal.like(cores_active)
-        m.d.sys += prev_cores_active.eq(cores_active)
-
-        m.d.comb += self.active.eq(self.sink.valid | cores_active.any())
-
-        # The `base_decision` that a core has to have in order to be split.
-        #
-        # If no cores have this `base_decision`, it gets incremented until one does and
-        # we can split.
-        splittable_base = Signal.like(cores[0].base_decision)
-        # Whether or not each core is splittable (is active and has a `base_decision` of
-        # `splittable_base`).
-        splittable = Signal(len(cores))
-        m.d.comb += splittable.eq(
-            Cat(
-                # TODO: base_decision is garbage while sending, so this decision-making might be a bit off.
-                cores_active[i] & (core_base_decisions[i] == splittable_base)
-                for i in range(len(cores))
-            )
-        )
-        with m.If(
-            Cat(
-                ~prev_cores_active[i] & cores_active[i] for i in range(len(cores))
-            ).any()
-        ):
-            # A new core's just become active and might have a `base_decision` below
-            # `splittable_base`, so reset it to 1.
-            m.d.sys += splittable_base.eq(1)
-        with m.Elif(~splittable.any()):
-            # There aren't any cores with this `base_decision`, so increment it until there
-            # are.
-            m.d.sys += splittable_base.eq(splittable_base + 1)
-
-        # The index of the core we're going to ask to split next (assuming we don't find
-        # a better candidate in the meantime).
-        splittee = Signal(range(len(cores)))
-        # Once we pick a `splittee`, lock it in until it's no longer splittable.
-        #
-        # This prevents `req_split` being moved to a different core on the same clock
-        # edge that the first core accepts it, causing both of them to split and the
-        # second one's split finder to have nowhere to go.
-        with m.If(~Array(splittable)[splittee]):
-            for i, is_splittable in enumerate(splittable):
-                with m.If(is_splittable):
-                    m.d.sys += splittee.eq(i)
-
-        # We only want to split next clock cycle if:
-        split_wanted = Signal()
-        m.d.sys += split_wanted.eq(
-            # - There's actually a splittable core.
-            splittable.any()
-            # - There aren't already more finders coming in from outside.
-            & ~self.sink.valid
-            # - There isn't another core that's already splitting (so that we don't
-            #   accidentally split twice to fulfil one request for a finder).
-            & ~Cat(core_states[i] == State.Split for i in range(len(cores))).any()
-            # - There are actually cores that want finders.
-            & Cat(wants_finders[i] for i in range(len(cores))).any()
-        )
-
-        for i, core in enumerate(cores):
-            # Request that `splittee` split itself, assuming splitting is actually desired
-            # in the first place.
-            m.d.core += core.req_split.eq(
-                pipen(m, (splittee == i) & split_wanted, SYS_BUFS, domain="sys")
-            )
+        ### Stats collection ###
 
         # Add 1 to `split_finders` every time a split finder passes through `output_merge`.
         with m.If(
