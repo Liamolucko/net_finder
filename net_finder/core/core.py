@@ -1140,7 +1140,10 @@ class Core(wiring.Component):
                 (state == State.Receive) & (prefix_bits_left == prefix.shape().size)
             )
             m.d.comb += self.interfaces[k].state.eq(state)
-            m.d.comb += self.interfaces[k].base_decision.eq(prefix.base_decision)
+            with m.If(
+                (prefix_bits_left == 0) | (prefix_bits_left == prefix.shape().size)
+            ):
+                m.d.sync += self.interfaces[k].base_decision.eq(prefix.base_decision)
 
         m.d.comb += self.state.eq(wb.i.state)
 

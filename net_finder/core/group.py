@@ -272,7 +272,6 @@ class CoreGroup(wiring.Component):
         splittable = Signal(len(cores))
         m.d.comb += splittable.eq(
             Cat(
-                # TODO: base_decision is garbage while sending, so this decision-making might be a bit off.
                 cores_active[i] & (core_base_decisions[i] == splittable_base)
                 | (core_states[i] == State.Split)
                 for i in range(len(cores))
@@ -315,9 +314,7 @@ class CoreGroup(wiring.Component):
             & ~self.req_pause
             # - There isn't another core that's already splitting (so that we don't
             #   accidentally split twice to fulfil one request for a finder).
-            & ~Cat(
-                core_states[i] == State.Split for i in range(len(cores))
-            ).any()
+            & ~Cat(core_states[i] == State.Split for i in range(len(cores))).any()
             # - There are actually cores that want finders.
             & Cat(wants_finders[i] for i in range(len(cores))).any()
         )

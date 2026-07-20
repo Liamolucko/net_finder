@@ -1612,7 +1612,7 @@ pub fn drive<const CUBOIDS: usize, R: Runtime<CUBOIDS>>(
 
     progress.set_style(
         ProgressStyle::with_template(
-            "{elapsed_precise} {wide_bar} {pos} / {len} finders completed",
+            "{elapsed_precise} {wide_bar} {pos} / {len} finders completed{msg}",
         )
         .unwrap(),
     );

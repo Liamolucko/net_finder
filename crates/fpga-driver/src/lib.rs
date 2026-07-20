@@ -198,8 +198,11 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
             }
 
             if let Some(progress) = progress {
-                progress.set_position(regs.completed_finders().read()?[0].into());
-                progress.set_length(num_input_finders + u64::from(regs.split_finders().read()?[0]));
+                let completed_finders = regs.completed_finders().read()?[0].into();
+                let total_finders = num_input_finders + u64::from(regs.split_finders().read()?[0]);
+                progress.set_position(completed_finders);
+                progress.set_length(total_finders);
+                progress.set_message(format!(" ({} active)", total_finders - completed_finders))
             }
 
             // Don't max out a CPU core doing nothing.
