@@ -308,18 +308,22 @@ class CoreIf(wiring.Component):
 
             with m.If(self.req_pause):
                 m.d.comb += o.state.eq(State.Pause)
-            with m.Elif(
-                self.req_split & (i.next_prefix.base_decision < o.decisions_len)
-            ):
-                m.d.comb += o.state.eq(State.Split)
-                # Set `base_decision` to what the base decision of the finder we're sending will
-                # be (1 past the end of its decisions), so that it gets sent out along with the
-                # rest of the prefix.
-                #
-                # However, it might not be our new base decision, since it might be a 0: we'll
-                # fix it up once we find the first 1 past our old base decision.
-                m.d.comb += o.prefix.base_decision.eq(i.next_prefix.base_decision + 1)
             if allow_check:
+                # Since allow_check will be set to True when exiting Split state, we need to
+                # disallow that too to avoid the same solution being output twice.
+                with m.Elif(
+                    self.req_split & (i.next_prefix.base_decision < o.decisions_len)
+                ):
+                    m.d.comb += o.state.eq(State.Split)
+                    # Set `base_decision` to what the base decision of the finder we're sending will
+                    # be (1 past the end of its decisions), so that it gets sent out along with the
+                    # rest of the prefix.
+                    #
+                    # However, it might not be our new base decision, since it might be a 0: we'll
+                    # fix it up once we find the first 1 past our old base decision.
+                    m.d.comb += o.prefix.base_decision.eq(
+                        i.next_prefix.base_decision + 1
+                    )
                 with m.Elif(
                     backtrack
                     & (o.run_stack_len + o.potential_len >= i.next_prefix.area)

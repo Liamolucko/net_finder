@@ -1138,7 +1138,7 @@ impl<const CUBOIDS: usize> FinderCtx<CUBOIDS> {
         &self,
         completed: Vec<Instruction<CUBOIDS>>,
         mut potential: Vec<Instruction<CUBOIDS>>,
-    ) -> Finalize<CUBOIDS> {
+    ) -> Finalize<'_, CUBOIDS> {
         // Check if `completed` is even valid: nothing in `Finder` prevents multiple
         // instructions from setting the same net position, or being neighbours on the
         // net but disagreeing on what each other should map to (which leads to a cut).
@@ -1532,7 +1532,7 @@ pub fn read_state<const CUBOIDS: usize>(
 ///
 /// `Runtime`s are allowed to produce duplicate solutions, which must be
 /// deduplicated externally.
-pub trait Runtime<const CUBOIDS: usize>: Send + 'static {
+pub trait Runtime<const CUBOIDS: usize>: Send {
     /// Gets the cuboids the `Runtime` is finding common nets of.
     // I considered making this return a `FinderCtx` instead, but that wouldn't
     // work because `drive` needs to set its `prior_search_time`.
@@ -1601,84 +1601,86 @@ pub fn drive<const CUBOIDS: usize, R: Runtime<CUBOIDS>>(
         }
     })?;
 
-    let runtime_thread = thread::Builder::new()
-        .name("runtime thread".to_owned())
-        .spawn({
-            let finders = state.finders.clone();
-            let pause = Arc::clone(&pause);
-            let progress = progress.clone();
-            move || runtime.run(&ctx, &finders, &solution_tx, &pause, Some(&progress))
-        })?;
+    thread::scope(|s| {
+        let runtime_thread = thread::Builder::new()
+            .name("runtime thread".to_owned())
+            .spawn_scoped(s, {
+                let finders = state.finders.clone();
+                let pause = Arc::clone(&pause);
+                let progress = progress.clone();
+                move || runtime.run(&ctx, &finders, &solution_tx, &pause, Some(&progress))
+            })?;
 
-    progress.set_style(
-        ProgressStyle::with_template(
-            "{elapsed_precise} {wide_bar} {pos} / {len} finders completed{msg}",
-        )
-        .unwrap(),
-    );
-    progress.set_length(state.finders.len().try_into().unwrap());
-    progress.set_draw_target(ProgressDrawTarget::stderr());
-    progress.enable_steady_tick(Duration::from_millis(50));
+        progress.set_style(
+            ProgressStyle::with_template(
+                "{elapsed_precise} {wide_bar} {pos} / {len} finders completed{msg}",
+            )
+            .unwrap(),
+        );
+        progress.set_length(state.finders.len().try_into().unwrap());
+        progress.set_draw_target(ProgressDrawTarget::stderr());
+        progress.enable_steady_tick(Duration::from_millis(50));
 
-    // Make a set of all the nets (not solutions! we don't care about the colorings
-    // and stuff) we've already yielded so that we don't yield duplicates.
-    let mut yielded_nets: HashSet<Net> = HashSet::new();
-    let mut count = 0;
+        // Make a set of all the nets (not solutions! we don't care about the colorings
+        // and stuff) we've already yielded so that we don't yield duplicates.
+        let mut yielded_nets: HashSet<Net> = HashSet::new();
+        let mut count = 0;
 
-    // `mem::take` `state`'s existing solutions so that we don't add them twice.
-    for solution in mem::take(&mut state.solutions)
-        .into_iter()
-        .chain(solution_rx)
-    {
-        let new = yielded_nets.insert(solution.net.clone());
-        if !new {
-            continue;
+        // `mem::take` `state`'s existing solutions so that we don't add them twice.
+        for solution in mem::take(&mut state.solutions)
+            .into_iter()
+            .chain(solution_rx)
+        {
+            let new = yielded_nets.insert(solution.net.clone());
+            if !new {
+                continue;
+            }
+
+            // TODO: this is starting to get suspicious. Counting flipped versions of nets
+            // as well isn't doubling the number of solutions; the flipped version of the
+            // net will always be another valid solution, so that should mean it's happening
+            // because the flipped version of the net is the same as the original net and
+            // still doesn't get counted separately, but that doesn't seem to be the case.
+            // So then why isn't it double? Are we missing solutions? I think we
+            // established that this was due to skipping? I don't 100% remember...
+            count += 1;
+            progress.suspend(|| {
+                println!(
+                    "#{count} after {:.3?} ({}):",
+                    solution.search_time,
+                    DateTime::<Local>::from(solution.time).format("at %r on %e %b")
+                );
+                println!("{solution}");
+            });
+
+            assert!(cuboids
+                .into_iter()
+                .all(|cuboid| solution.net.color(cuboid).is_some()));
+            state.solutions.push(solution);
         }
 
-        // TODO: this is starting to get suspicious. Counting flipped versions of nets
-        // as well isn't doubling the number of solutions; the flipped version of the
-        // net will always be another valid solution, so that should mean it's happening
-        // because the flipped version of the net is the same as the original net and
-        // still doesn't get counted separately, but that doesn't seem to be the case.
-        // So then why isn't it double? Are we missing solutions? I think we
-        // established that this was due to skipping? I don't 100% remember...
-        count += 1;
-        progress.suspend(|| {
+        // If the loop finished, the runtime thread must have ended and dropped its
+        // transmitter and so this should return immediately.
+        let finders = runtime_thread.join().expect("runtime thread panicked")?;
+
+        // Update `state`.
+        state.finders = finders;
+        state.prior_search_time = progress.elapsed();
+
+        progress.finish_and_clear();
+        if pause.load(Ordering::Relaxed) {
+            println!("Saving state...");
+        } else {
             println!(
-                "#{count} after {:.3?} ({}):",
-                solution.search_time,
-                DateTime::<Local>::from(solution.time).format("at %r on %e %b")
+                "Number of nets: {count} (took {:?})",
+                state.prior_search_time
             );
-            println!("{solution}");
-        });
+        }
 
-        assert!(cuboids
-            .into_iter()
-            .all(|cuboid| solution.net.color(cuboid).is_some()));
-        state.solutions.push(solution);
-    }
+        write_state(&state)?;
 
-    // If the loop finished, the runtime thread must have ended and dropped its
-    // transmitter and so this should return immediately.
-    let finders = runtime_thread.join().expect("runtime thread panicked")?;
-
-    // Update `state`.
-    state.finders = finders;
-    state.prior_search_time = progress.elapsed();
-
-    progress.finish_and_clear();
-    if pause.load(Ordering::Relaxed) {
-        println!("Saving state...");
-    } else {
-        println!(
-            "Number of nets: {count} (took {:?})",
-            state.prior_search_time
-        );
-    }
-
-    write_state(&state)?;
-
-    Ok(())
+        Ok(())
+    })
 }
 
 impl Display for Solution {

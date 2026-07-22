@@ -12,7 +12,3 @@ indicatif = "0.17.7"
 litex-bridge = { git = "https://github.com/Liamolucko/litex-bridge" }
 net-finder = { path = "../..", features = ["no-trie"] }
 serde_json = "1.0.113"
-wishbone-bridge = { version = "1.1.0", features = [
-    "pcie",
-    "ethernet",
-], default-features = false }

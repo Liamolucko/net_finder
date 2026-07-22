@@ -4,10 +4,9 @@ use std::thread;
 use std::time::Duration;
 
 use indicatif::ProgressBar;
-use litex_bridge::{csr_struct, CsrGroup, CsrRo, CsrRw, DynCsrRo, DynCsrRw, SocInfo};
+use litex_bridge::{csr_struct, Bridge, CsrGroup, CsrRo, CsrRw, DynCsrRo, DynCsrRw, SocInfo};
 use net_finder::fpga::{self, clog2, max_decisions_len};
 use net_finder::{Cuboid, Finder, FinderInfo, Runtime};
-use wishbone_bridge::Bridge;
 
 csr_struct! {
     pub struct CoreManagerRegisters<'a> {
@@ -40,11 +39,11 @@ const MAX_CUBOIDS: usize = 3;
 const MAX_AREA: usize = 64;
 
 /// A `Runtime` which runs finders on an FPGA running a custom SoC.
-pub struct FpgaRuntime<const CUBOIDS: usize> {
+pub struct FpgaRuntime<'a, const CUBOIDS: usize> {
     /// Information about the SoC the FPGA's running.
     pub soc_info: SocInfo,
     /// The bridge we're using to communicate with the FPGA.
-    pub bridge: Bridge,
+    pub bridge: &'a mut (dyn Bridge + Send),
     /// Whether only the SoC's CSRs are accessible via. the bridge, rather than
     /// its entire memory space.
     ///
@@ -54,7 +53,7 @@ pub struct FpgaRuntime<const CUBOIDS: usize> {
     pub cuboids: [Cuboid; CUBOIDS],
 }
 
-impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
+impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<'_, CUBOIDS> {
     fn cuboids(&self) -> [Cuboid; CUBOIDS] {
         self.cuboids
     }
@@ -68,12 +67,12 @@ impl<const CUBOIDS: usize> Runtime<CUBOIDS> for FpgaRuntime<CUBOIDS> {
         progress: Option<&ProgressBar>,
     ) -> anyhow::Result<Vec<FinderInfo<CUBOIDS>>> {
         let reset_addr = CsrRw::<1>::addrs(&self.soc_info, self.csr_only, "ctrl_reset")?;
-        let reset = CsrRw::backed_by(&self.bridge, reset_addr);
+        let mut reset = CsrRw::backed_by(self.bridge, reset_addr);
         reset.write([1])?;
         thread::sleep(Duration::from_millis(10));
 
         let reg_addrs = CoreManagerRegisters::addrs(&self.soc_info, self.csr_only, "core_mgr")?;
-        let regs = CoreManagerRegisters::backed_by(&self.bridge, reg_addrs);
+        let mut regs = CoreManagerRegisters::backed_by(self.bridge, reg_addrs);
 
         for (i, contents) in fpga::neighbour_lookups(ctx, MAX_AREA, MAX_CUBOIDS)
             .into_iter()

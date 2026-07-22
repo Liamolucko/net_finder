@@ -30,6 +30,3 @@ spliter = "0.1.0"
 
 [profile.release]
 debug = true
-
-[patch.crates-io]
-wishbone-bridge = { git = "https://github.com/Liamolucko/wishbone-utils", branch = "litex-server" }

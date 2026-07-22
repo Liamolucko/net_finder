@@ -484,13 +484,9 @@ class CoreManager(LiteXModule):
             self.output_conv.source.valid & self.output_conv.source.ready
         )
 
-        # Reserve 64 slots for solutions we're getting out of the way so that the core
-        # with the solution can split.
-        #
-        # TODO: remove this, probably
-        self.comb += self.cores.fifo_has_room.eq(self.output_fifo.level < 192)
-        fifo_overfull = Signal()
-        self.comb += fifo_overfull.eq(self.output_fifo.level >= 224)
+        self.comb += self.cores.fifo_has_room.eq(
+            self.output_fifo.level <= fifo_depth - 2
+        )
 
         self.comb += self.active.status.eq(self.cores.active)
         self.comb += self.cores.req_pause.eq(self.req_pause.storage)
@@ -576,7 +572,6 @@ class CoreManager(LiteXModule):
                 self.cores.receiver_wants_finder,
                 self.cores.receiver_state,
                 self.cores.receiver_base_decision,
-                fifo_overfull,
             ]
             self.analyzer = LiteScopeAnalyzer(
                 analyzer_signals,

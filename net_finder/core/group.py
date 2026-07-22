@@ -421,7 +421,7 @@ class CoreGroup(wiring.Component):
             for i in range(len(real_cores)):
                 m.d.core += state_matches[i].eq(real_states[i] == state)
             m.d.core += num_matches.eq(
-                tree_sum([real_states[i] == state for i in range(len(real_cores))])
+                tree_sum([state_matches[i] for i in range(len(real_cores))])
             )
             m.d.core += core_counter.eq(core_counter + num_matches)
             m.d.sys += counter.eq(core_counter)

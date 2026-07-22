@@ -1,12 +1,12 @@
 use std::fs;
+use std::net::TcpStream;
 use std::path::PathBuf;
 
 use anyhow::bail;
 use clap::Parser;
-use litex_bridge::{CsrGroup, SocInfo};
+use litex_bridge::{Bridge, CsrGroup, PcieBridge, SocInfo, UartBridge};
 use net_finder::Cuboid;
 use net_finder_fpga_driver::{CoreManagerRegisters, FpgaRuntime};
-use wishbone_bridge::{EthernetBridge, EthernetBridgeProtocol, PCIeBridge};
 
 #[derive(Parser)]
 #[command(group = clap::ArgGroup::new("bridge").required(true).multiple(false))]
@@ -20,12 +20,9 @@ struct Args {
     /// `/sys/bus/pci/devices`.
     #[arg(long, group = "bridge")]
     pcie_device: Option<PathBuf>,
-    /// If the SoC is connected via. Etherbone, its address.
+    /// If the SoC is connected via. serial2tcp, its address.
     #[arg(long, group = "bridge")]
     addr: Option<String>,
-    /// Whether to use a TCP Etherbone connection instead of UDP.
-    #[arg(long)]
-    tcp: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -35,22 +32,18 @@ fn main() -> anyhow::Result<()> {
     let soc_info_json = fs::read_to_string(args.soc_info)?;
     let soc_info: SocInfo = serde_json::from_str(&soc_info_json)?;
 
-    let bridge = if let Some(ref device) = args.pcie_device {
-        PCIeBridge::new(device.join("resource0"))?.create()?
+    let mut pcie_bridge;
+    let mut uart_bridge;
+    let bridge: &mut (dyn Bridge + Send) = if let Some(ref device) = args.pcie_device {
+        pcie_bridge = PcieBridge::new(device.join("resource0"))?;
+        &mut pcie_bridge
     } else if let Some(ip) = args.addr {
-        EthernetBridge::new(ip)?
-            .protocol(if args.tcp {
-                EthernetBridgeProtocol::TCP
-            } else {
-                EthernetBridgeProtocol::UDP
-            })
-            .create()?
+        let socket = TcpStream::connect(ip)?;
+        uart_bridge = UartBridge::new(socket);
+        &mut uart_bridge
     } else {
         unreachable!()
     };
-    // Note: When using PCIe, this needs to go right after creating the bridge due
-    // to a race condition in `wishbone-bridge`.
-    bridge.connect()?;
 
     let csr_only = args.pcie_device.is_some();
 
@@ -60,7 +53,7 @@ fn main() -> anyhow::Result<()> {
             FpgaRuntime {
                 soc_info: soc_info.clone(),
                 cuboids: [a],
-                bridge: bridge.clone(),
+                bridge,
                 csr_only,
             },
             args.resume,
@@ -69,7 +62,7 @@ fn main() -> anyhow::Result<()> {
             FpgaRuntime {
                 soc_info: soc_info.clone(),
                 cuboids: [a, b],
-                bridge: bridge.clone(),
+                bridge,
                 csr_only,
             },
             args.resume,
@@ -78,7 +71,7 @@ fn main() -> anyhow::Result<()> {
             FpgaRuntime {
                 soc_info: soc_info.clone(),
                 cuboids: [a, b, c],
-                bridge: bridge.clone(),
+                bridge,
                 csr_only,
             },
             args.resume,
@@ -87,7 +80,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let reg_addrs = CoreManagerRegisters::addrs(&soc_info, csr_only, "core_mgr")?;
-    let regs = CoreManagerRegisters::backed_by(&bridge, reg_addrs);
+    let mut regs = CoreManagerRegisters::backed_by(bridge, reg_addrs);
 
     fn to_u64(x: [u32; 2]) -> u64 {
         ((x[0] as u64) << 32) | x[1] as u64
